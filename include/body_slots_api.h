@@ -74,8 +74,8 @@ struct Api {
     // Exactly one physical hand and one content category; no engine/inventory mutation.
     Status (BS_CALL *EvaluateEligibility)(std::uint64_t client, std::uint64_t slotId,
         std::uint64_t expectedRevision, std::uint32_t physicalHand, std::uint32_t contentCategory, std::uint32_t* allowed);
-    // Replace this client's authored definitions atomically. No saved-player overrides
-    // exist in stage1; callers must not present this operation as customization persistence.
+    // Replace this client's authored definitions atomically. Saved-player customization
+    // belongs to a separately negotiated table; this operation only changes author defaults.
     Status (BS_CALL *ReplaceDefinitions)(std::uint64_t client, const Definition* definitions,
         std::uint32_t count, std::uint64_t expectedRegistryRevision);
     // Separate read-only lease pool; no namespace/definition ownership. Observers may

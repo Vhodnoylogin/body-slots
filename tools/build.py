@@ -53,7 +53,7 @@ def main():
     compiler = shutil.which("cl.exe", path=env.get("Path", env.get("PATH")))
     if not compiler:
         raise RuntimeError("x64 compiler not found after environment setup")
-    log.write_text("Body Slots standalone stage1 build\n", encoding="utf-8")
+    log.write_text("Body Slots standalone authored definitions and saved configuration build\n", encoding="utf-8")
 
     def run(command):
         result = subprocess.run([str(value) for value in command], cwd=output, env=env, capture_output=True, text=True)
@@ -83,14 +83,16 @@ def main():
         run(command)
         return target
 
-    dll = compile_target("BodySlots", ["src/registry.cpp", "src/validation.cpp", "src/package.cpp", "src/plugin.cpp"], True)
+    dll = compile_target("BodySlots", ["src/registry.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/package.cpp", "src/plugin.cpp"], True)
     package = output / "examples/potion-belt.bslots"
     run([sys.executable, "-B", ROOT / "tools/author.py", ROOT / "examples/potion-belt.json", "--output", package])
     if not args.skip_tests:
         compile_target("consumer_fixture", ["tests/consumer_fixture.cpp"], True)
         native = compile_target("native_tests", ["tests/native_tests.cpp", "src/validation.cpp", "src/package.cpp"])
+        configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
         run([sys.executable, "-B", ROOT / "tests/test_author.py"])
         run([native, dll, package, output])
+        run([configuration])
         # A disposable synthetic host proves SDK guards/phase ordering without Skyrim.
         fixture = output / "game-fixture"
         fixture.mkdir(exist_ok=True)
@@ -104,7 +106,7 @@ def main():
     artifacts = {}
     for path in (dll, package):
         artifacts[path.name] = {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    (output / "artifacts.json").write_text(json.dumps({"apiVersion": 1, "definitionSize": 408, "slotRecordSize": 424, "apiSizeX64": 80, "testsRun": not args.skip_tests, "artifacts": artifacts}, indent=2) + "\n", encoding="utf-8")
+    (output / "artifacts.json").write_text(json.dumps({"apiVersion": 1, "configurationApiVersion": 1, "definitionSize": 408, "slotRecordSize": 424, "apiSizeX64": 80, "configurationApiSizeX64": 72, "effectiveSlotRecordSize": 440, "testsRun": not args.skip_tests, "artifacts": artifacts}, indent=2) + "\n", encoding="utf-8")
     print(f"BUILD COMPLETE: {dll}\nEVIDENCE: {log}")
 
 

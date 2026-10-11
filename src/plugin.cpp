@@ -8,6 +8,7 @@
 #include "skse64/PluginAPI.h"
 #include "skse64_common/skse_version.h"
 #include "package.h"
+#include "configuration.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -29,6 +30,8 @@ extern "C" __declspec(dllexport) body_slots::Status BS_CALL BodySlots_LoadPackag
 }
 namespace {
 constexpr const char* kPluginName = "BodySlots";
+constexpr UInt32 kSerializationId = 0x534C5342; // BSLS
+constexpr UInt32 kConfigurationRecord = 0x46435342; // BSCF
 struct PluginState {
     std::mutex mutex;
     bool loaded = false, packagesLoaded = false;
@@ -56,10 +59,49 @@ void Log(const std::filesystem::path& directory, const std::string& message) noe
         if (stream) stream << message << '\n';
     } catch (...) {}
 }
+void OnRevert(SKSESerializationInterface*) noexcept {
+    const auto status = body_slots::detail::ResetCustomizations();
+    if (status != body_slots::Status::Ok) Log(State().packages, "customization revert failed");
+}
+void OnSave(SKSESerializationInterface* serialization) noexcept {
+    try {
+        if (!serialization || !serialization->WriteRecord) return;
+        std::vector<std::uint8_t> bytes;
+        auto status = body_slots::detail::SaveCustomizations(bytes);
+        if (status != body_slots::Status::Ok || !serialization->WriteRecord(kConfigurationRecord,
+            body_slots::detail::kCustomizationSaveVersion, bytes.data(), static_cast<UInt32>(bytes.size())))
+            Log(State().packages, "customization save failed; overrides were not written");
+    } catch (...) { Log(State().packages, "customization save internal error"); }
+}
+void OnLoad(SKSESerializationInterface* serialization) noexcept {
+    // End the previous save's state even when the next cosave is empty or malformed.
+    // All records are staged before the single validated registry commit below.
+    OnRevert(serialization);
+    try {
+        if (!serialization || !serialization->GetNextRecordInfo || !serialization->ReadRecordData) return;
+        std::vector<std::uint8_t> candidate; bool seen = false;
+        UInt32 type = 0, version = 0, length = 0;
+        while (serialization->GetNextRecordInfo(&type, &version, &length)) {
+            if (seen || type != kConfigurationRecord || version != body_slots::detail::kCustomizationSaveVersion ||
+                length < body_slots::detail::kCustomizationSaveHeaderBytes || length > body_slots::detail::kMaxCustomizationSaveBytes) {
+                Log(State().packages, "customization load rejected duplicate/unknown/unbounded record batch"); return;
+            }
+            seen = true; candidate.resize(length);
+            if (serialization->ReadRecordData(candidate.data(), length) != length) {
+                Log(State().packages, "customization load rejected truncated record"); return;
+            }
+        }
+        if (seen && body_slots::detail::LoadCustomizations(candidate.data(), static_cast<std::uint32_t>(candidate.size())) != body_slots::Status::Ok)
+            Log(State().packages, "customization load rejected invalid payload; author defaults remain effective");
+    } catch (...) { Log(State().packages, "customization load internal error; author defaults remain effective"); }
+}
 void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
     try {
-        if (!message || !message->sender || std::strcmp(message->sender, "SKSE") ||
-            message->type != SKSEMessagingInterface::kMessage_PostLoad) return;
+        if (!message || !message->sender || std::strcmp(message->sender, "SKSE")) return;
+        if (message->type == SKSEMessagingInterface::kMessage_PreLoadGame || message->type == SKSEMessagingInterface::kMessage_NewGame) {
+            OnRevert(nullptr); return;
+        }
+        if (message->type != SKSEMessagingInterface::kMessage_PostLoad) return;
         auto& state = State(); std::lock_guard<std::mutex> lock(state.mutex);
         if (!state.loaded || state.packagesLoaded) return;
         state.packagesLoaded = true;
@@ -98,7 +140,7 @@ void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
 
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSEInterface* skse, PluginInfo* info) noexcept {
     if (!info) return false;
-    info->infoVersion = PluginInfo::kInfoVersion; info->name = kPluginName; info->version = 1;
+    info->infoVersion = PluginInfo::kInfoVersion; info->name = kPluginName; info->version = 2;
     try { return Compatible(skse); } catch (...) { return false; }
 }
 extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse) noexcept {
@@ -106,11 +148,19 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse)
         if (!Compatible(skse) || !skse->QueryInterface || !skse->GetPluginHandle) return false;
         const auto* messaging = static_cast<SKSEMessagingInterface*>(skse->QueryInterface(kInterface_Messaging));
         if (!messaging || messaging->interfaceVersion < SKSEMessagingInterface::kInterfaceVersion || !messaging->RegisterListener) return false;
+        const auto* serialization = static_cast<SKSESerializationInterface*>(skse->QueryInterface(kInterface_Serialization));
+        if (!serialization || serialization->version < SKSESerializationInterface::kVersion || !serialization->SetUniqueID ||
+            !serialization->SetRevertCallback || !serialization->SetSaveCallback || !serialization->SetLoadCallback ||
+            !serialization->WriteRecord || !serialization->GetNextRecordInfo || !serialization->ReadRecordData) return false;
         auto& state = State(); std::lock_guard<std::mutex> lock(state.mutex);
         if (state.loaded) return false;
         const auto handle = skse->GetPluginHandle(); if (handle == kPluginHandle_Invalid) return false;
         const auto directory = Host().parent_path() / L"Data" / L"SKSE" / L"Plugins" / L"BodySlots";
         if (!messaging->RegisterListener(handle, "SKSE", OnMessage)) return false;
+        serialization->SetUniqueID(handle, kSerializationId);
+        serialization->SetRevertCallback(handle, OnRevert);
+        serialization->SetSaveCallback(handle, OnSave);
+        serialization->SetLoadCallback(handle, OnLoad);
         state.handle = handle; state.packages = directory; state.loaded = true;
         return true;
     } catch (...) { return false; }

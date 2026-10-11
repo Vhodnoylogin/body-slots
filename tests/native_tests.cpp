@@ -2,12 +2,14 @@
 #define NOMINMAX
 #include <Windows.h>
 #include "body_slots_api.h"
+#include "body_slots_configuration_api.h"
 #include "package.h"
 #include "validation.h"
 #include "common/ITypes.h"
 #include "skse64/PluginAPI.h"
 #include "skse64_common/skse_version.h"
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <fstream>
@@ -242,7 +244,33 @@ void Packages(const Api& api, HMODULE dll, const fs::path& source, const fs::pat
 static SKSEMessagingInterface::EventCallback listener = nullptr;
 static bool listenerResult = true;
 static SKSEMessagingInterface messaging{};
-static void* Interface(UInt32 id) { return id == kInterface_Messaging ? &messaging : nullptr; }
+static SKSESerializationInterface serialization{};
+static SKSESerializationInterface::EventCallback onSave = nullptr, onLoad = nullptr, onRevert = nullptr;
+static UInt32 serializationId = 0;
+struct SavedRecord { UInt32 type, version; std::vector<unsigned char> bytes; };
+static std::vector<SavedRecord> savedRecords;
+static std::size_t recordCursor = 0;
+static bool truncatedRead = false;
+static void UniqueID(PluginHandle handle, UInt32 id) { if (handle == 42) serializationId = id; }
+static void SaveCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onSave = cb; }
+static void LoadCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onLoad = cb; }
+static void RevertCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onRevert = cb; }
+static bool WriteRecord(UInt32 type, UInt32 version, const void* buffer, UInt32 length) {
+    const auto* bytes = static_cast<const unsigned char*>(buffer); savedRecords.push_back({type, version, {bytes, bytes + length}}); return true;
+}
+static bool NextRecord(UInt32* type, UInt32* version, UInt32* length) {
+    if (recordCursor == savedRecords.size()) return false;
+    const auto& record = savedRecords[recordCursor++]; *type = record.type; *version = record.version; *length = static_cast<UInt32>(record.bytes.size()); return true;
+}
+static UInt32 ReadRecord(void* buffer, UInt32 length) {
+    const auto& record = savedRecords[recordCursor - 1];
+    const auto bytes = std::min(length, static_cast<UInt32>(record.bytes.size()));
+    std::memcpy(buffer, record.bytes.data(), bytes); return truncatedRead && bytes ? bytes - 1 : bytes;
+}
+static void* Interface(UInt32 id) {
+    if (id == kInterface_Messaging) return &messaging;
+    return id == kInterface_Serialization ? &serialization : nullptr;
+}
 static PluginHandle Handle() { return 42; }
 static bool Listen(PluginHandle handle, const char* sender, SKSEMessagingInterface::EventCallback callback) {
     if (handle != 42 || std::strcmp(sender, "SKSE")) return false;
@@ -261,7 +289,12 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     bad = skse; bad.skseVersion = 0; CHECK(!query(&bad, &info) && !load(&bad));
     CHECK(!load(&skse)); messaging.interfaceVersion = 1; messaging.RegisterListener = Listen; CHECK(!load(&skse));
     messaging.interfaceVersion = SKSEMessagingInterface::kInterfaceVersion; listenerResult = false; CHECK(!load(&skse));
-    listenerResult = true; CHECK(load(&skse) && listener); CHECK(!load(&skse));
+    listenerResult = true; CHECK(!load(&skse));
+    serialization.version = SKSESerializationInterface::kVersion;
+    serialization.SetUniqueID = UniqueID; serialization.SetSaveCallback = SaveCallback;
+    serialization.SetLoadCallback = LoadCallback; serialization.SetRevertCallback = RevertCallback;
+    serialization.WriteRecord = WriteRecord; serialization.GetNextRecordInfo = NextRecord; serialization.ReadRecordData = ReadRecord;
+    CHECK(load(&skse) && listener && onSave && onLoad && onRevert && serializationId == 0x534C5342); CHECK(!load(&skse));
     std::uint64_t observer = 0; CHECK(api.RegisterObserver(&observer) == Status::Ok);
     CHECK(Copy(api, observer).count == 0);
     SKSEMessagingInterface::Message message{"other", SKSEMessagingInterface::kMessage_PostLoad, 0, nullptr};
@@ -271,8 +304,38 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     message.type = SKSEMessagingInterface::kMessage_PostLoad; listener(&message);
     auto snapshot = Copy(api, observer); CHECK(snapshot.count == 1 && !std::strcmp(snapshot.records[0].definition.provider, "example.potion-belt"));
     listener(&message); Same(snapshot, Copy(api, observer));
+    const auto configurationQuery = reinterpret_cast<QueryConfigurationInterface>(GetProcAddress(dll, "BodySlots_QueryConfigurationInterface"));
+    CHECK(configurationQuery && !configurationQuery(0, sizeof(ConfigurationApi)) && !configurationQuery(1, sizeof(ConfigurationApi) - 1));
+    const auto* configuration = configurationQuery(1, sizeof(ConfigurationApi)); CHECK(configuration && configuration->capabilities == 3);
+    std::array<EffectiveSlotRecord, kMaxDefinitions> effective{}; std::uint32_t count = 0; std::uint64_t revision = 0;
+    auto copyEffective = [&] { CHECK(configuration->CopyEffectiveDefinitions(observer, 0, effective.data(), kMaxDefinitions, &count, &revision) == Status::Ok); CHECK(count == 1); };
+    copyEffective(); std::uint64_t editor = 0; CHECK(configuration->RegisterCustomizer("fixture.customizer", &editor) == Status::Ok);
+    Customization customization{}; customization.structSize = sizeof(customization); customization.fieldMask = CustomizePosition;
+    std::strcpy(customization.provider, snapshot.records[0].definition.provider); std::strcpy(customization.key, snapshot.records[0].definition.key);
+    customization.position[0] = 123; EffectiveSlotRecord committed{};
+    CHECK(configuration->ApplyCustomization(editor, &customization, revision, &committed) == Status::Ok);
+    savedRecords.clear(); onSave(&serialization); CHECK(savedRecords.size() == 1 && savedRecords[0].bytes.size() == 224);
+    const auto saved = savedRecords;
+    onRevert(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
+    Same(snapshot, Copy(api, observer)); // customization never replaces author defaults
+    auto rejectLoad = [&] {
+        recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    };
+    savedRecords = saved; savedRecords[0].version = 99; rejectLoad();
+    savedRecords = saved; savedRecords[0].bytes[4] = 99; rejectLoad();
+    savedRecords = saved; savedRecords.push_back(saved[0]); rejectLoad();
+    savedRecords = saved; savedRecords[0].bytes.back() = 1; rejectLoad();
+    savedRecords = saved; truncatedRead = true; rejectLoad(); truncatedRead = false;
+    savedRecords = saved; recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
+    message.type = SKSEMessagingInterface::kMessage_PreLoadGame; listener(&message); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    savedRecords = saved; recordCursor = 0; onLoad(&serialization);
+    message.type = SKSEMessagingInterface::kMessage_NewGame; listener(&message); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    savedRecords = saved; recordCursor = 0; onLoad(&serialization);
+    savedRecords.clear(); recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    CHECK(configuration->ReleaseCustomizer(editor) == Status::Ok);
     CHECK(api.ReleaseClient(observer) == Status::Ok);
-    std::cout << "PASS simulated public SKSE messaging, guards, PostLoad-only package load, corrupt package isolation\n";
+    std::cout << "PASS simulated public SKSE messaging and serialization: save/load/revert, new-game/load boundaries, malformed/duplicate/truncated batch isolation\n";
 }
 int wmain(int argc, wchar_t** argv) {
     try {
