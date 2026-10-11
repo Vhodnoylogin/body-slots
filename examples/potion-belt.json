@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "provider": "example.potion-belt",
+  "referenceRig": "skyrimvr-humanoid-v1",
+  "units": "skyrim-engine-unit",
+  "axes": "right-handed-z-up",
+  "slots": [
+    {
+      "key": "potion/front-left",
+      "anchor": "NPC Pelvis [Pelv]",
+      "kind": "potion-pouch",
+      "enabled": true,
+      "position": [6.0, 14.0, 0.0],
+      "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+      "accessRegion": {"shape": "sphere", "center": [0.0, 0.0, 2.0], "radius": 10.0},
+      "hands": ["left"],
+      "contents": ["potion"],
+      "scaleMode": "anchor"
+    }
+  ]
+}
