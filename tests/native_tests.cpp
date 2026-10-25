@@ -6,6 +6,7 @@
 #include "body_slots_native_placement_api.h"
 #include "body_slots_native_policy_api.h"
 #include "body_slots_instance_api.h"
+#include "body_slots_instance_configuration_api.h"
 #include "package.h"
 #include "validation.h"
 #include "common/ITypes.h"
@@ -254,12 +255,18 @@ struct SavedRecord { UInt32 type, version; std::vector<unsigned char> bytes; };
 static std::vector<SavedRecord> savedRecords;
 static std::size_t recordCursor = 0;
 static bool truncatedRead = false;
+static int failedWrite = -1;
+static unsigned writeCalls = 0;
+static bool retainFailedWrite = false, resetScopeOnRead = false;
 static void UniqueID(PluginHandle handle, UInt32 id) { if (handle == 42) serializationId = id; }
 static void SaveCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onSave = cb; }
 static void LoadCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onLoad = cb; }
 static void RevertCallback(PluginHandle handle, SKSESerializationInterface::EventCallback cb) { if (handle == 42) onRevert = cb; }
 static bool WriteRecord(UInt32 type, UInt32 version, const void* buffer, UInt32 length) {
-    const auto* bytes = static_cast<const unsigned char*>(buffer); savedRecords.push_back({type, version, {bytes, bytes + length}}); return true;
+    const bool failed = static_cast<int>(writeCalls++) == failedWrite;
+    const auto* bytes = static_cast<const unsigned char*>(buffer);
+    if (!failed || retainFailedWrite) savedRecords.push_back({type, version, {bytes, bytes + length}});
+    return !failed;
 }
 static bool NextRecord(UInt32* type, UInt32* version, UInt32* length) {
     if (recordCursor == savedRecords.size()) return false;
@@ -268,7 +275,9 @@ static bool NextRecord(UInt32* type, UInt32* version, UInt32* length) {
 static UInt32 ReadRecord(void* buffer, UInt32 length) {
     const auto& record = savedRecords[recordCursor - 1];
     const auto bytes = std::min(length, static_cast<UInt32>(record.bytes.size()));
-    std::memcpy(buffer, record.bytes.data(), bytes); return truncatedRead && bytes ? bytes - 1 : bytes;
+    std::memcpy(buffer, record.bytes.data(), bytes);
+    if (resetScopeOnRead) { resetScopeOnRead = false; onRevert(&serialization); }
+    return truncatedRead && bytes ? bytes - 1 : bytes;
 }
 static void* Interface(UInt32 id) {
     if (id == kInterface_Messaging) return &messaging;
@@ -404,6 +413,62 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     activate(); message.type = SKSEMessagingInterface::kMessage_NewGame; listener(&message); resetInstances(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
     savedRecords = saved; loadScope();
     savedRecords.clear(); loadScope(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    const auto instanceConfigurationQuery = reinterpret_cast<QueryInstanceConfigurationInterface>(
+        GetProcAddress(dll, "BodySlots_QueryInstanceConfigurationInterface")); CHECK(instanceConfigurationQuery);
+    const auto* instanceConfiguration = instanceConfigurationQuery(1, sizeof(InstanceConfigurationApi)); CHECK(instanceConfiguration);
+    auto copySavedInstances = [&](unsigned expectedCount) {
+        InstanceView view{sizeof(view), 1, 0, 0, 0, 0, 0, 0}; InstanceCustomizationRecord record{};
+        CHECK(instanceConfiguration->CopyCustomizations(observer, 0, 0, &record, 1, &view) == Status::Ok);
+        CHECK(view.count == expectedCount); if (expectedCount) CHECK(record.available == 0);
+    };
+    copyEffective();
+    CHECK(configuration->ApplyCustomization(editor, &customization, revision, &committed) == Status::Ok);
+    activate();
+    InstanceCustomization instancePatch{}; instancePatch.structSize = sizeof(instancePatch); instancePatch.fieldMask = CustomizePosition;
+    instancePatch.key.instance = active.key;
+    std::memcpy(instancePatch.key.definitionProvider, active.definitionProvider, 64); std::memcpy(instancePatch.key.definitionKey, active.definitionKey, 64);
+    instancePatch.position[0] = 234; ConfiguredInstanceRecord configured{}; configured.instance.structSize = sizeof(InstanceRecord);
+    auto currentInstanceView = instanceHeader();
+    CHECK(instanceConfiguration->ApplyCustomization(editor, &instancePatch, currentInstanceView.saveGeneration,
+        currentInstanceView.viewRevision, &configured) == Status::Ok && configured.instance.effective.position[0] == 234);
+    savedRecords.clear(); writeCalls = 0; onSave(&serialization);
+    CHECK(savedRecords.size() == 2 && writeCalls == 2);
+    CHECK(savedRecords[0].type == 0x49435342 && savedRecords[0].version == 1 && savedRecords[0].bytes.size() == 416);
+    CHECK(savedRecords[1].type == saved[0].type && savedRecords[1].bytes == saved[0].bytes);
+    const auto pair = savedRecords;
+    auto checkBatch = [&](bool valid) {
+        recordCursor = 0; onLoad(&serialization); copyEffective();
+        CHECK((effective[0].slot.definition.position[0] == 123) == valid);
+        CHECK(instanceHeader().count == 0); copySavedInstances(valid ? 1u : 0u);
+    };
+    savedRecords = pair; checkBatch(true);
+    savedRecords = pair; std::reverse(savedRecords.begin(), savedRecords.end()); checkBatch(true);
+    savedRecords = {pair[0]}; checkBatch(false); // BSCI without its required BSCF partner
+    savedRecords = pair; savedRecords.push_back(pair[0]); checkBatch(false);
+    savedRecords = pair; savedRecords.push_back(pair[1]); checkBatch(false);
+    savedRecords = pair; savedRecords[0].version = 99; checkBatch(false);
+    savedRecords = pair; savedRecords[0].bytes[0] ^= 0x80; checkBatch(false);
+    savedRecords = pair; savedRecords[1].bytes.back() = 1; checkBatch(false);
+    savedRecords = pair; savedRecords[0].type = 0x12345678; checkBatch(false);
+    savedRecords = pair; truncatedRead = true; checkBatch(false); truncatedRead = false;
+    savedRecords = pair; resetScopeOnRead = true; checkBatch(false); CHECK(!resetScopeOnRead);
+    // A failed first write stops before BSCF. A failed second write leaves BSCI
+    // alone and is rejected; a complete retained pair remains a valid snapshot.
+    for (int failure = 0; failure < 2; ++failure) for (const bool retain : {false, true}) {
+        savedRecords = pair; checkBatch(true);
+        savedRecords.clear(); writeCalls = 0; failedWrite = failure; retainFailedWrite = retain;
+        onSave(&serialization); failedWrite = -1; retainFailedWrite = false;
+        CHECK(writeCalls == static_cast<unsigned>(failure + 1));
+        CHECK(savedRecords.size() == static_cast<unsigned>(failure + (retain ? 1 : 0)));
+        checkBatch(failure == 1 && retain);
+    }
+    savedRecords = pair; checkBatch(true);
+    savedRecords.clear(); writeCalls = 0; onSave(&serialization);
+    CHECK(savedRecords.size() == 2 && savedRecords[0].bytes == pair[0].bytes && savedRecords[1].bytes == pair[1].bytes); // dormant records resave
+    message.type = SKSEMessagingInterface::kMessage_NewGame; listener(&message); copySavedInstances(0); copyEffective();
+    CHECK(effective[0].slot.definition.position[0] != 123 && instanceHeader().count == 0);
+    savedRecords = saved; recordCursor = 0; onLoad(&serialization); copySavedInstances(0); copyEffective();
+    CHECK(effective[0].slot.definition.position[0] == 123); // legacy BSCF remains readable
     CHECK(api.ReleaseClient(equipmentWriter) == Status::Ok);
     CHECK(configuration->ReleaseCustomizer(editor) == Status::Ok);
     CHECK(policy->ReleaseOwner(policyOwner) == Status::Ok);

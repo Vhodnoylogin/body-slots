@@ -6,9 +6,11 @@ Body Slots owns definitions, stable keys, local placement and generic content po
 
 This first development snapshot is not a released or game-tested mod. It contains newly written code; reconstructed VRIK code stays in its separate private repository.
 
-The separate [configuration API](docs/configuration.md) stores save-scoped placement overrides without changing authored defaults or the original definition ABI. It exposes effective copied placement and eligibility, with provider/key persistence and revision-checked edits. Saved per-instance overrides, content previews and inventory transactions remain later services.
+The separate [configuration API](docs/configuration.md) stores save-scoped placement overrides without changing authored defaults or the original definition ABI. It exposes effective copied placement and eligibility, with provider/key persistence and revision-checked edits. This service remains definition-scoped; instance-specific placement uses the separate table below.
 
-The additive [instance API](docs/instances.md) now supports transient equipment-provider-owned logical instances of existing definitions, with explicit body-anchor binding, independent activation, pinned template revisions and coherent copied effective placement. Equipment keys come from the caller; per-instance persistence, equipment-node binding, content previews and item transactions remain later services.
+The additive [instance API](docs/instances.md) now supports transient equipment-provider-owned logical instances of existing definitions, with explicit body-anchor binding, independent activation, pinned template revisions and coherent copied effective placement. Equipment keys come from the caller; activation persistence, equipment-node binding, content previews and item transactions remain later services.
+
+The separate [saved instance configuration API](docs/instance-configuration.md) stores stable-keyed position, rotation, access-region and enabled overrides, including dormant equipment keys. Its configured copies compose after definition-scoped overrides while old instance copies keep their inherited semantics. BSCI placement records and BSCF definition records load as one validated batch; runtime activation, handles and item assignments are not saved.
 
 The additive [native14 placement compatibility service](docs/native-placement.md) owns the original fourteen raw local poses when VRIK explicitly attaches. It preserves their existing global INI persistence and does not mix them with per-save customization or generic registry identities. Native interaction/rendering and old equipment arrays remain in VRIK.
 

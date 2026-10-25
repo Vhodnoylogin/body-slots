@@ -26,7 +26,7 @@ The view carries save generation, view revision, authored registry revision and 
 
 Releasing a writer removes its runtime instances atomically with its authored definitions, including writers that own no definitions. Other owners' references to removed templates remain explicitly missing. Save-scope reset clears all instances and advances generation/view revision together with the existing configuration reset. Preload, revert, load (including empty/malformed saves) and new game invalidate old handles. Multiple callbacks may advance generation more than once; consumers compare the captured generation rather than assuming an increment count.
 
-Saving does not write instances. Existing `BSCF` bytes/parser, author packages and both global native compatibility banks remain unchanged. Only definition-wide customization is restored by BSCF. Equipment providers recreate runtime activation in the destination scope; no automatic bag restoration is promised. A failed save-scope reset aborts loading new customization rather than applying it to old runtime instances.
+Saving does not write runtime instances or activation. Existing `BSCF` bytes, author packages and both global native compatibility banks remain unchanged. Only definition-wide customization is restored by BSCF. The separate [saved instance configuration service](instance-configuration.md) adds placement-only BSCI records and a joint two-record dispatcher without changing this runtime-instance API. Equipment providers recreate runtime activation in the destination scope; no automatic bag restoration is promised. A failed save-scope reset aborts loading new customization rather than applying it to old runtime instances.
 
 ## Verification boundary
 

@@ -49,4 +49,5 @@ private:
 };
 // Save-scope invalidation is separate from a standalone configuration reset.
 Status ResetSaveScope() noexcept;
+Status ResetSaveScope(InstanceView* committed) noexcept;
 } // namespace body_slots::detail

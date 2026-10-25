@@ -4,7 +4,8 @@
 Uses test-only private counter access to the actual InstanceStore and Registry.
 The actual BeginSaveScope/OnLoad methods run against a counted public SKSE
 serialization interface; an external negative control removes only the reset
-check and reproduces the original cross-save failure. No testing ABI or DLL is
+check, while the later batch CAS independently rejects publication. Both saved
+stores are included in failure snapshots. No testing ABI or DLL is
 published. This is a standalone source fixture, not game validation.
 
 Requires the installed x64 MSVC toolchain and public SDK headers, like build.py.
@@ -20,6 +21,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -66,12 +68,16 @@ std::vector<std::uint8_t> RegistryBytes() {
         bytes.insert(bytes.end(), p, p + sizeof(field));
     };
     append(s.clients); append(s.records); append(s.customizers); append(s.customizations);
+    auto saved = std::make_unique<InstanceCustomizationData>();
+    s.instanceCustomizations.CopyTo(*saved); append(*saved);
     append(s.instances.state_); append(s.count); append(s.revision); append(s.nextToken);
     append(s.nextSlot); append(s.nextDefinitionRevision); append(s.configurationRevision);
     return bytes;
 }
 void ResetFixture() {
     auto& s = State(); s.clients={}; s.records={}; s.customizers={}; s.customizations={};
+    auto savedReset = std::make_unique<InstanceCustomizationStore::Candidate>();
+    s.instanceCustomizations.PrepareReset(*savedReset); s.instanceCustomizations.Apply(*savedReset);
     s.instances.state_={}; s.count=0;
     s.revision=s.nextToken=s.nextSlot=s.nextDefinitionRevision=s.configurationRevision=1;
 }
@@ -191,12 +197,100 @@ void RegistryAtomicity() {
     CHECK(s.count==1 && s.instances.Count()==0 && s.instances.ViewRevision()==view+1);
     CHECK(s.revision==registryRev && s.configurationRevision==configRev && !s.FindClient(fresh.equipment));
 }
+InstanceCustomization SeedSaved(const Seed& seed) {
+    InstanceCustomization value{}; value.structSize=sizeof(value); value.fieldMask=CustomizePosition;
+    value.key=CustomizationKey(*State().instances.Find(seed.instance.instanceHandle)); value.position[0]=7;
+    ConfiguredInstanceRecord out{}; out.instance.structSize=sizeof(InstanceRecord);
+    CHECK(ApplyInstanceCustomization(seed.customizer,&value,State().instances.Generation(),State().instances.ViewRevision(),&out)==Status::Ok);
+    CHECK(out.instance.effective.position[0]==7 && out.instanceCustomizationMask==CustomizePosition);
+    return value;
+}
+std::vector<std::uint8_t> SavedPayload(float position) {
+    auto data=std::make_unique<InstanceCustomizationData>(); State().instanceCustomizations.CopyTo(*data);
+    data->entries[0].position[0]=position; std::vector<std::uint8_t> bytes;
+    CHECK(EncodeInstanceCustomizations(*data,bytes)==Status::Ok); return bytes;
+}
+void SavedInstanceAtomicity() {
+    auto seed=SeedRegistry(); auto saved=SeedSaved(seed); auto& s=State();
+    const auto definitions=Payload(9), instances=SavedPayload(11);
+    CHECK(EffectiveInstance(s,*s.instances.Find(seed.instance.instanceHandle)).effective.position[0]==2);
+    const auto oldScope=s.instances.Generation(), oldView=s.instances.ViewRevision();
+    const auto beforeStale=RegistryBytes();
+    CHECK(LoadConfigurationBatch(&definitions,&instances,oldScope+1,oldView)==Status::Conflict);
+    CHECK(RegistryBytes()==beforeStale);
+    CHECK(LoadConfigurationBatch(&definitions,&instances,oldScope,oldView+1)==Status::Conflict);
+    CHECK(RegistryBytes()==beforeStale);
+    auto invalidInstances=instances; invalidInstances.pop_back();
+    CHECK(LoadConfigurationBatch(&definitions,&invalidInstances,oldScope,oldView)==Status::InvalidArgument);
+    CHECK(RegistryBytes()==beforeStale);
+    auto invalidDefinitions=definitions; invalidDefinitions.pop_back();
+    CHECK(LoadConfigurationBatch(&invalidDefinitions,&instances,oldScope,oldView)==Status::InvalidArgument);
+    CHECK(RegistryBytes()==beforeStale);
+
+    s.instances.state_.view=Max;
+    const auto before=RegistryBytes();
+    InstanceView rejected{}; std::memset(&rejected,0xa5,sizeof(rejected)); const auto sentinel=rejected;
+    CHECK(ResetSaveScope(&rejected)==Status::LimitExceeded);
+    CHECK(std::memcmp(&rejected,&sentinel,sizeof(rejected))==0 && RegistryBytes()==before);
+    CHECK(LoadConfigurationBatch(&definitions,&instances,s.instances.Generation(),s.instances.ViewRevision())==Status::LimitExceeded);
+    CHECK(RegistryBytes()==before);
+    auto changed=saved; changed.position[0]=13;
+    ConfiguredInstanceRecord output{}; output.instance.structSize=sizeof(InstanceRecord); output.instance.flags=0xa5a5a5a5;
+    const auto outputSentinel=output;
+    CHECK(ApplyInstanceCustomization(seed.customizer,&changed,s.instances.Generation(),s.instances.ViewRevision(),&output)==Status::LimitExceeded);
+    CHECK(std::memcmp(&output,&outputSentinel,sizeof(output))==0 && RegistryBytes()==before);
+    CHECK(ClearInstanceCustomization(seed.customizer,&saved.key,s.instances.Generation(),s.instances.ViewRevision())==Status::LimitExceeded);
+    CHECK(RegistryBytes()==before);
+    CHECK(ApplyInstanceCustomization(seed.customizer,&saved,s.instances.Generation(),s.instances.ViewRevision(),&output)==Status::Ok);
+    CHECK(RegistryBytes()==before); // Identical customization needs no new revision.
+
+    seed=SeedRegistry(); saved=SeedSaved(seed); s.instances.state_.generation=Max;
+    const auto generationBefore=RegistryBytes(); rejected=sentinel;
+    CHECK(ResetSaveScope(&rejected)==Status::LimitExceeded);
+    CHECK(RegistryBytes()==generationBefore && std::memcmp(&rejected,&sentinel,sizeof(rejected))==0);
+    seed=SeedRegistry(); saved=SeedSaved(seed); s.configurationRevision=Max;
+    const auto configurationBefore=RegistryBytes();
+    CHECK(ResetSaveScope(&rejected)==Status::LimitExceeded);
+    CHECK(RegistryBytes()==configurationBefore);
+    CHECK(LoadConfigurationBatch(&definitions,&instances,s.instances.Generation(),s.instances.ViewRevision())==Status::LimitExceeded);
+    CHECK(RegistryBytes()==configurationBefore);
+
+    seed=SeedRegistry(); saved=SeedSaved(seed);
+    CHECK(ResetCustomizations()==Status::Ok); // Existing internal helper remains definition-only.
+    CHECK(s.customizations.count==0 && s.instanceCustomizations.Count()==1);
+    CHECK(LoadCustomizations(definitions.data(),static_cast<std::uint32_t>(definitions.size()))==Status::Ok);
+    CHECK(s.instanceCustomizations.Count()==1);
+    CHECK(EffectiveInstance(s,*s.instances.Find(seed.instance.instanceHandle)).effective.position[0]==9);
+    CHECK(ConfiguredInstance(s,*s.instances.Find(seed.instance.instanceHandle)).instance.effective.position[0]==7);
+    CHECK(RemoveInstance(seed.equipment,seed.instance.instanceHandle,s.instances.Generation(),seed.instance.instanceRevision)==Status::Ok);
+    auto other=Template(); std::strcpy(other.key,"other"); SlotRecord otherRecord{};
+    CHECK(UpsertDefinition(seed.author,&other,0,&otherRecord)==Status::Ok);
+    auto spec=Spec(otherRecord.definitionRevision); std::strcpy(spec.definitionKey,"other");
+    InstanceRecord recreated{}; recreated.structSize=sizeof(recreated);
+    CHECK(UpsertInstance(seed.equipment,&spec,s.instances.Generation(),0,&recreated)==Status::Ok);
+    CHECK(ConfiguredInstance(s,*s.instances.Find(recreated.instanceHandle)).instanceCustomizationMask==0);
+    CHECK(s.instanceCustomizations.Count()==1 && FindCustomizationInstance(s,saved.key)==nullptr);
+    CHECK(ClearInstanceCustomization(seed.customizer,&saved.key,s.instances.Generation(),s.instances.ViewRevision())==Status::Ok);
+    CHECK(s.instanceCustomizations.Count()==0); // Dormant keys remain clearable.
+
+    seed=SeedRegistry(); saved=SeedSaved(seed);
+    InstanceView loadView{}; CHECK(ResetSaveScope(&loadView)==Status::Ok);
+    CHECK(s.customizations.count==0 && s.instanceCustomizations.Count()==0 && s.instances.Count()==0);
+    CHECK(LoadConfigurationBatch(&definitions,&instances,loadView.saveGeneration,loadView.viewRevision)==Status::Ok);
+    CHECK(s.customizations.count==1 && s.customizations.entries[0].position[0]==9);
+    CHECK(s.instanceCustomizations.Count()==1 && s.instanceCustomizations.At(0).position[0]==11);
+    spec=Spec(seed.definition.definitionRevision); recreated={}; recreated.structSize=sizeof(recreated);
+    CHECK(UpsertInstance(seed.equipment,&spec,s.instances.Generation(),0,&recreated)==Status::Ok);
+    CHECK(EffectiveInstance(s,*s.instances.Find(recreated.instanceHandle)).effective.position[0]==9);
+    CHECK(ConfiguredInstance(s,*s.instances.Find(recreated.instanceHandle)).instance.effective.position[0]==11);
+}
 namespace plugin_fixture {
 struct PluginState { std::filesystem::path packages; };
 PluginState& State() { static PluginState state; return state; }
 unsigned warnings=0, nextCalls=0, readCalls=0; bool offered=false;
 std::vector<std::uint8_t> payload;
 constexpr UInt32 kConfigurationRecord=0x46435342;
+constexpr UInt32 kInstanceConfigurationRecord=0x49435342;
 void Log(const std::filesystem::path&, const std::string&) noexcept { ++warnings; }
 bool Next(UInt32* type,UInt32* version,UInt32* length) {
     ++nextCalls; if(offered) return false; offered=true;
@@ -215,14 +309,14 @@ void Exercise() {
     nextCalls=readCalls=warnings=0; offered=false;
     OnLoad(&api);
     CHECK(nextCalls==0 && readCalls==0 && warnings==1); CHECK(RegistryBytes()==before);
-    // Test-only negative control restores the original unchecked-reset bug in the
-    // actual extracted callback, demonstrating why a checked scope boundary matters.
+    // Removing the early reset guard still permits record reads. The new exact
+    // loadView CAS independently prevents the original cross-scope publication.
     nextCalls=readCalls=warnings=0; offered=false;
     const auto oldConfiguration=body_slots::detail::State().configurationRevision;
     OnLoadUnchecked(&api);
-    CHECK(nextCalls==2 && readCalls==1 && warnings==1);
-    CHECK(body_slots::detail::State().configurationRevision==oldConfiguration+1);
-    CHECK(body_slots::detail::State().customizations.entries[0].position[0]==9);
+    CHECK(nextCalls==2 && readCalls==1 && warnings==2);
+    CHECK(body_slots::detail::State().configurationRevision==oldConfiguration);
+    CHECK(RegistryBytes()==before);
     CHECK(body_slots::detail::State().instances.Generation()==Max && body_slots::detail::State().instances.Count()==1);
     SeedRegistry(); payload=Payload(9); nextCalls=readCalls=warnings=0; offered=false;
     const auto oldGeneration=body_slots::detail::State().instances.Generation();
@@ -235,7 +329,10 @@ void Exercise() {
 int main() {
     try {
         PureExhaustion(); RegistryAtomicity(); plugin_fixture::Exercise();
-        std::cout<<"PASS "<<checks<<" checks: actual InstanceStore/Registry forced exhaustion, coupled failure atomicity, zero-definition writer release, actual OnLoad reset gate and original negative counterexample\n";
+        if(checks!=125) throw std::runtime_error("original boundary phase must retain 125 checks");
+        std::cout<<"PASS "<<checks<<" checks: original exhaustion/release/reset boundaries; unchecked-reset negative control now also blocked by batch CAS\n";
+        const auto previous=checks; SavedInstanceAtomicity();
+        std::cout<<"PASS "<<(checks-previous)<<" saved-instance checks: both-store atomic reset/load, exhaustion/CAS, dormant template identity and old inherited-only APIs\n";
     } catch(const std::exception& error) { std::cerr<<error.what()<<"\n"; return 1; }
 }
 '''
@@ -287,19 +384,20 @@ def main():
         "src/instances.h", "src/instances.cpp", "src/registry.cpp", "src/plugin.cpp",
         "src/validation.h", "src/validation.cpp", "src/configuration.h",
         "src/configuration_serialization.cpp", "src/runtime_token.h",
+        "src/instance_configuration.h", "src/instance_configuration.cpp",
         "include/body_slots_api.h", "include/body_slots_instance_api.h",
-        "include/body_slots_configuration_api.h",
+        "include/body_slots_configuration_api.h", "include/body_slots_instance_configuration_api.h",
     )] + [sdk / "sksevr/skse64/PluginAPI.h", helper, Path(__file__).resolve()]
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in pins}
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     plugin = (ROOT / "src/plugin.cpp").read_text(encoding="utf-8")
-    begin = extract(plugin, "bool BeginSaveScope()")
+    begin = extract(plugin, "bool BeginSaveScope(")
     load = extract(plugin, "void OnLoad(")
-    guard = "if (!BeginSaveScope()) return;"
+    guard = "if (!BeginSaveScope(&loadView)) return;"
     if load.count(guard) != 1:
         raise RuntimeError("production OnLoad reset gate changed; review fixture extraction")
     unchecked = load.replace("void OnLoad(", "void OnLoadUnchecked(", 1).replace(
-        guard, "(void)BeginSaveScope(); /* test-only original unchecked-reset counterexample */", 1)
+        guard, "(void)BeginSaveScope(&loadView); /* test-only unchecked-reset negative control */", 1)
     fixture = output / "instance_boundary_fixture.cpp"
     fixture.write_text(CPP.replace("@@PLUGIN_CURRENT@@", begin + "\n" + load)
                        .replace("@@PLUGIN_UNSAFE@@", unchecked), encoding="utf-8")
@@ -316,7 +414,8 @@ def main():
                "/D_CRT_SECURE_NO_WARNINGS", "/I" + str(ROOT / "include"), "/I" + str(ROOT / "src"),
                "/I" + str(sdk), "/I" + str(sdk / "sksevr"), "/Fo" + str(output) + os.sep,
                "/Fe:" + str(executable), str(fixture), str(ROOT / "src/validation.cpp"),
-               str(ROOT / "src/configuration_serialization.cpp"), "/link", "/INCREMENTAL:NO",
+               str(ROOT / "src/configuration_serialization.cpp"), str(ROOT / "src/instance_configuration.cpp"),
+               "/link", "/INCREMENTAL:NO",
                "/MACHINE:X64", "/STACK:8388608"]
     compiled = subprocess.run(command, cwd=output, env=env, capture_output=True)
     compile_log = output / "compile.log"
@@ -328,6 +427,7 @@ def main():
     for path in pins:
         if hashlib.sha256(path.read_bytes()).hexdigest() != hashes[str(path)]:
             raise RuntimeError(f"source changed during fixture build: {path}")
+    saved_checks = re.search(r"PASS (\d+) saved-instance checks:", result.stdout)
     manifest = {
         "productionCommit": commit,
         "sourcePins": hashes,
@@ -337,11 +437,12 @@ def main():
         "compileCommand": command,
         "compileExitCode": compiled.returncode,
         "runExitCode": result.returncode,
-        "expectedChecks": 125,
+        "originalBoundaryChecks": 125,
+        "savedInstanceChecks": int(saved_checks.group(1)) if saved_checks else None,
         "sourceInstrumentation": [
             "#define private public only while including actual instances.h",
             "include actual instances.cpp and registry.cpp into the fixture translation unit",
-            "extract actual BeginSaveScope/OnLoad; duplicate OnLoad with only the reset-return guard removed for the original negative counterexample",
+            "extract actual BeginSaveScope/OnLoad; remove only the reset-return guard in the negative control, whose reads are now rejected by the independent batch scope/view CAS",
         ],
         "boundaries": "Standalone production source with forced private exhaustion counters and mocked public SKSESerializationInterface read callbacks/log boundary; no installed game or full plugin/DLL load",
         "gameStarts": 0,
@@ -349,7 +450,7 @@ def main():
         "fullBodySlotsDllLoads": 0,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    if result.returncode or "PASS 125 checks:" not in result.stdout:
+    if result.returncode or "PASS 125 checks:" not in result.stdout or not saved_checks:
         raise RuntimeError(f"instance boundary fixture failed; see {output / 'run.log'}")
     print(result.stdout, end="")
     print(f"Evidence: {output / 'manifest.json'}")
