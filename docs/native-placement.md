@@ -10,7 +10,7 @@ The copied ABI is in `include/body_slots_native_placement_api.h`: a 48-byte pose
 
 Leases and revisions are process-local and monotonic. Release invalidates the owner, clears inaccessible pose data and never recycles its identity. The next acquisition receives a later revision. No callbacks, Skyrim pointers, allocated objects or caller-owned buffers are retained. This is cooperation between plugins in one process, not a security boundary. Tables are valid only while the provider remains loaded; hot DLL unloading is unsupported.
 
-`NativePlacementStore` encapsulates the bank. Pure transition builders construct acquisition, release and replacement candidates. Only its private `Commit` method publishes state under the store lock. ABI functions delegate to this owner.
+`NativePlacementStore` is a typed instance of the private `OwnedNativeBank` class, shared with the [policy bank](native-policy.md). Pure transition builders construct acquisition, release and replacement candidates. Only its private `Commit` method publishes state under the store lock. ABI functions delegate to this owner. Tagged runtime owner IDs prevent accidental reuse of registry or policy handles here; public record/table shapes remain unchanged.
 
 ## Existing persistence and VRIK boundary
 

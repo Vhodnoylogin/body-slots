@@ -4,6 +4,7 @@
 #include "body_slots_api.h"
 #include "body_slots_configuration_api.h"
 #include "body_slots_native_placement_api.h"
+#include "body_slots_native_policy_api.h"
 #include "package.h"
 #include "validation.h"
 #include "common/ITypes.h"
@@ -320,12 +321,35 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     std::uint64_t nativeOwner = 0;
     CHECK(native->AcquireOwner("fixture.native14", &nativeInitial, &nativeOwner, &nativeSnapshot) == Status::Ok);
     const auto nativeBeforeLoad = nativeSnapshot;
+    const auto policyQuery = reinterpret_cast<QueryNativePolicyInterface>(
+        GetProcAddress(dll, "BodySlots_QueryNativePolicyInterface"));
+    CHECK(policyQuery);
+    const auto* policy = policyQuery(kNativePolicyApiVersion, sizeof(NativePolicyApi));
+    CHECK(policy && policy->capabilities == kNativePolicyCapability);
+    NativePolicySnapshot policyInitial{sizeof(policyInitial), kNativePolicyApiVersion, 0, {}};
+    for (unsigned slot = 0; slot < kNativePlacementCount; ++slot)
+        for (unsigned field = 0; field < kNativePolicyFields; ++field)
+            policyInitial.policies[slot].values[field] = double(slot * kNativePolicyFields + field) / 8.0;
+    const std::uint64_t policyNan = 0x7ff8000000000123ULL, policyNegativeZero = 0x8000000000000000ULL;
+    std::memcpy(&policyInitial.policies[0].values[0], &policyNan, sizeof(double));
+    std::memcpy(&policyInitial.policies[13].values[7], &policyNegativeZero, sizeof(double));
+    auto policySnapshot = policyInitial;
+    std::uint64_t policyOwner = 0;
+    CHECK(policy->AcquireOwner("fixture.native14.policy", &policyInitial, &policyOwner, &policySnapshot) == Status::Ok);
+    const auto policyBeforeLoad = policySnapshot;
+    auto copyNativeBanks = [&] {
+        CHECK(native->CopySnapshot(nativeOwner, &nativeSnapshot) == Status::Ok);
+        CHECK(std::memcmp(&nativeBeforeLoad, &nativeSnapshot, sizeof(nativeSnapshot)) == 0);
+        CHECK(policy->CopySnapshot(policyOwner, &policySnapshot) == Status::Ok);
+        CHECK(std::memcmp(&policyBeforeLoad, &policySnapshot, sizeof(policySnapshot)) == 0);
+        CHECK(policy->CopySnapshot(0, &policySnapshot) == Status::Ok);
+        CHECK(std::memcmp(&policyBeforeLoad, &policySnapshot, sizeof(policySnapshot)) == 0);
+    };
     std::array<EffectiveSlotRecord, kMaxDefinitions> effective{}; std::uint32_t count = 0; std::uint64_t revision = 0;
     auto copyEffective = [&] {
         CHECK(configuration->CopyEffectiveDefinitions(observer, 0, effective.data(), kMaxDefinitions, &count, &revision) == Status::Ok);
         CHECK(count == 1);
-        CHECK(native->CopySnapshot(nativeOwner, &nativeSnapshot) == Status::Ok);
-        CHECK(std::memcmp(&nativeBeforeLoad, &nativeSnapshot, sizeof(nativeSnapshot)) == 0);
+        copyNativeBanks();
     };
     copyEffective(); std::uint64_t editor = 0; CHECK(configuration->RegisterCustomizer("fixture.customizer", &editor) == Status::Ok);
     Customization customization{}; customization.structSize = sizeof(customization); customization.fieldMask = CustomizePosition;
@@ -333,6 +357,7 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     customization.position[0] = 123; EffectiveSlotRecord committed{};
     CHECK(configuration->ApplyCustomization(editor, &customization, revision, &committed) == Status::Ok);
     savedRecords.clear(); onSave(&serialization); CHECK(savedRecords.size() == 1 && savedRecords[0].bytes.size() == 224);
+    copyNativeBanks(); // neither native bank is serialized or changed by saving
     const auto saved = savedRecords;
     onRevert(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
     recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
@@ -352,9 +377,12 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     savedRecords = saved; recordCursor = 0; onLoad(&serialization);
     savedRecords.clear(); recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
     CHECK(configuration->ReleaseCustomizer(editor) == Status::Ok);
+    CHECK(policy->ReleaseOwner(policyOwner) == Status::Ok);
+    CHECK(policy->CopySnapshot(0, &policySnapshot) == Status::Unavailable);
+    CHECK(std::memcmp(&policyBeforeLoad, &policySnapshot, sizeof(policySnapshot)) == 0);
     CHECK(native->ReleaseOwner(nativeOwner) == Status::Ok);
     CHECK(api.ReleaseClient(observer) == Status::Ok);
-    std::cout << "PASS simulated public SKSE messaging and serialization: save/load/revert, new-game/load boundaries, malformed/duplicate/truncated batch isolation\n";
+    std::cout << "PASS simulated public SKSE messaging and serialization: save/load/revert, new-game/load boundaries, malformed/duplicate/truncated batch isolation; both native banks unchanged and absent from cosaves\n";
 }
 int wmain(int argc, wchar_t** argv) {
     try {

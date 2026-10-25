@@ -1,5 +1,6 @@
 #include "validation.h"
 #include "configuration.h"
+#include "runtime_token.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -66,10 +67,11 @@ Status BS_CALL RegisterClient(const char* provider, std::uint64_t* client) noexc
         if (n == sizeof(name) || !ValidString(name, sizeof(name), true)) return Status::InvalidArgument;
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
         for (auto& c : s.clients) if (c.token && !std::strcmp(c.provider, name)) return Status::Conflict;
-        if (s.nextToken == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+        const auto allocation = NextRuntimeToken(s.nextToken, RuntimeDomain::Registry);
+        if (allocation.status != Status::Ok) return allocation.status;
         for (std::size_t i = 0; i < kMaxWriters; ++i) {
             auto& c = s.clients[i]; if (c.token) continue;
-            std::memcpy(c.provider, name, sizeof(name)); c.token = s.nextToken++;
+            std::memcpy(c.provider, name, sizeof(name)); c.token = allocation.token; s.nextToken = allocation.nextCounter;
             *client = c.token; return Status::Ok;
         }
         return Status::LimitExceeded;
@@ -79,9 +81,11 @@ Status BS_CALL RegisterObserver(std::uint64_t* client) noexcept {
     return Guard([&] {
         if (!client) return Status::InvalidArgument;
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
-        if (s.nextToken == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+        const auto allocation = NextRuntimeToken(s.nextToken, RuntimeDomain::Registry);
+        if (allocation.status != Status::Ok) return allocation.status;
         for (std::size_t i = kMaxWriters; i < kMaxClients; ++i) if (!s.clients[i].token) {
-            s.clients[i].token = s.nextToken++; *client = s.clients[i].token; return Status::Ok;
+            s.clients[i].token = allocation.token; s.nextToken = allocation.nextCounter;
+            *client = s.clients[i].token; return Status::Ok;
         }
         return Status::LimitExceeded;
     });
@@ -226,9 +230,11 @@ Status BS_CALL RegisterCustomizer(const char* identity, std::uint64_t* lease) no
         char name[64]{}; if (!lease || !CopyIdentity(identity, name)) return Status::InvalidArgument;
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
         for (const auto& c : s.customizers) if (c.token && !std::strcmp(c.identity, name)) return Status::Conflict;
-        if (s.nextToken == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+        const auto allocation = NextRuntimeToken(s.nextToken, RuntimeDomain::Registry);
+        if (allocation.status != Status::Ok) return allocation.status;
         for (auto& c : s.customizers) if (!c.token) {
-            std::memcpy(c.identity, name, sizeof(name)); c.token = s.nextToken++; *lease = c.token; return Status::Ok;
+            std::memcpy(c.identity, name, sizeof(name)); c.token = allocation.token; s.nextToken = allocation.nextCounter;
+            *lease = c.token; return Status::Ok;
         }
         return Status::LimitExceeded;
     });
