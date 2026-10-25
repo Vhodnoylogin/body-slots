@@ -6,6 +6,16 @@
 #include <limits>
 
 namespace body_slots::detail {
+Status ValidateActivationChanges(const ActivationChange* changes, std::uint32_t count) noexcept {
+    if (!changes || !count || count > kMaxActivationChanges) return Status::InvalidArgument;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (changes[i].structSize != sizeof(ActivationChange)) return Status::UnsupportedVersion;
+        if ((changes[i].flags & ~kInstanceActive) || !changes[i].instanceHandle) return Status::InvalidArgument;
+        for (std::uint32_t j = 0; j < i; ++j)
+            if (changes[i].instanceHandle == changes[j].instanceHandle) return Status::InvalidArgument;
+    }
+    return Status::Ok;
+}
 Status ValidateInstanceSpec(const InstanceSpec& spec) noexcept {
     if (spec.structSize != sizeof(spec)) return Status::UnsupportedVersion;
     if ((spec.flags & ~kInstanceActive) || spec.reserved || !spec.definitionRevision ||
@@ -93,6 +103,34 @@ Status InstanceStore::PrepareRelease(std::uint64_t owner, bool definitionsChange
         if (state_.entries[index].owner != owner) next.entries[out++] = state_.entries[index];
     for (auto index = out; index < next.count; ++index) next.entries[index] = {};
     next.count = out;
+    return Status::Ok;
+}
+Status InstanceStore::PrepareActivation(std::uint64_t owner, const ActivationChange* changes, std::uint32_t count,
+    std::uint64_t expectedGeneration, std::uint64_t expectedView, Candidate& candidate) const noexcept {
+    const auto validation = ValidateActivationChanges(changes, count); if (validation != Status::Ok) return validation;
+    if (!expectedGeneration || expectedGeneration != state_.generation || !expectedView || expectedView != state_.view) return Status::Conflict;
+    std::uint32_t changed = 0;
+    std::array<std::uint32_t, kMaxActivationChanges> indices{};
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto* entry = Find(changes[i].instanceHandle); if (!entry) return Status::NotFound;
+        indices[i] = static_cast<std::uint32_t>(entry - state_.entries.data());
+        if (entry->owner != owner) return Status::Unauthorized;
+        if (!changes[i].expectedInstanceRevision || changes[i].expectedInstanceRevision != entry->revision) return Status::Conflict;
+        for (std::uint32_t j = 0; j < i; ++j) {
+            const auto& earlier = state_.entries[indices[j]];
+            if (SameKey(*entry, earlier.provider, earlier.spec)) return Status::InvalidArgument;
+        }
+        if (entry->spec.flags != changes[i].flags) ++changed;
+    }
+    if (!changed) { candidate.changed_ = false; return Status::Ok; }
+    if (changed > std::numeric_limits<std::uint64_t>::max() - state_.nextRevision) return Status::LimitExceeded;
+    const auto status = PrepareInvalidation(candidate); if (status != Status::Ok) return status;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto& previous = state_.entries[indices[i]];
+        if (previous.spec.flags == changes[i].flags) continue;
+        auto& entry = candidate.state_.entries[indices[i]];
+        entry.spec.flags = changes[i].flags; entry.revision = candidate.state_.nextRevision++;
+    }
     return Status::Ok;
 }
 Status InstanceStore::PrepareReset(Candidate& candidate) const noexcept {

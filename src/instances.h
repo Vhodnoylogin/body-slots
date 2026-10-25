@@ -1,9 +1,11 @@
 #pragma once
 #include "body_slots_instance_api.h"
+#include "body_slots_instance_activation_api.h"
 #include <array>
 
 namespace body_slots::detail {
 Status ValidateInstanceSpec(const InstanceSpec&) noexcept;
+Status ValidateActivationChanges(const ActivationChange*, std::uint32_t count) noexcept;
 // The enclosing Registry mutex guards every call. No independent lock, definition
 // copy, engine binding or persistence lives here. Candidates are prepared before
 // any coupled registry/configuration publication; only Commit changes live state.
@@ -37,6 +39,8 @@ public:
         Candidate&, std::uint64_t& handle) const noexcept;
     Status PrepareRemove(std::uint64_t owner, std::uint64_t handle,
         std::uint64_t expectedGeneration, std::uint64_t expectedRevision, Candidate&) const noexcept;
+    Status PrepareActivation(std::uint64_t owner, const ActivationChange*, std::uint32_t count,
+        std::uint64_t expectedGeneration, std::uint64_t expectedView, Candidate&) const noexcept;
     Status PrepareRelease(std::uint64_t owner, bool definitionsChanged, Candidate&) const noexcept;
     Status PrepareInvalidation(Candidate&) const noexcept;
     Status PrepareReset(Candidate&) const noexcept;

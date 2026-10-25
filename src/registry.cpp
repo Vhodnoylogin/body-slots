@@ -366,6 +366,33 @@ InstanceView InstanceHeader(const Registry& state, std::uint32_t count) noexcept
 bool CurrentInstanceView(const Registry& state, std::uint64_t scope, std::uint64_t view) noexcept {
     return scope && view && scope == state.instances.Generation() && view == state.instances.ViewRevision();
 }
+Status BS_CALL ApplyActivationChanges(std::uint64_t writer, const ActivationChange* changes, std::uint32_t count,
+    std::uint64_t scope, std::uint64_t view, InstanceView* output) noexcept {
+    return Guard([&] {
+        if (!changes || !output || !count || count > kMaxActivationChanges) return Status::InvalidArgument;
+        if (output->structSize != sizeof(*output) || output->version != kInstanceApiVersion || output->reserved) return Status::UnsupportedVersion;
+        auto copied = std::make_unique<std::array<ActivationChange, kMaxActivationChanges>>();
+        std::copy(changes, changes + count, copied->begin());
+        const auto validation = ValidateActivationChanges(copied->data(), count); if (validation != Status::Ok) return validation;
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* client = s.FindClient(writer); if (!client || !client->provider[0]) return Status::Unauthorized;
+        if (!CurrentInstanceView(s, scope, view)) return Status::Conflict;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto& change = (*copied)[i]; const auto* entry = s.instances.Find(change.instanceHandle);
+            if (!entry) return Status::NotFound;
+            if (entry->owner != writer) return Status::Unauthorized;
+            if (!change.expectedInstanceRevision || change.expectedInstanceRevision != entry->revision) return Status::Conflict;
+            if (change.flags & kInstanceActive) {
+                const auto index = s.FindKey(entry->spec.definitionProvider, entry->spec.definitionKey);
+                if (index == s.count || s.records[index].definitionRevision != entry->spec.definitionRevision) return Status::Unavailable;
+            }
+        }
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto status = s.instances.PrepareActivation(writer, copied->data(), count, scope, view, *transition);
+        if (status != Status::Ok) return status;
+        s.instances.Apply(*transition); *output = InstanceHeader(s, s.instances.Count()); return Status::Ok;
+    });
+}
 Status BS_CALL ApplyInstanceCustomization(std::uint64_t lease, const InstanceCustomization* customization,
     std::uint64_t scope, std::uint64_t view, ConfiguredInstanceRecord* output) noexcept {
     return Guard([&] {
@@ -654,6 +681,8 @@ const InstanceConfigurationApi kInstanceConfigurationApi{sizeof(InstanceConfigur
 const InstanceApi kInstanceApi{sizeof(InstanceApi), kInstanceApiVersion,
     kRuntimeInstancesCapability | kBodyAnchorInstancesCapability, UpsertInstance, RemoveInstance,
     CopyEffectiveInstances, EvaluateInstanceEligibility};
+const InstanceActivationApi kInstanceActivationApi{sizeof(InstanceActivationApi), kInstanceActivationApiVersion,
+    kAtomicInstanceActivationCapability, ApplyActivationChanges};
 const ConfigurationApi kConfigurationApi{sizeof(ConfigurationApi), kConfigurationApiVersion,
     kEffectiveConfigurationCapability | kSavedCustomizationCapability, RegisterCustomizer, ReleaseCustomizer,
     ApplyCustomization, ClearCustomization, CopyEffectiveDefinitions, CopyCustomizations, EvaluateEffectiveEligibility};
@@ -673,6 +702,10 @@ extern "C" __declspec(dllexport) const body_slots::ConfigurationApi* BS_CALL Bod
 extern "C" __declspec(dllexport) const body_slots::InstanceApi* BS_CALL BodySlots_QueryInstanceInterface(std::uint32_t version, std::uint32_t size) noexcept {
     if (version != body_slots::kInstanceApiVersion || size != sizeof(body_slots::InstanceApi)) return nullptr;
     return &body_slots::detail::kInstanceApi;
+}
+extern "C" __declspec(dllexport) const body_slots::InstanceActivationApi* BS_CALL BodySlots_QueryInstanceActivationInterface(std::uint32_t version, std::uint32_t size) noexcept {
+    if (version != body_slots::kInstanceActivationApiVersion || size != sizeof(body_slots::InstanceActivationApi)) return nullptr;
+    return &body_slots::detail::kInstanceActivationApi;
 }
 extern "C" __declspec(dllexport) const body_slots::InstanceConfigurationApi* BS_CALL BodySlots_QueryInstanceConfigurationInterface(std::uint32_t version, std::uint32_t size) noexcept {
     if (version != body_slots::kInstanceConfigurationApiVersion || size != sizeof(body_slots::InstanceConfigurationApi)) return nullptr;

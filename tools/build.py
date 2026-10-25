@@ -54,15 +54,23 @@ def main():
     if not compiler:
         raise RuntimeError("x64 compiler not found after environment setup")
     log.write_text("Body Slots standalone authored definitions and saved configuration build\n", encoding="utf-8")
+    commands = []
+    activation_results = []
+    source_paths = list((ROOT / "src").glob("*.cpp")) + list((ROOT / "src").glob("*.h")) + list((ROOT / "include").glob("*.h"))
+    source_paths += [ROOT / p for p in ("tests/instance_activation_tests.cpp", "tests/instance_activation_store_tests.cpp", "tools/build.py", "README.md", "docs/instance-activation.md")]
+    source_pins = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
 
     def run(command):
-        result = subprocess.run([str(value) for value in command], cwd=output, env=env, capture_output=True, text=True)
+        argv = [str(value) for value in command]
+        result = subprocess.run(argv, cwd=output, env=env, capture_output=True, text=True, timeout=180)
+        commands.append({"argv": argv, "exitCode": result.returncode, "timeoutSeconds": 180})
         text = result.stdout + result.stderr
         with log.open("a", encoding="utf-8") as stream:
             stream.write("\n$ " + subprocess.list2cmdline([str(v) for v in command]) + "\n" + text)
         print(text, end="")
         if result.returncode:
             raise RuntimeError(f"command failed ({result.returncode}); see {log}")
+        return text
 
     def compile_target(name, sources, dll=False):
         obj = output / "obj" / name
@@ -91,6 +99,8 @@ def main():
         native = compile_target("native_tests", ["tests/native_tests.cpp", "src/validation.cpp", "src/package.cpp"])
         configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
         instances = compile_target("instance_tests", ["tests/instance_tests.cpp"])
+        activation = compile_target("instance_activation_tests", ["tests/instance_activation_tests.cpp"])
+        activation_store = compile_target("instance_activation_store_tests", ["tests/instance_activation_store_tests.cpp", "src/instances.cpp", "src/validation.cpp"])
         instance_configuration = compile_target("instance_configuration_tests", ["tests/instance_configuration_tests.cpp", "src/instance_configuration.cpp", "src/configuration_serialization.cpp", "src/validation.cpp"])
         native_placement = compile_target("native_placement_tests", ["tests/native_placement_tests.cpp"])
         native_policy = compile_target("native_policy_tests", ["tests/native_policy_tests.cpp"])
@@ -98,6 +108,8 @@ def main():
         run([native, dll, package, output])
         run([configuration])
         run([instances, dll])
+        activation_results.append(run([activation, dll]))
+        activation_results.append(run([activation_store]))
         run([instance_configuration, dll])
         run([native_placement, dll])
         run([native_policy, dll])
@@ -114,6 +126,16 @@ def main():
     artifacts = {}
     for path in (dll, package):
         artifacts[path.name] = {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    for path in source_paths:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != source_pins[str(path.relative_to(ROOT))]:
+            raise RuntimeError(f"source changed during build: {path}")
+    activation_manifest = {"sourcePins": source_pins, "commands": commands, "compiler": compiler,
+        "compilerSha256": hashlib.sha256(Path(compiler).read_bytes()).hexdigest(),
+        "dll": artifacts[dll.name], "activationApiVersion": 1, "activationApiSizeX64": 24,
+        "activationChangeSize": 24, "activationCapability": 1, "committedViewSize": 48,
+        "maxActivationChanges": 256, "testsRun": not args.skip_tests, "subjectResults": activation_results,
+        "qualification": "Actual production DLL subject tests plus actual-store private counter fixture. Existing synthetic SKSE host is separate; no Skyrim game or install.", "gameStarts": 0}
+    (output / "activation-manifest.json").write_text(json.dumps(activation_manifest, indent=2) + "\n", encoding="utf-8")
     (output / "artifacts.json").write_text(json.dumps({"apiVersion": 1, "configurationApiVersion": 1, "instanceApiVersion": 1, "instanceSpecSize": 280, "instanceRecordSize": 784, "instanceViewSize": 48, "instanceApiSizeX64": 48, "instanceCapabilities": 3, "instanceConfigurationApiVersion": 1, "instanceConfigurationApiSizeX64": 56, "instanceCustomizationSize": 400, "instanceCustomizationRecordSize": 408, "configuredInstanceRecordSize": 792, "instanceCustomizationMaxBytes": 102416, "nativePlacementApiVersion": 1, "nativePlacementSnapshotSize": 688, "nativePlacementApiSizeX64": 48, "nativePolicyApiVersion": 1, "nativePolicyFieldCount": 9, "nativePolicySize": 72, "nativePolicySnapshotSize": 1024, "nativePolicyApiSizeX64": 48, "nativePolicyCapability": 2, "definitionSize": 408, "slotRecordSize": 424, "apiSizeX64": 80, "configurationApiSizeX64": 72, "effectiveSlotRecordSize": 440, "testsRun": not args.skip_tests, "artifacts": artifacts}, indent=2) + "\n", encoding="utf-8")
     print(f"BUILD COMPLETE: {dll}\nEVIDENCE: {log}")
 
