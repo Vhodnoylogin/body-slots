@@ -1,0 +1,30 @@
+{
+  "modId": 196769,
+  "game": "skyrimspecialedition",
+  "name": "Body Slots",
+  "version": "0.1.0-alpha.1",
+  "status": "unpublished",
+  "verifiedBy": "Saved Nexus editor rows and unpublished status, 25 October 2026",
+  "sourceCommit": "376ef62ff05c1e696eff72f11a06ab0469020cc0",
+  "runtimeDllSha256": "a4a5af3b028da5aecdffa6db66e7ef152e2787cd923dcb45518666344eb5a03b",
+  "files": [
+    {
+      "archive": "BodySlots-runtime-0.1.0-alpha.1.zip",
+      "displayName": "Body Slots - Experimental Runtime",
+      "category": "Main",
+      "primary": true,
+      "sha256": "d3a3d5c010ade2b9512141134c66ce381fc14c55ef36f81ab5f6afbe6f507efd"
+    },
+    {
+      "archive": "BodySlots-sdk-0.1.0-alpha.1.zip",
+      "displayName": "Body Slots - SDK and Examples (Experimental)",
+      "category": "Miscellaneous",
+      "primary": false,
+      "modManagerDownload": false,
+      "sha256": "c5e6e31d2dbce2e5f9334cb89f96b6404b3e7e8e469cb94e951bea6dd9d003d4"
+    }
+  ],
+  "publicLicenseChosen": false,
+  "gameQualified": false,
+  "releasedVrikIntegration": false
+}

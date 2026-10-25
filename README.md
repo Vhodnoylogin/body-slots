@@ -6,6 +6,8 @@ Body Slots owns definitions, stable keys, local placement and generic content po
 
 This first development snapshot is not a released or game-tested mod. It contains newly written code; reconstructed VRIK code stays in its separate private repository.
 
+The [unpublished Nexus draft packaging](docs/release-draft.md) separates the unchanged runtime DLL from a mod-author SDK/example archive. Its label `0.1.0-alpha.1` does not change the existing plugin/ABI versions. Licensing is to be finalized before publication; no license grant or public-source/visibility change is made by draft packaging.
+
 The separate [configuration API](docs/configuration.md) stores save-scoped placement overrides without changing authored defaults or the original definition ABI. It exposes effective copied placement and eligibility, with provider/key persistence and revision-checked edits. This service remains definition-scoped; instance-specific placement uses the separate table below.
 
 The additive [instance API](docs/instances.md) now supports transient equipment-provider-owned logical instances of existing definitions, with explicit body-anchor binding, independent activation, pinned template revisions and coherent copied effective placement. Equipment keys come from the caller; activation persistence, equipment-node binding, content previews and item transactions remain later services.
