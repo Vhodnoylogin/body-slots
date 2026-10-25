@@ -83,18 +83,20 @@ def main():
         run(command)
         return target
 
-    dll = compile_target("BodySlots", ["src/registry.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/plugin.cpp"], True)
+    dll = compile_target("BodySlots", ["src/registry.cpp", "src/instances.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/plugin.cpp"], True)
     package = output / "examples/potion-belt.bslots"
     run([sys.executable, "-B", ROOT / "tools/author.py", ROOT / "examples/potion-belt.json", "--output", package])
     if not args.skip_tests:
         compile_target("consumer_fixture", ["tests/consumer_fixture.cpp"], True)
         native = compile_target("native_tests", ["tests/native_tests.cpp", "src/validation.cpp", "src/package.cpp"])
-        configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/instances.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        instances = compile_target("instance_tests", ["tests/instance_tests.cpp"])
         native_placement = compile_target("native_placement_tests", ["tests/native_placement_tests.cpp"])
         native_policy = compile_target("native_policy_tests", ["tests/native_policy_tests.cpp"])
         run([sys.executable, "-B", ROOT / "tests/test_author.py"])
         run([native, dll, package, output])
         run([configuration])
+        run([instances, dll])
         run([native_placement, dll])
         run([native_policy, dll])
         # A disposable synthetic host proves SDK guards/phase ordering without Skyrim.
@@ -110,7 +112,7 @@ def main():
     artifacts = {}
     for path in (dll, package):
         artifacts[path.name] = {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    (output / "artifacts.json").write_text(json.dumps({"apiVersion": 1, "configurationApiVersion": 1, "nativePlacementApiVersion": 1, "nativePlacementSnapshotSize": 688, "nativePlacementApiSizeX64": 48, "nativePolicyApiVersion": 1, "nativePolicyFieldCount": 9, "nativePolicySize": 72, "nativePolicySnapshotSize": 1024, "nativePolicyApiSizeX64": 48, "nativePolicyCapability": 2, "definitionSize": 408, "slotRecordSize": 424, "apiSizeX64": 80, "configurationApiSizeX64": 72, "effectiveSlotRecordSize": 440, "testsRun": not args.skip_tests, "artifacts": artifacts}, indent=2) + "\n", encoding="utf-8")
+    (output / "artifacts.json").write_text(json.dumps({"apiVersion": 1, "configurationApiVersion": 1, "instanceApiVersion": 1, "instanceSpecSize": 280, "instanceRecordSize": 784, "instanceViewSize": 48, "instanceApiSizeX64": 48, "instanceCapabilities": 3, "nativePlacementApiVersion": 1, "nativePlacementSnapshotSize": 688, "nativePlacementApiSizeX64": 48, "nativePolicyApiVersion": 1, "nativePolicyFieldCount": 9, "nativePolicySize": 72, "nativePolicySnapshotSize": 1024, "nativePolicyApiSizeX64": 48, "nativePolicyCapability": 2, "definitionSize": 408, "slotRecordSize": 424, "apiSizeX64": 80, "configurationApiSizeX64": 72, "effectiveSlotRecordSize": 440, "testsRun": not args.skip_tests, "artifacts": artifacts}, indent=2) + "\n", encoding="utf-8")
     print(f"BUILD COMPLETE: {dll}\nEVIDENCE: {log}")
 
 

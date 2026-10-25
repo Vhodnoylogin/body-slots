@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include "body_slots_native_policy_api.h"
 #include "body_slots_configuration_api.h"
+#include "body_slots_instance_api.h"
 #include "runtime_token.h"
 #include <array>
 #include <atomic>
@@ -67,9 +68,9 @@ void TokenBoundaries() {
     using detail::NextRuntimeToken;
     using detail::RuntimeDomain;
     constexpr std::uint64_t maximum = 0x00ffffffffffffffULL;
-    const std::array<RuntimeDomain, 3> domains{RuntimeDomain::Registry, RuntimeDomain::NativePlacement, RuntimeDomain::NativePolicy};
-    const std::uint64_t firstTokens[]{1ULL, 0x0100000000000001ULL, 0x0200000000000001ULL};
-    const std::uint64_t lastTokens[]{0x00ffffffffffffffULL, 0x01ffffffffffffffULL, 0x02ffffffffffffffULL};
+    const std::array<RuntimeDomain, 4> domains{RuntimeDomain::Registry, RuntimeDomain::NativePlacement, RuntimeDomain::NativePolicy, RuntimeDomain::Instance};
+    const std::uint64_t firstTokens[]{1ULL, 0x0100000000000001ULL, 0x0200000000000001ULL, 0x0300000000000001ULL};
+    const std::uint64_t lastTokens[]{0x00ffffffffffffffULL, 0x01ffffffffffffffULL, 0x02ffffffffffffffULL, 0x03ffffffffffffffULL};
     CHECK(detail::kRuntimeCounterLimit == maximum);
     for (unsigned index = 0; index < domains.size(); ++index) {
         const auto first = NextRuntimeToken(1, domains[index]);
@@ -81,7 +82,7 @@ void TokenBoundaries() {
             CHECK(rejected.status == Status::LimitExceeded && rejected.token == 0 && rejected.nextCounter == 0);
         }
     }
-    for (const auto domain : {static_cast<RuntimeDomain>(3), static_cast<RuntimeDomain>(255)}) {
+    for (const auto domain : {static_cast<RuntimeDomain>(4), static_cast<RuntimeDomain>(255)}) {
         const auto rejected = NextRuntimeToken(1, domain);
         CHECK(rejected.status == Status::InvalidArgument && rejected.token == 0 && rejected.nextCounter == 0);
     }
@@ -207,6 +208,23 @@ int main(int argc, char** argv) {
         CHECK((writer >> 56) == 0 && (observer >> 56) == 0 && (customizer >> 56) == 0);
         CHECK(writer != observer && writer != customizer && observer != customizer);
         CHECK((poseOwner >> 56) == 1 && (owner >> 56) == 2);
+        const auto instanceQuery = reinterpret_cast<QueryInstanceInterface>(GetProcAddress(module, "BodySlots_QueryInstanceInterface")); CHECK(instanceQuery);
+        const auto* instances = instanceQuery(kInstanceApiVersion, sizeof(InstanceApi)); CHECK(instances);
+        Definition instanceTemplate{}; instanceTemplate.structSize = sizeof(instanceTemplate); instanceTemplate.flags = kEnabled;
+        std::strcpy(instanceTemplate.provider, "fixture.cross-service"); std::strcpy(instanceTemplate.key, "instance-template");
+        std::strcpy(instanceTemplate.anchor, "NPC Pelvis [Pelv]"); std::strcpy(instanceTemplate.kind, "pouch");
+        std::strcpy(instanceTemplate.referenceRig, "skyrimvr-humanoid-v1");
+        instanceTemplate.rotation[0] = instanceTemplate.rotation[4] = instanceTemplate.rotation[8] = 1;
+        instanceTemplate.radius = 4; instanceTemplate.handMask = Both; instanceTemplate.contentMask = AllContent;
+        SlotRecord templateRecord{}; CHECK(registry->UpsertDefinition(writer, &instanceTemplate, 0, &templateRecord) == Status::Ok);
+        InstanceView instanceView{sizeof(instanceView), kInstanceApiVersion, 0, 0, 0, 0, 0, 0};
+        CHECK(instances->CopyEffectiveInstances(observer, 0, 0, nullptr, 0, &instanceView) == Status::Ok);
+        InstanceSpec instanceSpec{}; instanceSpec.structSize = sizeof(instanceSpec); instanceSpec.flags = kInstanceActive;
+        std::strcpy(instanceSpec.equipmentKey, "bag"); std::strcpy(instanceSpec.slotKey, "opening");
+        std::strcpy(instanceSpec.definitionProvider, instanceTemplate.provider); std::strcpy(instanceSpec.definitionKey, instanceTemplate.key);
+        instanceSpec.definitionRevision = templateRecord.definitionRevision; instanceSpec.binding = static_cast<unsigned>(InstanceBinding::BodyAnchor);
+        InstanceRecord instance{}; instance.structSize = sizeof(instance);
+        CHECK(instances->UpsertInstance(writer, &instanceSpec, instanceView.saveGeneration, 0, &instance) == Status::Ok);
         const auto policyBeforeForeign = current;
         const auto banksUnchanged = [&] {
             auto copiedPolicy = Snapshot();
@@ -217,7 +235,7 @@ int main(int argc, char** argv) {
             CHECK(std::memcmp(&copiedPose, &unchangedPose, sizeof(copiedPose)) == 0);
         };
         auto changedPolicy = policyBeforeForeign; changedPolicy.policies[13].values[7] = -321;
-        for (const auto foreign : {writer, observer, customizer, poseOwner}) {
+        for (const auto foreign : {writer, observer, customizer, poseOwner, instance.instanceHandle}) {
             auto rejectedPolicy = policyBeforeForeign;
             CHECK(api->CopySnapshot(foreign, &rejectedPolicy) == Status::Unauthorized && Same(rejectedPolicy, policyBeforeForeign));
             CHECK(api->ReplaceSnapshot(foreign, &changedPolicy, &rejectedPolicy) == Status::Unauthorized && Same(rejectedPolicy, policyBeforeForeign));
@@ -225,7 +243,7 @@ int main(int argc, char** argv) {
             banksUnchanged();
         }
         auto changedPose = unchangedPose; changedPose.placements[13].position[0] = 987;
-        for (const auto foreign : {writer, observer, customizer, owner}) {
+        for (const auto foreign : {writer, observer, customizer, owner, instance.instanceHandle}) {
             auto rejectedPose = unchangedPose;
             CHECK(placement->CopySnapshot(foreign, &rejectedPose) == Status::Unauthorized);
             CHECK(std::memcmp(&rejectedPose, &unchangedPose, sizeof(rejectedPose)) == 0);
@@ -234,6 +252,8 @@ int main(int argc, char** argv) {
             CHECK(placement->ReleaseOwner(foreign) == Status::Unauthorized);
             banksUnchanged();
         }
+        CHECK(instances->RemoveInstance(writer, instance.instanceHandle, instanceView.saveGeneration, instance.instanceRevision) == Status::Ok);
+        CHECK(registry->RemoveDefinition(writer, instanceTemplate.key, templateRecord.definitionRevision) == Status::Ok);
         std::uint32_t definitionCount = 999; std::uint64_t registryRevision = 0, configurationRevision = 0;
         CHECK(registry->CopyDefinitions(writer, 0, nullptr, 0, &definitionCount, &registryRevision) == Status::Ok && definitionCount == 0);
         CHECK(registry->CopyDefinitions(observer, registryRevision, nullptr, 0, &definitionCount, &registryRevision) == Status::Ok && definitionCount == 0);

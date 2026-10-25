@@ -1,6 +1,7 @@
 #include "validation.h"
 #include "configuration.h"
 #include "runtime_token.h"
+#include "instances.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -18,6 +19,7 @@ struct Registry {
     std::array<SlotRecord, kMaxDefinitions> records{};
     std::array<Customizer, 32> customizers{};
     CustomizationStore customizations{};
+    InstanceStore instances{};
     std::uint32_t count = 0;
     std::uint64_t revision = 1, nextToken = 1, nextSlot = 1, nextDefinitionRevision = 1;
     std::uint64_t configurationRevision = 1;
@@ -98,9 +100,13 @@ Status BS_CALL ReleaseClient(std::uint64_t token) noexcept {
         bool owned = false;
         for (std::uint32_t i = 0; i < s.count; ++i) if (!std::strcmp(s.records[i].definition.provider, c->provider)) owned = true;
         if (owned && !s.CanAdvance(0, 0)) return Status::LimitExceeded;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto status = s.instances.PrepareRelease(token, owned, *transition);
+        if (status != Status::Ok) return status;
         for (std::uint32_t i = 0; i < s.count; ++i)
             if (std::strcmp(s.records[i].definition.provider, c->provider)) s.records[out++] = s.records[i];
         if (owned) { s.count = out; ++s.revision; ++s.configurationRevision; }
+        s.instances.Apply(*transition);
         *c = {}; return Status::Ok;
     });
 }
@@ -117,9 +123,13 @@ Status BS_CALL UpsertDefinition(std::uint64_t token, const Definition* definitio
         if (!create && (!expected || expected != s.records[index].definitionRevision)) return Status::Conflict;
         if (create && s.count == kMaxDefinitions) return Status::LimitExceeded;
         if (!s.CanAdvance(1, create ? 1 : 0)) return Status::LimitExceeded;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+        if (instanceStatus != Status::Ok) return instanceStatus;
         SlotRecord record{d, s.nextDefinitionRevision++, create ? s.nextSlot++ : s.records[index].slotId};
         s.records[index] = record; if (create) ++s.count;
-        Sort(s.records, s.count); ++s.revision; ++s.configurationRevision; *output = record; return Status::Ok;
+        Sort(s.records, s.count); ++s.revision; ++s.configurationRevision;
+        s.instances.Apply(*transition); *output = record; return Status::Ok;
     });
 }
 Status BS_CALL RemoveDefinition(std::uint64_t token, const char* key, std::uint64_t expected) noexcept {
@@ -133,8 +143,11 @@ Status BS_CALL RemoveDefinition(std::uint64_t token, const char* key, std::uint6
         const auto index = s.FindKey(c->provider, name); if (index == s.count) return Status::NotFound;
         if (!expected || expected != s.records[index].definitionRevision) return Status::Conflict;
         if (!s.CanAdvance(0, 0)) return Status::LimitExceeded;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+        if (instanceStatus != Status::Ok) return instanceStatus;
         for (auto i = index + 1; i < s.count; ++i) s.records[i - 1] = s.records[i];
-        --s.count; ++s.revision; ++s.configurationRevision; return Status::Ok;
+        --s.count; ++s.revision; ++s.configurationRevision; s.instances.Apply(*transition); return Status::Ok;
     });
 }
 Status BS_CALL CopyDefinitions(std::uint64_t token, std::uint64_t expected, SlotRecord* records, std::uint32_t capacity,
@@ -202,8 +215,12 @@ Status BS_CALL ReplaceDefinitions(std::uint64_t token, const Definition* definit
         for (std::uint32_t i = 0; !changed && i < total; ++i)
             changed = std::memcmp(&candidate[i], &s.records[i], sizeof(SlotRecord)) != 0;
         if (changed) {
+            auto transition = std::make_unique<InstanceStore::Candidate>();
+            const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+            if (instanceStatus != Status::Ok) return instanceStatus;
             s.records = candidate; s.count = total; s.nextSlot = nextSlot;
             s.nextDefinitionRevision = nextRevision; ++s.revision; ++s.configurationRevision;
+            s.instances.Apply(*transition);
         }
         return Status::Ok;
     });
@@ -224,6 +241,92 @@ EffectiveSlotRecord Effective(const Registry& state, const SlotRecord& authored)
     if (c.fieldMask & CustomizeAccessRegion) { d.radius = c.radius; std::memcpy(d.regionCenter, c.regionCenter, sizeof(c.regionCenter)); }
     if (c.fieldMask & CustomizeEnabled) d.flags = c.enabled ? kEnabled : 0;
     return out;
+}
+InstanceRecord EffectiveInstance(const Registry& state, const InstanceStore::Entry& entry) noexcept {
+    InstanceRecord out{}; out.structSize = sizeof(out); out.flags = entry.spec.flags;
+    std::memcpy(out.key.ownerProvider, entry.provider, sizeof(entry.provider));
+    std::memcpy(out.key.equipmentKey, entry.spec.equipmentKey, sizeof(out.key.equipmentKey));
+    std::memcpy(out.key.slotKey, entry.spec.slotKey, sizeof(out.key.slotKey));
+    std::memcpy(out.definitionProvider, entry.spec.definitionProvider, sizeof(out.definitionProvider));
+    std::memcpy(out.definitionKey, entry.spec.definitionKey, sizeof(out.definitionKey));
+    out.instanceHandle = entry.handle; out.instanceRevision = entry.revision;
+    out.pinnedDefinitionRevision = entry.spec.definitionRevision; out.binding = entry.spec.binding;
+    out.templateState = static_cast<std::uint32_t>(InstanceTemplateState::Missing);
+    const auto index = state.FindKey(entry.spec.definitionProvider, entry.spec.definitionKey);
+    if (index == state.count) return out;
+    out.currentDefinitionRevision = state.records[index].definitionRevision;
+    out.templateState = static_cast<std::uint32_t>(InstanceTemplateState::Changed);
+    if (out.currentDefinitionRevision != out.pinnedDefinitionRevision) return out;
+    const auto effective = Effective(state, state.records[index]);
+    out.templateState = static_cast<std::uint32_t>(InstanceTemplateState::Current);
+    out.effective = effective.slot.definition; out.customizationMask = effective.customizationMask;
+    return out;
+}
+Status BS_CALL UpsertInstance(std::uint64_t writer, const InstanceSpec* spec,
+    std::uint64_t scope, std::uint64_t expected, InstanceRecord* committed) noexcept {
+    return Guard([&] {
+        if (!spec || !committed) return Status::InvalidArgument;
+        const auto input = *spec;
+        const auto validation = ValidateInstanceSpec(input); if (validation != Status::Ok) return validation;
+        if (committed->structSize != sizeof(*committed)) return Status::UnsupportedVersion;
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* client = s.FindClient(writer);
+        if (!client || !client->provider[0]) return Status::Unauthorized;
+        if (!scope || scope != s.instances.Generation()) return Status::Conflict;
+        const auto index = s.FindKey(input.definitionProvider, input.definitionKey);
+        if (index == s.count) return Status::NotFound;
+        if (input.definitionRevision != s.records[index].definitionRevision) return Status::Conflict;
+        auto transition = std::make_unique<InstanceStore::Candidate>(); std::uint64_t handle = 0;
+        const auto status = s.instances.PrepareUpsert(writer, client->provider, input, scope, expected, *transition, handle);
+        if (status != Status::Ok) return status;
+        s.instances.Apply(*transition);
+        *committed = EffectiveInstance(s, *s.instances.Find(handle)); return Status::Ok;
+    });
+}
+Status BS_CALL RemoveInstance(std::uint64_t writer, std::uint64_t handle,
+    std::uint64_t scope, std::uint64_t expected) noexcept {
+    return Guard([&] {
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* client = s.FindClient(writer);
+        if (!client || !client->provider[0]) return Status::Unauthorized;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto status = s.instances.PrepareRemove(writer, handle, scope, expected, *transition);
+        if (status != Status::Ok) return status;
+        s.instances.Apply(*transition); return Status::Ok;
+    });
+}
+Status BS_CALL CopyEffectiveInstances(std::uint64_t reader, std::uint64_t scope, std::uint64_t expected,
+    InstanceRecord* records, std::uint32_t capacity, InstanceView* view) noexcept {
+    return Guard([&] {
+        if (!view || (capacity && !records) || capacity > kMaxInstances) return Status::InvalidArgument;
+        if (view->structSize != sizeof(*view) || view->version != kInstanceApiVersion || view->reserved) return Status::UnsupportedVersion;
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.CanReadConfiguration(reader)) return Status::Unauthorized;
+        const InstanceView header{sizeof(InstanceView), kInstanceApiVersion, s.instances.Generation(),
+            s.instances.ViewRevision(), s.revision, s.configurationRevision, s.instances.Count(), 0};
+        if ((scope && scope != header.saveGeneration) || (expected && expected != header.viewRevision)) {
+            *view = header; return Status::Conflict;
+        }
+        if (capacity < header.count) { *view = header; return Status::BufferTooSmall; }
+        for (std::uint32_t index = 0; index < header.count; ++index) records[index] = EffectiveInstance(s, s.instances.At(index));
+        *view = header; return Status::Ok;
+    });
+}
+Status BS_CALL EvaluateInstanceEligibility(std::uint64_t reader, std::uint64_t handle,
+    std::uint64_t scope, std::uint64_t expected, std::uint32_t hand, std::uint32_t content,
+    std::uint32_t* allowed) noexcept {
+    return Guard([&] {
+        if (!allowed || (hand != Left && hand != Right) || !content || (content & (content - 1)) || (content & ~AllContent)) return Status::InvalidArgument;
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.CanReadConfiguration(reader)) return Status::Unauthorized;
+        if (!scope || scope != s.instances.Generation() || !expected || expected != s.instances.ViewRevision()) return Status::Conflict;
+        const auto* entry = s.instances.Find(handle); if (!entry) return Status::NotFound;
+        const auto record = EffectiveInstance(s, *entry); const auto& definition = record.effective;
+        *allowed = record.templateState == static_cast<std::uint32_t>(InstanceTemplateState::Current)
+            && (record.flags & kInstanceActive) && (definition.flags & kEnabled)
+            && (definition.handMask & hand) && (definition.contentMask & content) ? 1u : 0u;
+        return Status::Ok;
+    });
 }
 Status BS_CALL RegisterCustomizer(const char* identity, std::uint64_t* lease) noexcept {
     return Guard([&] {
@@ -261,6 +364,9 @@ Status BS_CALL ApplyCustomization(std::uint64_t lease, const Customization* cust
         const bool changed = index == s.customizations.count || std::memcmp(&c, &s.customizations.entries[index], sizeof(c));
         if (changed) {
             if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+            auto transition = std::make_unique<InstanceStore::Candidate>();
+            const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+            if (instanceStatus != Status::Ok) return instanceStatus;
             s.customizations.entries[index] = c; if (index == s.customizations.count) ++s.customizations.count;
             std::sort(s.customizations.entries.begin(), s.customizations.entries.begin() + s.customizations.count,
                 [](const Customization& a, const Customization& b) {
@@ -268,6 +374,7 @@ Status BS_CALL ApplyCustomization(std::uint64_t lease, const Customization* cust
                     return provider < 0 || (provider == 0 && std::strcmp(a.key, b.key) < 0);
                 });
             ++s.configurationRevision;
+            s.instances.Apply(*transition);
         }
         *output = Effective(s, s.records[authored]); return Status::Ok;
     });
@@ -281,8 +388,12 @@ Status BS_CALL ClearCustomization(std::uint64_t lease, const char* provider, con
         if (!expected || expected != s.configurationRevision) return Status::Conflict;
         const auto index = s.FindCustomization(name, slotKey); if (index == s.customizations.count) return Status::NotFound;
         if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+        if (instanceStatus != Status::Ok) return instanceStatus;
         for (auto i = index + 1; i < s.customizations.count; ++i) s.customizations.entries[i - 1] = s.customizations.entries[i];
-        s.customizations.entries[--s.customizations.count] = {}; ++s.configurationRevision; return Status::Ok;
+        s.customizations.entries[--s.customizations.count] = {}; ++s.configurationRevision;
+        s.instances.Apply(*transition); return Status::Ok;
     });
 }
 Status BS_CALL CopyEffectiveDefinitions(std::uint64_t reader, std::uint64_t expected, EffectiveSlotRecord* records,
@@ -342,16 +453,34 @@ Status LoadCustomizations(const std::uint8_t* bytes, std::uint32_t size) noexcep
         auto status = DecodeCustomizations(bytes, size, *candidate); if (status != Status::Ok) return status;
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
         if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
-        s.customizations = *candidate; ++s.configurationRevision; return Status::Ok;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+        if (instanceStatus != Status::Ok) return instanceStatus;
+        s.customizations = *candidate; ++s.configurationRevision; s.instances.Apply(*transition); return Status::Ok;
     });
 }
 Status ResetCustomizations() noexcept {
     return Guard([&] {
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
         if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
-        s.customizations = {}; ++s.configurationRevision; return Status::Ok;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto instanceStatus = s.instances.PrepareInvalidation(*transition);
+        if (instanceStatus != Status::Ok) return instanceStatus;
+        s.customizations = {}; ++s.configurationRevision; s.instances.Apply(*transition); return Status::Ok;
     });
 }
+Status ResetSaveScope() noexcept {
+    return Guard([&] {
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        const auto status = s.instances.PrepareReset(*transition); if (status != Status::Ok) return status;
+        s.customizations = {}; ++s.configurationRevision; s.instances.Apply(*transition); return Status::Ok;
+    });
+}
+const InstanceApi kInstanceApi{sizeof(InstanceApi), kInstanceApiVersion,
+    kRuntimeInstancesCapability | kBodyAnchorInstancesCapability, UpsertInstance, RemoveInstance,
+    CopyEffectiveInstances, EvaluateInstanceEligibility};
 const ConfigurationApi kConfigurationApi{sizeof(ConfigurationApi), kConfigurationApiVersion,
     kEffectiveConfigurationCapability | kSavedCustomizationCapability, RegisterCustomizer, ReleaseCustomizer,
     ApplyCustomization, ClearCustomization, CopyEffectiveDefinitions, CopyCustomizations, EvaluateEffectiveEligibility};
@@ -367,4 +496,8 @@ extern "C" __declspec(dllexport) const body_slots::Api* BS_CALL BodySlots_QueryI
 extern "C" __declspec(dllexport) const body_slots::ConfigurationApi* BS_CALL BodySlots_QueryConfigurationInterface(std::uint32_t version, std::uint32_t size) noexcept {
     if (version != body_slots::kConfigurationApiVersion || size != sizeof(body_slots::ConfigurationApi)) return nullptr;
     return &body_slots::detail::kConfigurationApi;
+}
+extern "C" __declspec(dllexport) const body_slots::InstanceApi* BS_CALL BodySlots_QueryInstanceInterface(std::uint32_t version, std::uint32_t size) noexcept {
+    if (version != body_slots::kInstanceApiVersion || size != sizeof(body_slots::InstanceApi)) return nullptr;
+    return &body_slots::detail::kInstanceApi;
 }

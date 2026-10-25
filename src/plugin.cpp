@@ -9,6 +9,7 @@
 #include "skse64_common/skse_version.h"
 #include "package.h"
 #include "configuration.h"
+#include "instances.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -59,10 +60,12 @@ void Log(const std::filesystem::path& directory, const std::string& message) noe
         if (stream) stream << message << '\n';
     } catch (...) {}
 }
-void OnRevert(SKSESerializationInterface*) noexcept {
-    const auto status = body_slots::detail::ResetCustomizations();
-    if (status != body_slots::Status::Ok) Log(State().packages, "customization revert failed");
+bool BeginSaveScope() noexcept {
+    const auto status = body_slots::detail::ResetSaveScope();
+    if (status != body_slots::Status::Ok) Log(State().packages, "save scope reset failed");
+    return status == body_slots::Status::Ok;
 }
+void OnRevert(SKSESerializationInterface*) noexcept { BeginSaveScope(); }
 void OnSave(SKSESerializationInterface* serialization) noexcept {
     try {
         if (!serialization || !serialization->WriteRecord) return;
@@ -76,7 +79,7 @@ void OnSave(SKSESerializationInterface* serialization) noexcept {
 void OnLoad(SKSESerializationInterface* serialization) noexcept {
     // End the previous save's state even when the next cosave is empty or malformed.
     // All records are staged before the single validated registry commit below.
-    OnRevert(serialization);
+    if (!BeginSaveScope()) return;
     try {
         if (!serialization || !serialization->GetNextRecordInfo || !serialization->ReadRecordData) return;
         std::vector<std::uint8_t> candidate; bool seen = false;

@@ -5,6 +5,7 @@
 #include "body_slots_configuration_api.h"
 #include "body_slots_native_placement_api.h"
 #include "body_slots_native_policy_api.h"
+#include "body_slots_instance_api.h"
 #include "package.h"
 #include "validation.h"
 #include "common/ITypes.h"
@@ -345,6 +346,31 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
         CHECK(policy->CopySnapshot(0, &policySnapshot) == Status::Ok);
         CHECK(std::memcmp(&policyBeforeLoad, &policySnapshot, sizeof(policySnapshot)) == 0);
     };
+    const auto instanceQuery = reinterpret_cast<QueryInstanceInterface>(GetProcAddress(dll, "BodySlots_QueryInstanceInterface"));
+    CHECK(instanceQuery); const auto* instances = instanceQuery(kInstanceApiVersion, sizeof(InstanceApi)); CHECK(instances);
+    std::uint64_t equipmentWriter = 0; CHECK(api.RegisterClient("fixture.equipment", &equipmentWriter) == Status::Ok);
+    auto instanceHeader = [&] {
+        InstanceView view{sizeof(view), kInstanceApiVersion, 0, 0, 0, 0, 0, 0}; InstanceRecord record{};
+        CHECK(instances->CopyEffectiveInstances(observer, 0, 0, &record, 1, &view) == Status::Ok); return view;
+    };
+    auto scope = instanceHeader(); InstanceRecord active{};
+    auto activate = [&] {
+        scope = instanceHeader(); CHECK(scope.count == 0);
+        InstanceSpec spec{}; spec.structSize = sizeof(spec); spec.flags = kInstanceActive;
+        std::strcpy(spec.equipmentKey, "fixture-bag"); std::strcpy(spec.slotKey, "opening");
+        std::strcpy(spec.definitionProvider, snapshot.records[0].definition.provider);
+        std::strcpy(spec.definitionKey, snapshot.records[0].definition.key);
+        spec.definitionRevision = snapshot.records[0].definitionRevision; spec.binding = static_cast<unsigned>(InstanceBinding::BodyAnchor);
+        const auto oldHandle = active.instanceHandle; active.structSize = sizeof(active);
+        CHECK(instances->UpsertInstance(equipmentWriter, &spec, scope.saveGeneration, 0, &active) == Status::Ok);
+        CHECK(active.instanceHandle > oldHandle && instanceHeader().count == 1);
+    };
+    auto resetInstances = [&] {
+        const auto after = instanceHeader(); CHECK(after.count == 0 && after.saveGeneration > scope.saveGeneration);
+        CHECK(instances->RemoveInstance(equipmentWriter, active.instanceHandle, scope.saveGeneration, active.instanceRevision) == Status::Conflict);
+        CHECK(instances->RemoveInstance(equipmentWriter, active.instanceHandle, after.saveGeneration, active.instanceRevision) == Status::NotFound);
+    };
+    auto loadScope = [&] { activate(); recordCursor = 0; onLoad(&serialization); resetInstances(); };
     std::array<EffectiveSlotRecord, kMaxDefinitions> effective{}; std::uint32_t count = 0; std::uint64_t revision = 0;
     auto copyEffective = [&] {
         CHECK(configuration->CopyEffectiveDefinitions(observer, 0, effective.data(), kMaxDefinitions, &count, &revision) == Status::Ok);
@@ -356,26 +382,29 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     std::strcpy(customization.provider, snapshot.records[0].definition.provider); std::strcpy(customization.key, snapshot.records[0].definition.key);
     customization.position[0] = 123; EffectiveSlotRecord committed{};
     CHECK(configuration->ApplyCustomization(editor, &customization, revision, &committed) == Status::Ok);
+    activate();
     savedRecords.clear(); onSave(&serialization); CHECK(savedRecords.size() == 1 && savedRecords[0].bytes.size() == 224);
     copyNativeBanks(); // neither native bank is serialized or changed by saving
+    CHECK(instanceHeader().count == 1 && instanceHeader().saveGeneration == scope.saveGeneration);
     const auto saved = savedRecords;
-    onRevert(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
-    recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
+    onRevert(&serialization); resetInstances(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    loadScope(); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
     Same(snapshot, Copy(api, observer)); // customization never replaces author defaults
     auto rejectLoad = [&] {
-        recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+        loadScope(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
     };
     savedRecords = saved; savedRecords[0].version = 99; rejectLoad();
     savedRecords = saved; savedRecords[0].bytes[4] = 99; rejectLoad();
     savedRecords = saved; savedRecords.push_back(saved[0]); rejectLoad();
     savedRecords = saved; savedRecords[0].bytes.back() = 1; rejectLoad();
     savedRecords = saved; truncatedRead = true; rejectLoad(); truncatedRead = false;
-    savedRecords = saved; recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
-    message.type = SKSEMessagingInterface::kMessage_PreLoadGame; listener(&message); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
-    savedRecords = saved; recordCursor = 0; onLoad(&serialization);
-    message.type = SKSEMessagingInterface::kMessage_NewGame; listener(&message); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
-    savedRecords = saved; recordCursor = 0; onLoad(&serialization);
-    savedRecords.clear(); recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    savedRecords = saved; loadScope(); copyEffective(); CHECK(effective[0].slot.definition.position[0] == 123);
+    activate(); message.type = SKSEMessagingInterface::kMessage_PreLoadGame; listener(&message); resetInstances(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    savedRecords = saved; loadScope();
+    activate(); message.type = SKSEMessagingInterface::kMessage_NewGame; listener(&message); resetInstances(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    savedRecords = saved; loadScope();
+    savedRecords.clear(); loadScope(); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
+    CHECK(api.ReleaseClient(equipmentWriter) == Status::Ok);
     CHECK(configuration->ReleaseCustomizer(editor) == Status::Ok);
     CHECK(policy->ReleaseOwner(policyOwner) == Status::Ok);
     CHECK(policy->CopySnapshot(0, &policySnapshot) == Status::Unavailable);
