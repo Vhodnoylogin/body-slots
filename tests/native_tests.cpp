@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include "body_slots_api.h"
 #include "body_slots_configuration_api.h"
+#include "body_slots_native_placement_api.h"
 #include "package.h"
 #include "validation.h"
 #include "common/ITypes.h"
@@ -307,8 +308,25 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     const auto configurationQuery = reinterpret_cast<QueryConfigurationInterface>(GetProcAddress(dll, "BodySlots_QueryConfigurationInterface"));
     CHECK(configurationQuery && !configurationQuery(0, sizeof(ConfigurationApi)) && !configurationQuery(1, sizeof(ConfigurationApi) - 1));
     const auto* configuration = configurationQuery(1, sizeof(ConfigurationApi)); CHECK(configuration && configuration->capabilities == 3);
+    const auto nativeQuery = reinterpret_cast<QueryNativePlacementInterface>(
+        GetProcAddress(dll, "BodySlots_QueryNativePlacementInterface"));
+    CHECK(nativeQuery);
+    const auto* native = nativeQuery(kNativePlacementApiVersion, sizeof(NativePlacementApi));
+    CHECK(native);
+    NativePlacementSnapshot nativeInitial{sizeof(nativeInitial), kNativePlacementApiVersion, 0, {}};
+    nativeInitial.placements[0].position[0] = 30;
+    nativeInitial.placements[0].rotation[0] = 2;
+    auto nativeSnapshot = nativeInitial;
+    std::uint64_t nativeOwner = 0;
+    CHECK(native->AcquireOwner("fixture.native14", &nativeInitial, &nativeOwner, &nativeSnapshot) == Status::Ok);
+    const auto nativeBeforeLoad = nativeSnapshot;
     std::array<EffectiveSlotRecord, kMaxDefinitions> effective{}; std::uint32_t count = 0; std::uint64_t revision = 0;
-    auto copyEffective = [&] { CHECK(configuration->CopyEffectiveDefinitions(observer, 0, effective.data(), kMaxDefinitions, &count, &revision) == Status::Ok); CHECK(count == 1); };
+    auto copyEffective = [&] {
+        CHECK(configuration->CopyEffectiveDefinitions(observer, 0, effective.data(), kMaxDefinitions, &count, &revision) == Status::Ok);
+        CHECK(count == 1);
+        CHECK(native->CopySnapshot(nativeOwner, &nativeSnapshot) == Status::Ok);
+        CHECK(std::memcmp(&nativeBeforeLoad, &nativeSnapshot, sizeof(nativeSnapshot)) == 0);
+    };
     copyEffective(); std::uint64_t editor = 0; CHECK(configuration->RegisterCustomizer("fixture.customizer", &editor) == Status::Ok);
     Customization customization{}; customization.structSize = sizeof(customization); customization.fieldMask = CustomizePosition;
     std::strcpy(customization.provider, snapshot.records[0].definition.provider); std::strcpy(customization.key, snapshot.records[0].definition.key);
@@ -334,6 +352,7 @@ void Skse(const Api& api, HMODULE dll, bool fakeHost) {
     savedRecords = saved; recordCursor = 0; onLoad(&serialization);
     savedRecords.clear(); recordCursor = 0; onLoad(&serialization); copyEffective(); CHECK(effective[0].slot.definition.position[0] != 123);
     CHECK(configuration->ReleaseCustomizer(editor) == Status::Ok);
+    CHECK(native->ReleaseOwner(nativeOwner) == Status::Ok);
     CHECK(api.ReleaseClient(observer) == Status::Ok);
     std::cout << "PASS simulated public SKSE messaging and serialization: save/load/revert, new-game/load boundaries, malformed/duplicate/truncated batch isolation\n";
 }
