@@ -4,6 +4,7 @@
 #include "instances.h"
 #include "hand_broker.h"
 #include "interaction_validation.h"
+#include "drag_authority.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <vector>
 extern "C" const body_slots::Api* BS_CALL BodySlots_QueryInterface(std::uint32_t,std::uint32_t) noexcept;
 extern "C" const body_slots::InstanceApi* BS_CALL BodySlots_QueryInstanceInterface(std::uint32_t,std::uint32_t) noexcept;
+extern "C" const body_slots::ConfigurationApi* BS_CALL BodySlots_QueryConfigurationInterface(std::uint32_t,std::uint32_t) noexcept;
 using namespace body_slots;
 using namespace body_slots::detail;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL %s:%d %s\n",__FILE__,__LINE__,#x); std::abort(); } } while(false)
@@ -22,7 +24,7 @@ struct Pilot {
     std::array<HIGGS_HandRecord,2> hands{};
     ActionOffer offer{}; HIGGS_ActionRequest selected{}; ActionRequest executed{};
     unsigned offers{}, notifications{}, executions{};
-    Pilot() {
+    explicit Pilot(const char* equipmentKey="body") {
         HIGGS_HandClientInfo info{}; info.structSize=sizeof(info); std::strcpy(info.name,"BodySlots");
         CHECK(!broker.Register(info,recognizer)); std::strcpy(info.name,"potion provider"); CHECK(!broker.Register(info,provider));
         CHECK(!broker.Executor(provider,Selected,this,executor));
@@ -39,7 +41,7 @@ struct Pilot {
         SlotRecord definition{};CHECK(base->UpsertDefinition(writer,&d,0,&definition)==Status::Ok);
         auto* api=BodySlots_QueryInstanceInterface(1,sizeof(InstanceApi));InstanceView view{sizeof(view),1};
         CHECK(api->CopyEffectiveInstances(reader,0,0,nullptr,0,&view)==Status::Ok);
-        InstanceSpec spec{};spec.structSize=sizeof(spec);spec.flags=kInstanceActive;std::strcpy(spec.equipmentKey,"body");std::strcpy(spec.slotKey,"pocket");
+        InstanceSpec spec{};spec.structSize=sizeof(spec);spec.flags=kInstanceActive;std::strcpy(spec.equipmentKey,equipmentKey);std::strcpy(spec.slotKey,"pocket");
         std::strcpy(spec.definitionProvider,d.provider);std::strcpy(spec.definitionKey,d.key);spec.definitionRevision=definition.definitionRevision;spec.binding=1;
         InstanceRecord record{};record.structSize=sizeof(record);CHECK(api->UpsertInstance(writer,&spec,view.saveGeneration,0,&record)==Status::Ok);instance=record.instanceHandle;
         BehaviorSpec b{};b.structSize=sizeof(b);b.instanceHandle=instance;b.context=this;b.offers=Offers;b.execute=Execute;b.higgsClient=provider;b.higgsExecutor=executor;
@@ -79,6 +81,60 @@ Status Validate(const ContentCommit& c,const ActionRequest& request) noexcept {
     if(result.epoch!=c.epoch||result.executor!=request.offer.higgsExecutor)return Status::Conflict;
     return result.stage==HIGGS_ACTION_COMMITTED||result.stage==HIGGS_ACTION_COMPLETED?Status::Ok:Status::Conflict;
 }
+unsigned dragFenceMode=0;
+HIGGS_GrantedMutationCallback actualDragCallback=nullptr;void* actualDragContext=nullptr;
+HIGGS_HandStatus HIGGS_HAND_CALL DragCallback(const HIGGS_ActionRequest* action,const HIGGS_HandSnapshot* snapshot,void*){
+    if(dragFenceMode==4){
+        CHECK(active->broker.Release(action->owner,action->grant)==HIGGS_HAND_PENDING);
+        CHECK(active->broker.Unregister(action->owner)==HIGGS_HAND_PENDING);
+    }
+    if(dragFenceMode==5){
+        active->broker.ObserveWorld(0,true,HiggsHands::Now());
+        CHECK(active->broker.Epoch()==action->epoch); // Commit owns the old epoch until fence exit.
+    }
+    return actualDragCallback(action,snapshot,actualDragContext);
+}
+HIGGS_HandStatus HIGGS_HAND_CALL DragFence(uint64_t owner,const HIGGS_GrantedMutationRequest* request,HIGGS_GrantedMutationCallback callback,void* context,HIGGS_ActionResult* result){
+    if(dragFenceMode==1)CHECK(!active->broker.Release(owner,request->grant));
+    if(dragFenceMode==2){HIGGS_HandSnapshot expired{};CHECK(!active->broker.Copy(owner,expired,HiggsHands::Now()+UINT64_C(10000000000)));}
+    if(dragFenceMode==3)CHECK(!active->broker.Unregister(owner));
+    actualDragCallback=callback;actualDragContext=context;
+    return active->broker.WithAuthorizedAction(owner,*request,DragCallback,nullptr,*result);
+}
+void DragAuthorityCases(){
+    for(unsigned mode=0;mode<6;++mode){
+        char key[32]{};std::snprintf(key,sizeof(key),"drag-case-%u",mode);
+        Pilot p(key);active=&p;p.frame=100+mode*100;p.Frame();p.broker.MarkMainThread();
+        CHECK(!p.broker.Authorize(p.provider,p.executor,p.recognizer,Left));
+        CHECK(p.broker.Input(Left,HIGGS_INPUT_TRIGGER,true,++p.clock));CHECK(p.selected.grant);
+        const auto* config=BodySlots_QueryConfigurationInterface(1,sizeof(ConfigurationApi));CHECK(config);
+        std::uint64_t editor{};CHECK(config->RegisterCustomizer("protocol-drag-editor",&editor)==Status::Ok);
+        SlotEditingSnapshot editing{};CHECK(GetManipulationApi().CopyEditingMode(p.reader,&editing)==Status::Ok);
+        SlotEditingMode armed{sizeof(armed),1,Left,HIGGS_INPUT_TRIGGER};
+        CHECK(GetManipulationApi().SetEditingMode(editor,&armed,editing.revision,&editing)==Status::Ok);
+        std::array<RuntimeRecord,kMaxInstances> rows{};RuntimeView view{sizeof(view),kRuntimeApiVersion};
+        CHECK(GetRuntimeApi().CopyRuntime(p.reader,rows.data(),kMaxInstances,&view)==Status::Ok&&view.count==1);
+        RuntimeTransform initial{};initial.scale=1;initial.rotation[0]=initial.rotation[4]=initial.rotation[8]=1;
+        auto moved=initial;moved.position[0]=4;
+        DragStart start{p.selected.requestId,p.epoch,p.frame,editing.revision,view.saveGeneration,view.viewRevision,1,1,Left,0,rows[0],initial,initial};
+        CHECK(BeginAuthorizedDrag(start)==Status::Ok);CHECK(AdvanceAuthorizedDrag(p.selected.requestId,p.frame,moved,initial)==Status::Ok);
+        HIGGS_HandSnapshot before{};CHECK(!p.broker.Copy(p.provider,before,++p.clock));
+        HIGGS_HandInterface hands{};hands.ReleaseGrant=+[](uint64_t owner,uint64_t grant)->HIGGS_HandStatus{return active->broker.Release(owner,grant);};
+        HIGGS_GrantMutationInterface mutation{sizeof(mutation),1,DragFence};dragFenceMode=mode;
+        const auto outcome=CommitDragWithAuthority(mutation,hands,p.provider,p.selected,before.hands[0].generation);
+        const bool shouldCommit=mode==0||mode==4||mode==5;
+        CHECK((outcome.authority==HIGGS_HAND_OK)==shouldCommit);
+        CHECK((outcome.customization==Status::Ok)==shouldCommit);
+        CHECK(GetRuntimeApi().CopyRuntime(p.reader,rows.data(),kMaxInstances,&view)==Status::Ok);
+        CHECK(rows[0].configured.instance.effective.position[0]==(shouldCommit?4.f:0.f));
+        HIGGS_HandSnapshot after{};CHECK(!p.broker.Copy(p.recognizer,after,++p.clock));CHECK(!after.hands[0].grant);
+        if(shouldCommit){CHECK(outcome.receipt.stage==HIGGS_ACTION_COMPLETED);CHECK(outcome.receipt.requestId==p.selected.requestId);}
+        if(mode==5){CHECK(p.broker.Epoch()!=p.selected.epoch);CHECK(outcome.receipt.epoch==p.selected.epoch);}
+        InvalidateDrag();
+        auto* base=BodySlots_QueryInterface(1,sizeof(Api));CHECK(config->ReleaseCustomizer(editor)==Status::Ok);
+        CHECK(base->ReleaseClient(p.writer)==Status::Ok);CHECK(base->ReleaseClient(p.reader)==Status::Ok);
+    }
+}
 }
 int main() {
     HIGGS_HandRecord held{};held.observationMask=kKnownHandObservation;held.availability=HIGGS_AVAILABILITY_RESERVED;held.heldRefId=42;
@@ -116,5 +172,6 @@ int main() {
     CHECK(GetRuntimeApi().ReportContentCommit(pilot.writer,&receipt)!=Status::Ok);
     CHECK(BodySlots_QueryInterface(1,sizeof(Api))->ReleaseClient(pilot.writer)==Status::Ok);
     CHECK(BodySlots_QueryInterface(1,sizeof(Api))->ReleaseClient(pilot.reader)==Status::Ok);
+    DragAuthorityCases();
     std::puts("PASS real HIGGS/BodySlots routed authority, deferred spatial validation, once-only execution, committed content and epoch invalidation; no game qualification");
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "body_slots_runtime_api.h"
+#include "body_slots_behavior_api.h"
 namespace body_slots::detail {
 struct HandProbe {
     std::uint32_t physicalHand, valid;
@@ -22,6 +23,8 @@ struct RuntimeFrame {
 // are synchronous, world-space, finite and from one declared update boundary.
 Status UpdateRuntime(const RuntimeFrame&) noexcept;
 Status CollectOffers(const RuntimeInput&, ActionOffer*, std::uint32_t capacity, std::uint32_t* count) noexcept;
+bool RevalidateOfferContent(const ActionOffer&,std::uint64_t currentHandObservationId) noexcept;
+const BehaviorApi& GetBehaviorApi() noexcept;
 Status DispatchSelected(const ActionOffer&, const ActionGrant&, std::uint64_t* requestId) noexcept;
 Status CopyActionProgress(ActionProgress*, std::uint32_t capacity, std::uint32_t* count) noexcept;
 using ContentCommitValidator=Status (*)(const ContentCommit&,const ActionRequest&) noexcept;
@@ -31,6 +34,8 @@ using ContentCommitValidator=Status (*)(const ContentCommit&,const ActionRequest
 void SetContentCommitValidator(ContentCommitValidator) noexcept;
 Status ApplyHandResult(std::uint64_t higgsRequestId,std::uint64_t epoch,CommitStage) noexcept;
 void InvalidateRuntime() noexcept;
+Status ReserveDragSlot(std::uint64_t instanceHandle,std::uint64_t requestId,std::uint64_t epoch,std::uint64_t runtimeRevision) noexcept;
+void ReleaseDragSlot(std::uint64_t requestId) noexcept;
 Status ReportPresentation(std::uint64_t instanceHandle, std::uint64_t visualRevision,
     std::uint64_t contentVersion, PresentationState) noexcept;
 bool ComposeSlotTransform(const Definition&, const RuntimeTransform&, RuntimeTransform&, float center[3], float& radius) noexcept;

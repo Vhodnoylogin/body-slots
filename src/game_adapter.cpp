@@ -7,8 +7,12 @@
 #include "body_slots_game_api.h"
 #include "runtime.h"
 #include "interaction_validation.h"
+#include "manipulation.h"
+#include "drag_authority.h"
+#include "content_policy.h"
 #include "higgshandapi.h"
 #include "higgshandrouting.h"
+#include "higgsgrantmutation.h"
 #include "higgsinterface001.h"
 #include <algorithm>
 #include <array>
@@ -39,6 +43,11 @@ struct Visual {
     bool failed{};
 };
 struct AnchorIdentity { std::uint64_t instance{}, generation{}; RE::NiPointer<RE::NiAVObject> node; };
+struct DragCandidate {
+    HIGGS_HandRequestId request{};
+    std::uint64_t editingRevision{},instance{},createdAt{};
+    HIGGS_HandInput input{};
+};
 class Adapter final {
 public:
     void Initialize(const void* skse) {
@@ -58,21 +67,33 @@ public:
 private:
     static void OnFrame() noexcept;
     static void HIGGS_HAND_CALL OnInput(const HIGGS_HandInput*, void*) noexcept;
+    static void HIGGS_HAND_CALL OnDragSelected(const HIGGS_ActionRequest*,void*) noexcept {}
     void ClearVisuals();
     void Present(const RuntimeRecord&, RE::NiNode*);
     RE::NiAVObject* ResolveAnchor(const RuntimeRecord&, RE::PlayerCharacter*, RE::NiAVObject*);
     void FinishCandidates(const HIGGS_HandSnapshot&);
     void SynchronizeActions();
+    bool OfferDrag(const HIGGS_HandInput&);
+    void UpdateDrag(const HIGGS_HandSnapshot&,const detail::RuntimeFrame&,const RuntimeTransform handWorld[2],const RuntimeView&);
+    void CancelDrag();
+    void UpdatePolicies(const HIGGS_HandSnapshot&);
     std::mutex mutex_;
     HIGGS_HandInterface api_{};
     HIGGS_HandRoutingInterface routing_{};
+    HIGGS_GrantMutationInterface mutation_{};
     HIGGS_HandClient client_{};
     HIGGS_HandRegistration recognizer_{};
+    HIGGS_HandExecutor dragExecutor_{};
     bool connected_{}, resetRequested_{};
     CachedInput cache_{};
     std::vector<Candidate> candidates_;
     std::vector<Visual> visuals_;
     std::vector<AnchorIdentity> anchors_;
+    DragCandidate dragCandidate_{};
+    HIGGS_ActionRequest activeDrag_{};
+    detail::DragStart dragStart_{};
+    std::uint64_t releasedInput_[2]{};
+    std::uint64_t dragHandGeneration_{};
     std::uint64_t reader_{}, frame_{}, nextAnchor_{1};
     std::atomic<std::uint64_t> bodyGeneration_{1};
     RE::NiAVObject* lastBody_{};
@@ -152,11 +173,15 @@ void Adapter::Connect() {
     const auto queryRouting = reinterpret_cast<HIGGS_QueryHandRoutingInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandRoutingInterface"));
     HIGGS_HandRoutingInterface routing{};
     if (!queryRouting || queryRouting(HIGGS_HAND_ROUTING_ABI_VERSION, sizeof(routing), &routing) != HIGGS_HAND_OK) return;
+    HIGGS_GrantMutationInterface mutation{};
+    const auto queryMutation=reinterpret_cast<HIGGS_QueryGrantMutationInterfaceFn>(GetProcAddress(module,"HIGGS_QueryGrantMutationInterface"));
+    if(queryMutation&&queryMutation(1,sizeof(mutation),&mutation)!=HIGGS_HAND_OK)mutation={};
     HIGGS_HandClientInfo info{}; info.structSize = sizeof(info); std::strcpy(info.name, "BodySlots");
     // Neutral default. HIGGS owns the user's effective provider priority.
-    HIGGS_HandClient client{}; HIGGS_HandRegistration recognizer{};
+    HIGGS_HandClient client{}; HIGGS_HandRegistration recognizer{};HIGGS_HandExecutor dragExecutor{};
     if (api.RegisterClient(&info, &client) != HIGGS_HAND_OK) return;
     if (api.SubscribeRecognizer(client, &OnInput, this, &recognizer) != HIGGS_HAND_OK) { api.UnregisterClient(client); return; }
+    if(api.RegisterExecutor(client,&OnDragSelected,this,&dragExecutor)!=HIGGS_HAND_OK){api.UnregisterClient(client);return;}
     std::uint64_t reader{};
     struct PhaseRequest { void* (*getInterface)(unsigned int) = nullptr; } phase;
     const auto* messaging = SKSE::GetMessagingInterface();
@@ -168,7 +193,7 @@ void Adapter::Connect() {
     }
     phases->AddPostVrikPostHiggsCallback(&OnFrame);
     std::lock_guard lock(mutex_);
-    api_ = api; routing_ = routing; client_ = client; recognizer_ = recognizer; reader_ = reader; connected_ = true;
+    api_ = api; routing_ = routing; mutation_=mutation; client_ = client; recognizer_ = recognizer;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
     detail::SetContentCommitValidator(&ValidateContentCommit);
 }
 Status Adapter::ValidateCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
@@ -212,12 +237,14 @@ void HIGGS_HAND_CALL Adapter::OnInput(const HIGGS_HandInput* input, void* contex
 }
 void Adapter::Input(const HIGGS_HandInput& input) {
     if (input.structSize != sizeof(input) || input.physicalHand < 1 || input.physicalHand > 2) return;
+    if(input.edge==HIGGS_INPUT_UP){SlotEditingSnapshot editing{};const bool editingEnabled=detail::ReadEditingMode(editing);std::lock_guard lock(mutex_);if((activeDrag_.requestId&&activeDrag_.epoch==input.epoch&&activeDrag_.physicalHands==input.physicalHand&&dragStart_.editingRevision&&input.button==editing.mode.button)||(dragCandidate_.request&&dragCandidate_.input.epoch==input.epoch&&dragCandidate_.input.physicalHand==input.physicalHand&&dragCandidate_.input.button==input.button)){releasedInput_[input.physicalHand-1]=input.inputId;}(void)editingEnabled;}
     CachedInput cached{};
     { std::lock_guard lock(mutex_); if (!connected_) return; cached = cache_; }
     const auto now = Now(); const auto handIndex = input.physicalHand - 1;
     if (!cached.frame || cached.epoch != input.epoch || cached.observation != input.snapshot.observationId ||
         now < cached.sampledAt || now - cached.sampledAt > 100000000) return;
     const auto& hand = input.snapshot.hands[handIndex];
+    if(OfferDrag(input))return;
     RuntimeInput observation{}; observation.structSize = sizeof(observation);
     observation.physicalHand = input.physicalHand; observation.button = input.button; observation.edge = input.edge;
     observation.contentCategory = cached.categories[handIndex];
@@ -243,6 +270,60 @@ void Adapter::Input(const HIGGS_HandInput& input) {
             candidates_.push_back({request, offer, now, input.snapshot, candidate.physicalHands});
     }
 }
+bool Adapter::OfferDrag(const HIGGS_HandInput& input){
+    SlotEditingSnapshot editing{};if(!detail::ReadEditingMode(editing)||!(editing.mode.physicalHands&input.physicalHand)||input.button!=editing.mode.button||input.edge!=HIGGS_INPUT_DOWN)return false;
+    if(!mutation_.WithAuthorizedAction)return true;
+    const auto& hand=input.snapshot.hands[input.physicalHand-1];
+    if(!detail::MayOfferSlotAction(hand)||hand.occupancy!=HIGGS_OCCUPANCY_EMPTY)return false;
+    auto rows=std::make_unique<std::array<RuntimeRecord,kMaxInstances>>();RuntimeView view{sizeof(RuntimeView),kRuntimeApiVersion};
+    if(detail::GetRuntimeApi().CopyRuntime(reader_,rows->data(),kMaxInstances,&view)!=Status::Ok)return false;
+    const RuntimeRecord* target=nullptr;
+    for(std::uint32_t i=0;i<view.count;++i){const auto& row=(*rows)[i];if(!row.availability&&(row.insideHands&input.physicalHand)&&(!target||row.configured.instance.instanceHandle<target->configured.instance.instanceHandle))target=&row;}
+    if(!target)return false;
+    HIGGS_ActionCandidate candidate{};candidate.structSize=sizeof(candidate);candidate.physicalHands=input.physicalHand;candidate.inputId=input.inputId;candidate.epoch=input.epoch;candidate.handGeneration=input.handGeneration;candidate.executor=dragExecutor_;candidate.actionId=UINT64_C(0x425344524147);candidate.contextId=target->configured.instance.instanceHandle;candidate.contextGeneration=editing.revision;candidate.grantDurationMs=60000;
+    std::lock_guard lock(mutex_);if(dragCandidate_.request||activeDrag_.requestId)return true;
+    HIGGS_HandRequestId request{};if(api_.SubmitCandidate(client_,&candidate,&request)==HIGGS_HAND_OK){dragCandidate_={request,editing.revision,candidate.contextId,Now(),input};releasedInput_[input.physicalHand-1]=0;}
+    return true;
+}
+void Adapter::CancelDrag(){
+    HIGGS_ActionRequest active{};DragCandidate pending{};
+    {std::lock_guard lock(mutex_);active=activeDrag_;activeDrag_={};pending=dragCandidate_;dragCandidate_={};}
+    detail::InvalidateDrag();if(active.requestId){routing_.CancelRecognizedAction(client_,active.requestId,active.epoch,4);api_.ReleaseGrant(client_,active.grant);}if(pending.request)routing_.CancelRecognizedAction(client_,pending.request,pending.input.epoch,4);
+}
+void Adapter::UpdateDrag(const HIGGS_HandSnapshot& snapshot,const detail::RuntimeFrame& frame,const RuntimeTransform hands[2],const RuntimeView& view){
+    DragCandidate candidate{};HIGGS_ActionRequest active{};
+    {std::lock_guard lock(mutex_);candidate=dragCandidate_;active=activeDrag_;}
+    auto records=std::make_unique<std::array<RuntimeRecord,kMaxInstances>>();RuntimeView current{sizeof(RuntimeView),kRuntimeApiVersion};
+    if(detail::GetRuntimeApi().CopyRuntime(reader_,records->data(),kMaxInstances,&current)!=Status::Ok){CancelDrag();return;}
+    if(candidate.request){
+        HIGGS_InputDecision decision{};decision.structSize=sizeof(decision);HIGGS_ActionResult result{};result.structSize=sizeof(result);
+        const auto decided=api_.CopyInputDecision(client_,candidate.input.inputId,&decision);
+        if(decided!=HIGGS_HAND_OK){if(Now()-candidate.createdAt>100000000)CancelDrag();return;}
+        if(!decision.consumed||decision.requestId!=candidate.request||decision.owner!=client_){std::lock_guard lock(mutex_);dragCandidate_={};return;}
+        if(api_.CopyActionResult(client_,candidate.request,&result)!=HIGGS_HAND_OK||result.stage!=HIGGS_ACTION_ACCEPTED||result.executor!=dragExecutor_||!detail::GrantMatchesObservations(candidate.input.snapshot,snapshot,candidate.input.physicalHand,client_,decision.grant)){CancelDrag();return;}
+        const RuntimeRecord* row=nullptr;const detail::AnchorSample* anchor=nullptr;
+        for(std::uint32_t i=0;i<current.count;++i)if((*records)[i].configured.instance.instanceHandle==candidate.instance)row=&(*records)[i];
+        for(std::uint32_t i=0;i<frame.anchorCount;++i)if(frame.anchors[i].instanceHandle==candidate.instance)anchor=&frame.anchors[i];
+        if(!row||!anchor||!anchor->valid||!frame.hands[candidate.input.physicalHand-1].valid){CancelDrag();return;}
+        detail::DragStart start{candidate.request,snapshot.epoch,frame.frame,candidate.editingRevision,current.saveGeneration,current.viewRevision,frame.bodyGeneration,anchor->anchorGeneration,candidate.input.physicalHand,0,*row,hands[candidate.input.physicalHand-1],anchor->world};
+        if(detail::BeginAuthorizedDrag(start)!=Status::Ok){CancelDrag();return;}
+        active={};active.structSize=sizeof(active);active.physicalHands=candidate.input.physicalHand;active.requestId=candidate.request;active.owner=client_;active.executor=dragExecutor_;active.grant=decision.grant;active.epoch=snapshot.epoch;active.inputId=candidate.input.inputId;active.actionId=UINT64_C(0x425344524147);active.contextId=candidate.instance;active.contextGeneration=candidate.editingRevision;
+        {std::lock_guard lock(mutex_);dragStart_=start;dragHandGeneration_=candidate.input.handGeneration;activeDrag_=active;dragCandidate_={};}
+    }
+    if(!active.requestId)return;
+    const auto handIndex=active.physicalHands-1;const auto& hand=snapshot.hands[handIndex];SlotEditingSnapshot editing{};SlotDragSnapshot drag{sizeof(SlotDragSnapshot)};detail::GetManipulationApi().CopyDrag(reader_,&drag);
+    if(!detail::ReadEditingMode(editing)||editing.revision!=dragStart_.editingRevision||drag.stage!=static_cast<std::uint32_t>(SlotDragStage::Preview)||snapshot.epoch!=active.epoch||frame.bodyGeneration!=dragStart_.bodyGeneration||current.saveGeneration!=dragStart_.saveGeneration||current.viewRevision!=dragStart_.viewRevision||hand.grant!=active.grant||hand.owner!=client_||hand.generation!=dragHandGeneration_||hand.availability!=HIGGS_AVAILABILITY_RESERVED||hand.unavailableReasons||(hand.observationMask&detail::kKnownHandObservation)!=detail::kKnownHandObservation||(hand.observationMask&HIGGS_OBS_SECONDARY_SUPPORT)||!frame.hands[handIndex].valid||hand.occupancy!=HIGGS_OCCUPANCY_EMPTY){CancelDrag();return;}
+    const detail::AnchorSample* anchor=nullptr;for(std::uint32_t i=0;i<frame.anchorCount;++i)if(frame.anchors[i].instanceHandle==dragStart_.slot.configured.instance.instanceHandle)anchor=&frame.anchors[i];
+    if(!anchor||!anchor->valid||anchor->anchorGeneration!=dragStart_.anchorGeneration||detail::AdvanceAuthorizedDrag(active.requestId,frame.frame,hands[handIndex],anchor->world)!=Status::Ok){CancelDrag();return;}
+    std::uint64_t released{};{std::lock_guard lock(mutex_);released=releasedInput_[handIndex];}
+    if(released>active.inputId){
+        const auto outcome=detail::CommitDragWithAuthority(mutation_,api_,client_,active,dragHandGeneration_);
+        const auto committed=outcome.authority==HIGGS_HAND_OK?outcome.customization:Status::Unavailable;
+        if(outcome.authority!=HIGGS_HAND_OK)routing_.CancelRecognizedAction(client_,active.requestId,active.epoch,static_cast<std::uint32_t>(committed));
+        {std::lock_guard lock(mutex_);activeDrag_={};}if(committed!=Status::Ok)detail::InvalidateDrag();
+    }
+    (void)view;
+}
 void Adapter::FinishCandidates(const HIGGS_HandSnapshot& snapshot) {
     std::vector<Candidate> pending;
     { std::lock_guard lock(mutex_); pending.swap(candidates_); }
@@ -260,6 +341,7 @@ void Adapter::FinishCandidates(const HIGGS_HandSnapshot& snapshot) {
         if (!detail::GrantMatchesObservations(candidate.observation, snapshot, candidate.resources, decision.owner, decision.grant)) {
             routing_.CancelRecognizedAction(client_, candidate.request, decision.epoch, 1); continue;
         }
+        if(!detail::RevalidateOfferContent(offer,snapshot.observationId)){routing_.CancelRecognizedAction(client_,candidate.request,decision.epoch,5);continue;}
         ActionGrant grant{}; grant.epoch = decision.epoch; grant.requestId = decision.requestId; grant.grantId = decision.grant;
         grant.contextId = offer.offerId; grant.contextGeneration = offer.policyRevision;
         grant.inputSequence = decision.inputId; grant.physicalHand = offer.context.input.physicalHand;
@@ -269,6 +351,30 @@ void Adapter::FinishCandidates(const HIGGS_HandSnapshot& snapshot) {
         // Inventory/physics outcomes are reported by the assigned provider under
         // its own HIGGS client, then mirrored through ReportContentCommit.
     }
+}
+void Adapter::UpdatePolicies(const HIGGS_HandSnapshot& snapshot){
+    auto policies=std::make_unique<std::array<ContentPolicyRecord,kMaxInstances>>();InstanceView view{sizeof(InstanceView),1};
+    if(detail::GetContentPolicyApi().CopyPolicies(reader_,policies->data(),kMaxInstances,&view)!=Status::Ok)return;
+    auto runtime=std::make_unique<std::array<RuntimeRecord,kMaxInstances>>();RuntimeView current{sizeof(RuntimeView),kRuntimeApiVersion};
+    if(detail::GetRuntimeApi().CopyRuntime(reader_,runtime->data(),kMaxInstances,&current)!=Status::Ok||view.saveGeneration!=current.saveGeneration||view.viewRevision!=current.viewRevision)return;
+    std::array<detail::ContentPolicySample,kMaxInstances*4> samples{};std::uint32_t count=0;
+    for(std::uint32_t i=0;i<current.count;++i){const auto handle=(*runtime)[i].configured.instance.instanceHandle;const SlotContentPolicy* policy=nullptr;for(std::uint32_t j=0;j<view.count;++j)if((*policies)[j].instanceHandle==handle)policy=&(*policies)[j].policy;
+        for(unsigned handIndex=0;handIndex<2;++handIndex)for(unsigned source=1;source<=2;++source){const auto& hand=snapshot.hands[handIndex];detail::ContentPolicySample sample{};sample.instanceHandle=handle;sample.epoch=snapshot.epoch;sample.handObservationId=snapshot.observationId;sample.physicalHand=handIndex+1;sample.source=source;
+            const auto known=source==1?HIGGS_OBS_HELD_KNOWN:HIGGS_OBS_EQUIPMENT_KNOWN;const auto id=source==1?hand.heldRefId:hand.equippedFormId;auto* form=RE::TESForm::LookupByID(id);if(auto* reference=form?form->As<RE::TESObjectREFR>():nullptr)form=reference->GetBaseObject();
+            if((hand.observationMask&known)==known&&!id){sample.known=1;sample.allowed=1;}
+            else if((hand.observationMask&known)==known&&form){
+                sample.baseFormId=form->GetFormID();sample.category=Category(source==1?hand.heldRefId:0,source==2?hand.equippedFormId:0);
+                detail::ContentPolicyResolver resolver{};resolver.context=form;
+                resolver.IsBaseForm=[](void* data,std::uint32_t expected){return static_cast<RE::TESForm*>(data)->GetFormID()==expected;};
+                resolver.HasKeyword=[](void* data,std::uint32_t keyword){auto* key=RE::TESForm::LookupByID<RE::BGSKeyword>(keyword);auto* keywords=static_cast<RE::TESForm*>(data)->As<RE::BGSKeywordForm>();return key&&keywords&&keywords->HasKeyword(key);};
+                resolver.IsInFormList=[](void* data,std::uint32_t list){auto* value=RE::TESForm::LookupByID<RE::BGSListForm>(list);return value&&value->HasForm(static_cast<RE::TESForm*>(data));};
+                resolver.DependencyAvailable=[](void*,std::uint32_t formId,std::uint32_t kind){auto* value=RE::TESForm::LookupByID(formId);return value&&(kind==1||(kind==2&&value->Is(RE::FormType::Keyword))||(kind==3&&value->Is(RE::FormType::FormList)));};
+                bool available=true;sample.allowed=!policy||detail::EvaluateContentPolicy(*policy,resolver,available)?1u:0u;sample.known=available?1u:0u;
+            }
+            samples[count++]=sample;
+        }
+    }
+    detail::PublishContentPolicySamples(samples.data(),count,view.saveGeneration,view.viewRevision);
 }
 void Adapter::ClearVisuals() {
     for (auto& visual : visuals_) if (visual.wrapper && visual.wrapper->parent) visual.wrapper->parent->DetachChild(visual.wrapper.get());
@@ -324,8 +430,9 @@ void Adapter::Present(const RuntimeRecord& record, RE::NiNode* parent) {
     const auto parentTransform = parent->world;
     if (!(parentTransform.scale > 0)) return;
     RE::NiTransform world{};
-    std::copy(record.world.rotation, record.world.rotation + 9, &world.rotate.entry[0][0]);
-    world.translate = {record.world.position[0], record.world.position[1], record.world.position[2]}; world.scale = record.world.scale;
+    auto placement=record.world;detail::ApplyDragPreview(record.configured.instance.instanceHandle,placement);
+    std::copy(placement.rotation, placement.rotation + 9, &world.rotate.entry[0][0]);
+    world.translate = {placement.position[0], placement.position[1], placement.position[2]}; world.scale = placement.scale;
     wrapper.local = parentTransform.Invert() * world;
     wrapper.SetAppCulled(false);
     RE::NiUpdateData update{}; wrapper.Update(update);
@@ -335,6 +442,7 @@ void Adapter::Tick() {
     bool reset{};
     { std::lock_guard lock(mutex_); if (!connected_) return; reset = resetRequested_; resetRequested_ = false; }
     if (reset) {
+        CancelDrag();
         ClearVisuals(); anchors_.clear(); retainedBody_.reset(); lastBody_ = nullptr; lastCell_ = nullptr; ++bodyGeneration_;
         std::vector<Candidate> cancelled;
         { std::lock_guard lock(mutex_); cancelled.swap(candidates_); }
@@ -345,10 +453,11 @@ void Adapter::Tick() {
     auto* root = player ? player->Get3D(false) : nullptr;
     auto* cell = player ? player->GetParentCell() : nullptr;
     if (api_.CopySnapshot(client_, &snapshot) != HIGGS_HAND_OK || !snapshot.worldReady || !root || !cell || !cell->IsAttached()) {
-        detail::InvalidateRuntime(); ClearVisuals();
+        CancelDrag();detail::InvalidateRuntime(); ClearVisuals();
         std::lock_guard lock(mutex_); cache_ = {}; return;
     }
     if (root != lastBody_ || cell != lastCell_) {
+        CancelDrag();
         SynchronizeActions();
         detail::InvalidateRuntime(); ClearVisuals(); anchors_.clear(); retainedBody_.reset(root); lastBody_ = root; lastCell_ = cell; ++bodyGeneration_;
     }
@@ -367,11 +476,13 @@ void Adapter::Tick() {
             if ((*records)[i].configured.instance.instanceHandle == identity.instance) return false;
         return true;
     }), anchors_.end());
+    RuntimeTransform handWorld[2]{};
     for (unsigned i = 0; i < 2; ++i) {
         auto& probe = frame.hands[i]; probe.physicalHand = i + 1; probe.sampleId = frame.frame * 2 + i;
         auto* hand = FindPath(root, i == 0 ? "NPC L Hand [LHnd]" : "NPC R Hand [RHnd]");
         const auto flags = snapshot.hands[i].observationMask;
         if (hand && (flags & HIGGS_OBS_TRACKING_VALID)) {
+            handWorld[i]=CopyTransform(hand->world);
             probe.valid = 1; probe.world[0] = hand->world.translate.x; probe.world[1] = hand->world.translate.y; probe.world[2] = hand->world.translate.z;
         }
     }
@@ -386,6 +497,8 @@ void Adapter::Tick() {
     }
     frame.anchors = anchors->data(); frame.anchorCount = view.count;
     if (detail::UpdateRuntime(frame) != Status::Ok) return;
+    UpdatePolicies(snapshot);
+    UpdateDrag(snapshot,frame,handWorld,view);
     FinishCandidates(snapshot);
     SynchronizeActions();
     view = {}; view.structSize = sizeof(view); view.version = kRuntimeApiVersion;

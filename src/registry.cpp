@@ -4,6 +4,10 @@
 #include "instances.h"
 #include "instance_configuration.h"
 #include "runtime_saved.h"
+#include "zone_geometry.h"
+#include "manipulation.h"
+#include "body_slots_equipment_api.h"
+#include "content_policy.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -385,6 +389,25 @@ InstanceView InstanceHeader(const Registry& state, std::uint32_t count) noexcept
 }
 bool CurrentInstanceView(const Registry& state, std::uint64_t scope, std::uint64_t view) noexcept {
     return scope && view && scope == state.instances.Generation() && view == state.instances.ViewRevision();
+}
+Status RuntimeCustomizerIdentity(std::uint64_t token) noexcept {
+    return Guard([&]{auto& s=State();std::lock_guard lock(s.mutex);return s.FindCustomizer(token)?Status::Ok:Status::Unauthorized;});
+}
+Status RuntimeConfigurationReader(std::uint64_t token) noexcept {
+    return Guard([&]{auto& s=State();std::lock_guard lock(s.mutex);return s.CanReadConfiguration(token)?Status::Ok:Status::Unauthorized;});
+}
+Status ApplyDraggedPlacement(std::uint64_t customizer,std::uint64_t handle,std::uint64_t scope,std::uint64_t view,const float position[3],const float rotation[9]) noexcept {
+    return Guard([&]{
+        if(!position||!rotation)return Status::InvalidArgument;auto& s=State();std::lock_guard lock(s.mutex);
+        if(!s.FindCustomizer(customizer))return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        const auto* entry=s.instances.Find(handle);if(!entry)return Status::NotFound;
+        if(EffectiveInstance(s,*entry).templateState!=static_cast<std::uint32_t>(InstanceTemplateState::Current))return Status::Unavailable;
+        const auto key=CustomizationKey(*entry);InstanceCustomization custom{};if(const auto* old=s.instanceCustomizations.Find(key))custom=*old;
+        custom.structSize=sizeof(custom);custom.key=key;custom.fieldMask|=CustomizePosition|CustomizeRotation;std::copy(position,position+3,custom.position);std::copy(rotation,rotation+9,custom.rotation);
+        const auto validation=ValidateInstanceCustomization(custom);if(validation!=Status::Ok)return validation;
+        auto saved=std::make_unique<InstanceCustomizationStore::Candidate>();bool changed=false;const auto status=s.instanceCustomizations.PrepareApply(custom,*saved,changed);if(status!=Status::Ok)return status;
+        if(changed){auto instances=std::make_unique<InstanceStore::Candidate>();const auto invalidated=s.instances.PrepareInvalidation(*instances);if(invalidated!=Status::Ok)return invalidated;s.instanceCustomizations.Apply(*saved);s.instances.Apply(*instances);}return Status::Ok;
+    });
 }
 Status BS_CALL ApplyActivationChanges(std::uint64_t writer, const ActivationChange* changes, std::uint32_t count,
     std::uint64_t scope, std::uint64_t view, InstanceView* output) noexcept {
@@ -770,8 +793,9 @@ Status CopySavedRuntimeCustomizations(std::uint64_t reader,RuntimeCustomizationR
         if(!view||capacity>kMaxInstances||(capacity&&!records))return Status::InvalidArgument;
         if(view->structSize!=sizeof(InstanceView)||view->version!=kInstanceApiVersion||view->reserved)return Status::UnsupportedVersion;
         auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);if(!s.FindClient(reader))return Status::Unauthorized;
-        *view=InstanceHeader(s,s.runtimeCustomizations.count);if(capacity<s.runtimeCustomizations.count)return Status::BufferTooSmall;
-        std::copy(s.runtimeCustomizations.entries.begin(),s.runtimeCustomizations.entries.begin()+s.runtimeCustomizations.count,records);return Status::Ok;
+        std::uint32_t count=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&3u)++count;
+        *view=InstanceHeader(s,count);if(capacity<count)return Status::BufferTooSmall;
+        std::uint32_t out=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&3u){records[out]=s.runtimeCustomizations.entries[i];records[out++].fieldMask&=3u;}return Status::Ok;
     });
 }
 Status ClearSavedRuntimeCustomization(std::uint64_t writer,const InstanceCustomizationKey* key,std::uint32_t mask,std::uint64_t scope,std::uint64_t view) noexcept {
@@ -783,13 +807,91 @@ Status ClearSavedRuntimeCustomization(std::uint64_t writer,const InstanceCustomi
         if(index==s.runtimeCustomizations.count)return Status::NotFound;
         auto transition=std::make_unique<InstanceStore::Candidate>();auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;
         auto& record=s.runtimeCustomizations.entries[index];record.fieldMask&=~mask;if(mask&kSavedRuntimeBinding)record.binding={};if(mask&kSavedRuntimeVisual)record.visual={};
-        if(!record.fieldMask){for(auto i=index+1;i<s.runtimeCustomizations.count;++i)s.runtimeCustomizations.entries[i-1]=s.runtimeCustomizations.entries[i];s.runtimeCustomizations.entries[--s.runtimeCustomizations.count]={};}
+        if(!record.fieldMask){for(auto i=index+1;i<s.runtimeCustomizations.count;++i){s.runtimeCustomizations.entries[i-1]=s.runtimeCustomizations.entries[i];s.runtimeCustomizations.shapes[i-1]=s.runtimeCustomizations.shapes[i];s.runtimeCustomizations.policies[i-1]=s.runtimeCustomizations.policies[i];}s.runtimeCustomizations.entries[--s.runtimeCustomizations.count]={};s.runtimeCustomizations.shapes[s.runtimeCustomizations.count]={};s.runtimeCustomizations.policies[s.runtimeCustomizations.count]={};}
         s.instances.Apply(*transition);return Status::Ok;
     });
+}
+Status SetSavedZoneShape(std::uint64_t editor,std::uint64_t handle,const ZoneShape* shape,std::uint64_t scope,std::uint64_t view) noexcept {
+    return Guard([&]{
+        if(!shape)return Status::InvalidArgument;auto status=ValidateZoneShape(*shape);if(status!=Status::Ok)return status;
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* client=s.FindClient(editor);const bool customizer=s.FindCustomizer(editor)!=nullptr;
+        if(!customizer&&(!client||!client->provider[0]))return Status::Unauthorized;
+        if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        const auto* instance=s.instances.Find(handle);if(!instance)return Status::NotFound;if(!customizer&&instance->owner!=editor)return Status::Unauthorized;
+        const auto configured=ConfiguredInstance(s,*instance);if(configured.instance.templateState!=static_cast<std::uint32_t>(InstanceTemplateState::Current))return Status::Unavailable;
+        InstanceCustomizationKey key{};key.instance=configured.instance.key;std::memcpy(key.definitionProvider,configured.instance.definitionProvider,64);std::memcpy(key.definitionKey,configured.instance.definitionKey,64);
+        auto index=s.runtimeCustomizations.count;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[i].key,key)){index=i;break;}
+        if(index==kMaxInstances)return Status::LimitExceeded;
+        if(index<s.runtimeCustomizations.count&&(s.runtimeCustomizations.entries[index].fieldMask&kSavedRuntimeShape)&&!std::memcmp(&s.runtimeCustomizations.shapes[index],shape,sizeof(*shape)))return Status::Ok;
+        auto transition=std::make_unique<InstanceStore::Candidate>();status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;
+        auto& row=s.runtimeCustomizations.entries[index];row.key=key;row.fieldMask|=kSavedRuntimeShape;s.runtimeCustomizations.shapes[index]=*shape;if(index==s.runtimeCustomizations.count)++s.runtimeCustomizations.count;s.instances.Apply(*transition);return Status::Ok;
+    });
+}
+Status ClearSavedZoneShape(std::uint64_t editor,const InstanceCustomizationKey* key,std::uint64_t scope,std::uint64_t view) noexcept {
+    return Guard([&]{
+        if(!key||ValidateInstanceCustomizationKey(*key)!=Status::Ok)return Status::InvalidArgument;
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);const auto* client=s.FindClient(editor);
+        if(!s.FindCustomizer(editor)&&(!client||!client->provider[0]||std::strcmp(client->provider,key->instance.ownerProvider)))return Status::Unauthorized;
+        if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        std::uint32_t index=0;for(;index<s.runtimeCustomizations.count;++index)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[index].key,*key))break;
+        if(index==s.runtimeCustomizations.count||!(s.runtimeCustomizations.entries[index].fieldMask&kSavedRuntimeShape))return Status::NotFound;
+        auto transition=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;
+        auto& record=s.runtimeCustomizations.entries[index];record.fieldMask&=~kSavedRuntimeShape;s.runtimeCustomizations.shapes[index]={};
+        if(!record.fieldMask){for(auto i=index+1;i<s.runtimeCustomizations.count;++i){s.runtimeCustomizations.entries[i-1]=s.runtimeCustomizations.entries[i];s.runtimeCustomizations.shapes[i-1]=s.runtimeCustomizations.shapes[i];s.runtimeCustomizations.policies[i-1]=s.runtimeCustomizations.policies[i];}s.runtimeCustomizations.entries[--s.runtimeCustomizations.count]={};s.runtimeCustomizations.shapes[s.runtimeCustomizations.count]={};s.runtimeCustomizations.policies[s.runtimeCustomizations.count]={};}
+        s.instances.Apply(*transition);return Status::Ok;
+    });
+}
+Status CopySavedZoneShapes(std::uint64_t reader,SavedZoneShape* records,std::uint32_t capacity,InstanceView* view) noexcept {
+    return Guard([&]{
+        if(!view||capacity>kMaxInstances||(capacity&&!records))return Status::InvalidArgument;
+        if(view->structSize!=sizeof(InstanceView)||view->version!=kInstanceApiVersion||view->reserved)return Status::UnsupportedVersion;
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);if(!s.CanReadConfiguration(reader))return Status::Unauthorized;
+        std::uint32_t count=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&kSavedRuntimeShape)++count;
+        *view=InstanceHeader(s,count);if(capacity<count)return Status::BufferTooSmall;
+        std::uint32_t out=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&kSavedRuntimeShape)records[out++]={s.runtimeCustomizations.entries[i].key,s.runtimeCustomizations.shapes[i]};return Status::Ok;
+    });
+}
+Status SetSavedContentPolicy(std::uint64_t editor,std::uint64_t handle,const SlotContentPolicy* policy,std::uint64_t scope,std::uint64_t view) noexcept {
+    return Guard([&]{if(!policy)return Status::InvalidArgument;const auto validation=ValidateContentPolicy(*policy);if(validation!=Status::Ok)return validation;auto& s=State();std::lock_guard lock(s.mutex);const auto* client=s.FindClient(editor);const bool customizer=s.FindCustomizer(editor)!=nullptr;if(!customizer&&(!client||!client->provider[0]))return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;const auto* instance=s.instances.Find(handle);if(!instance)return Status::NotFound;if(!customizer&&instance->owner!=editor)return Status::Unauthorized;const auto configured=ConfiguredInstance(s,*instance);if(configured.instance.templateState!=static_cast<std::uint32_t>(InstanceTemplateState::Current))return Status::Unavailable;const auto key=CustomizationKey(*instance);auto index=s.runtimeCustomizations.count;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[i].key,key)){index=i;break;}if(index==kMaxInstances)return Status::LimitExceeded;if(index<s.runtimeCustomizations.count&&(s.runtimeCustomizations.entries[index].fieldMask&kSavedRuntimePolicy)&&!std::memcmp(&s.runtimeCustomizations.policies[index],policy,sizeof(*policy)))return Status::Ok;auto transition=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;auto& entry=s.runtimeCustomizations.entries[index];entry.key=key;entry.fieldMask|=kSavedRuntimePolicy;s.runtimeCustomizations.policies[index]=*policy;if(index==s.runtimeCustomizations.count)++s.runtimeCustomizations.count;s.instances.Apply(*transition);return Status::Ok;});
+}
+Status ClearSavedContentPolicy(std::uint64_t editor,const InstanceCustomizationKey* key,std::uint64_t scope,std::uint64_t view) noexcept {
+    return Guard([&]{if(!key||ValidateInstanceCustomizationKey(*key)!=Status::Ok)return Status::InvalidArgument;auto& s=State();std::lock_guard lock(s.mutex);const auto* client=s.FindClient(editor);if(!s.FindCustomizer(editor)&&(!client||!client->provider[0]||std::strcmp(client->provider,key->instance.ownerProvider)))return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;std::uint32_t index=0;for(;index<s.runtimeCustomizations.count;++index)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[index].key,*key))break;if(index==s.runtimeCustomizations.count||!(s.runtimeCustomizations.entries[index].fieldMask&kSavedRuntimePolicy))return Status::NotFound;auto transition=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;auto& record=s.runtimeCustomizations.entries[index];record.fieldMask&=~kSavedRuntimePolicy;s.runtimeCustomizations.policies[index]={};if(!record.fieldMask){for(auto i=index+1;i<s.runtimeCustomizations.count;++i){s.runtimeCustomizations.entries[i-1]=s.runtimeCustomizations.entries[i];s.runtimeCustomizations.shapes[i-1]=s.runtimeCustomizations.shapes[i];s.runtimeCustomizations.policies[i-1]=s.runtimeCustomizations.policies[i];}s.runtimeCustomizations.entries[--s.runtimeCustomizations.count]={};s.runtimeCustomizations.shapes[s.runtimeCustomizations.count]={};s.runtimeCustomizations.policies[s.runtimeCustomizations.count]={};}s.instances.Apply(*transition);return Status::Ok;});
+}
+Status CopySavedContentPolicies(std::uint64_t reader,ContentPolicyRecord* records,std::uint32_t capacity,InstanceView* view) noexcept {
+    return Guard([&]{if(!view||capacity>kMaxInstances||(capacity&&!records))return Status::InvalidArgument;if(view->structSize!=sizeof(InstanceView)||view->version!=kInstanceApiVersion||view->reserved)return Status::UnsupportedVersion;auto& s=State();std::lock_guard lock(s.mutex);if(!s.CanReadConfiguration(reader))return Status::Unauthorized;std::uint32_t count=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&kSavedRuntimePolicy)++count;*view=InstanceHeader(s,count);if(capacity<count)return Status::BufferTooSmall;std::uint32_t out=0;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(s.runtimeCustomizations.entries[i].fieldMask&kSavedRuntimePolicy){const auto& key=s.runtimeCustomizations.entries[i].key;const auto* live=FindCustomizationInstance(s,key);records[out++]={key,live?live->handle:0,s.runtimeCustomizations.policies[i]};}return Status::Ok;});
 }
 const InstanceApi kInstanceApi{sizeof(InstanceApi), kInstanceApiVersion,
     kRuntimeInstancesCapability | kBodyAnchorInstancesCapability, UpsertInstance, RemoveInstance,
     CopyEffectiveInstances, EvaluateInstanceEligibility};
+Status BS_CALL BindEquipmentSlots(std::uint64_t writer,const EquipmentSlotEntry* entries,std::uint32_t count,std::uint64_t scope,std::uint64_t view,
+    InstanceRecord* output,std::uint32_t capacity,InstanceView* header) noexcept {
+    return Guard([&]{
+        if(!entries||!count||count>kMaxEquipmentSetSlots||!output||capacity<count||capacity>kMaxInstances||!header)return Status::InvalidArgument;
+        if(header->structSize!=sizeof(*header)||header->version!=kInstanceApiVersion||header->reserved)return Status::UnsupportedVersion;
+        auto copied=std::make_unique<std::array<EquipmentSlotEntry,kMaxEquipmentSetSlots>>();std::copy(entries,entries+count,copied->begin());
+        std::array<InstanceSpec,kMaxEquipmentSetSlots> specs{};std::array<std::uint64_t,kMaxEquipmentSetSlots> revisions{},handles{};
+        for(std::uint32_t i=0;i<count;++i){const auto& entry=(*copied)[i];auto status=ValidateInstanceSpec(entry.instance);if(status!=Status::Ok)return status;status=ValidateRuntimeBinding(entry.binding);if(status!=Status::Ok)return status;if(!entry.binding.requiredEquipmentFormId||(i&&(std::strcmp(entry.instance.equipmentKey,(*copied)[0].instance.equipmentKey)||entry.binding.requiredEquipmentFormId!=(*copied)[0].binding.requiredEquipmentFormId)))return Status::InvalidArgument;specs[i]=entry.instance;revisions[i]=entry.expectedInstanceRevision;}
+        auto& s=State();std::lock_guard lock(s.mutex);const auto* client=s.FindClient(writer);if(!client||!client->provider[0])return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        for(std::uint32_t i=0;i<count;++i){const auto index=s.FindKey(specs[i].definitionProvider,specs[i].definitionKey);if(index==s.count||s.records[index].definitionRevision!=specs[i].definitionRevision)return Status::Unavailable;}
+        auto saved=std::make_unique<RuntimeCustomizationData>(s.runtimeCustomizations);bool savedChanged=false;
+        for(std::uint32_t i=0;i<count;++i){InstanceCustomizationKey key{};std::memcpy(key.instance.ownerProvider,client->provider,64);std::memcpy(key.instance.equipmentKey,specs[i].equipmentKey,64);std::memcpy(key.instance.slotKey,specs[i].slotKey,64);std::memcpy(key.definitionProvider,specs[i].definitionProvider,64);std::memcpy(key.definitionKey,specs[i].definitionKey,64);auto index=saved->count;for(std::uint32_t j=0;j<saved->count;++j)if(SameInstanceCustomizationKey(saved->entries[j].key,key)){index=j;break;}if(index==kMaxInstances)return Status::LimitExceeded;if(!(saved->entries[index].fieldMask&kSavedRuntimeBinding)){auto& record=saved->entries[index];record.key=key;record.binding=(*copied)[i].binding;record.fieldMask|=kSavedRuntimeBinding;if(index==saved->count)++saved->count;savedChanged=true;}}
+        auto instances=std::make_unique<InstanceStore::Candidate>();auto status=s.instances.PrepareBatchUpsert(writer,client->provider,specs.data(),revisions.data(),count,scope,*instances,handles.data());if(status!=Status::Ok)return status;if(savedChanged){status=s.instances.EnsureInvalidation(*instances);if(status!=Status::Ok)return status;}
+        s.runtimeCustomizations=*saved;s.instances.Apply(*instances);for(std::uint32_t i=0;i<count;++i)output[i]=ConfiguredInstance(s,*s.instances.Find(handles[i])).instance;*header=InstanceHeader(s,count);return Status::Ok;
+    });
+}
+Status BS_CALL SetEquipmentActive(std::uint64_t writer,const char* equipment,std::uint32_t active,std::uint64_t scope,std::uint64_t view,InstanceView* header) noexcept {
+    return Guard([&]{
+        char key[64]{};if(!CopyIdentity(equipment,key)||active>1||!header)return Status::InvalidArgument;if(header->structSize!=sizeof(*header)||header->version!=kInstanceApiVersion||header->reserved)return Status::UnsupportedVersion;
+        auto& s=State();std::lock_guard lock(s.mutex);const auto* client=s.FindClient(writer);if(!client||!client->provider[0])return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        std::array<ActivationChange,kMaxInstances> changes{};std::uint32_t count=0;for(std::uint32_t i=0;i<s.instances.Count();++i){const auto& instance=s.instances.At(i);if(instance.owner!=writer||std::strcmp(instance.spec.equipmentKey,key))continue;if(active){const auto authored=s.FindKey(instance.spec.definitionProvider,instance.spec.definitionKey);if(authored==s.count||s.records[authored].definitionRevision!=instance.spec.definitionRevision)return Status::Unavailable;}changes[count++]={sizeof(ActivationChange),active?kInstanceActive:0,instance.handle,instance.revision};}
+        if(!count)return Status::NotFound;auto candidate=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareActivation(writer,changes.data(),count,scope,view,*candidate);if(status!=Status::Ok)return status;s.instances.Apply(*candidate);*header=InstanceHeader(s,count);return Status::Ok;
+    });
+}
+Status BS_CALL RemoveEquipmentSlots(std::uint64_t writer,const char* equipment,std::uint64_t scope,std::uint64_t view,InstanceView* header) noexcept {
+    return Guard([&]{char key[64]{};if(!CopyIdentity(equipment,key)||!header)return Status::InvalidArgument;if(header->structSize!=sizeof(*header)||header->version!=kInstanceApiVersion||header->reserved)return Status::UnsupportedVersion;auto& s=State();std::lock_guard lock(s.mutex);const auto* client=s.FindClient(writer);if(!client||!client->provider[0])return Status::Unauthorized;if(!CurrentInstanceView(s,scope,view))return Status::Conflict;auto candidate=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareEquipmentRemoval(writer,key,scope,*candidate);if(status!=Status::Ok)return status;s.instances.Apply(*candidate);*header=InstanceHeader(s,s.instances.Count());return Status::Ok;});
+}
+const EquipmentApi kEquipmentApi{sizeof(EquipmentApi),kEquipmentApiVersion,3,BindEquipmentSlots,SetEquipmentActive,RemoveEquipmentSlots};
 const InstanceActivationApi kInstanceActivationApi{sizeof(InstanceActivationApi), kInstanceActivationApiVersion,
     kAtomicInstanceActivationCapability, ApplyActivationChanges};
 const ConfigurationApi kConfigurationApi{sizeof(ConfigurationApi), kConfigurationApiVersion,
@@ -819,4 +921,7 @@ extern "C" __declspec(dllexport) const body_slots::InstanceActivationApi* BS_CAL
 extern "C" __declspec(dllexport) const body_slots::InstanceConfigurationApi* BS_CALL BodySlots_QueryInstanceConfigurationInterface(std::uint32_t version, std::uint32_t size) noexcept {
     if (version != body_slots::kInstanceConfigurationApiVersion || size != sizeof(body_slots::InstanceConfigurationApi)) return nullptr;
     return &body_slots::detail::kInstanceConfigurationApi;
+}
+extern "C" __declspec(dllexport) const body_slots::EquipmentApi* BS_CALL BodySlots_QueryEquipmentInterface(std::uint32_t version,std::uint32_t size) noexcept {
+    return version==body_slots::kEquipmentApiVersion&&size==sizeof(body_slots::EquipmentApi)?&body_slots::detail::kEquipmentApi:nullptr;
 }

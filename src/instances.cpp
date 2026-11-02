@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 namespace body_slots::detail {
 Status ValidateActivationChanges(const ActivationChange* changes, std::uint32_t count) noexcept {
@@ -92,6 +93,19 @@ Status InstanceStore::PrepareRemove(std::uint64_t owner, std::uint64_t handle,
     for (auto i = index + 1; i < next.count; ++i) next.entries[i - 1] = next.entries[i];
     next.entries[--next.count] = {};
     return Status::Ok;
+}
+Status InstanceStore::PrepareBatchUpsert(std::uint64_t owner,const char* provider,const InstanceSpec* specs,const std::uint64_t* revisions,
+    std::uint32_t count,std::uint64_t generation,Candidate& candidate,std::uint64_t* handles) const {
+    if(!specs||!revisions||!handles||!count||count>kMaxInstances)return Status::InvalidArgument;
+    auto staged=std::make_unique<InstanceStore>(*this);auto row=std::make_unique<Candidate>();std::array<std::uint64_t,kMaxInstances> allocated{};
+    for(std::uint32_t i=0;i<count;++i){const auto validation=ValidateInstanceSpec(specs[i]);if(validation!=Status::Ok)return validation;for(std::uint32_t j=0;j<i;++j)if(!std::strcmp(specs[i].equipmentKey,specs[j].equipmentKey)&&!std::strcmp(specs[i].slotKey,specs[j].slotKey))return Status::InvalidArgument;const auto status=staged->PrepareUpsert(owner,provider,specs[i],generation,revisions[i],*row,allocated[i]);if(status!=Status::Ok)return status;staged->Apply(*row);}
+    candidate.state_=staged->state_;candidate.changed_=state_.view!=candidate.state_.view;std::copy(allocated.begin(),allocated.begin()+count,handles);return Status::Ok;
+}
+Status InstanceStore::PrepareEquipmentRemoval(std::uint64_t owner,const char* equipment,std::uint64_t generation,Candidate& candidate) const noexcept {
+    if(!generation||generation!=state_.generation)return Status::Conflict;bool found=false;for(std::uint32_t i=0;i<state_.count;++i)if(state_.entries[i].owner==owner&&!std::strcmp(state_.entries[i].spec.equipmentKey,equipment))found=true;if(!found)return Status::NotFound;
+    const auto status=PrepareInvalidation(candidate);if(status!=Status::Ok)return status;std::uint32_t out=0;
+    for(std::uint32_t i=0;i<state_.count;++i)if(state_.entries[i].owner!=owner||std::strcmp(state_.entries[i].spec.equipmentKey,equipment))candidate.state_.entries[out++]=state_.entries[i];
+    for(auto i=out;i<candidate.state_.count;++i)candidate.state_.entries[i]={};candidate.state_.count=out;return Status::Ok;
 }
 Status InstanceStore::PrepareRelease(std::uint64_t owner, bool definitionsChanged, Candidate& candidate) const noexcept {
     bool owns = false;

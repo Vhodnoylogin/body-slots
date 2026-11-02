@@ -115,7 +115,7 @@ void OnLoad(SKSESerializationInterface* serialization) noexcept {
             } else if (type == kInstanceConfigurationRecord && !seenInstances && version == body_slots::detail::kInstanceCustomizationSaveVersion
                 && length >= body_slots::detail::kInstanceCustomizationSaveHeaderBytes && length <= body_slots::detail::kMaxInstanceCustomizationSaveBytes) {
                 seenInstances = true; candidate = &instances;
-            } else if (type == kRuntimeConfigurationRecord && !seenRuntime && version == body_slots::detail::kRuntimeCustomizationSaveVersion
+            } else if (type == kRuntimeConfigurationRecord && !seenRuntime && (version >= 1 && version <= body_slots::detail::kRuntimeCustomizationSaveVersion)
                 && length >= 16 && length <= body_slots::detail::kMaxRuntimeCustomizationSaveBytes) {
                 seenRuntime = true; candidate = &runtime;
             } else { Log(State().packages, "customization load rejected duplicate/unknown/unbounded record batch"); return; }

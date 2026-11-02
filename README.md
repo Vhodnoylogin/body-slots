@@ -6,7 +6,9 @@ Body Slots owns definitions, stable keys, saved placement, body/equipment bindin
 
 This first development snapshot is not a released or game-tested mod. It contains newly written code; reconstructed VRIK code stays in its separate private repository.
 
-The new [runtime API](docs/runtime.md) and [independent game adapter](docs/game-adapter.md) implement spherical zones, versioned behavior/action contracts, correlated content receipts, removable callbacks and save-scoped binding/visual overrides. The native DLL builds without a changed VRIK DLL. Activation requires the additive HIGGS hand/routing API implemented in the cooperation fork; released HIGGS001 alone does not provide that service. Native/game qualification remains distinct from the production-core and protocol checks.
+The [runtime API](docs/runtime.md), [slot extensions](docs/runtime-extensions.md) and [independent game adapter](docs/game-adapter.md) implement sphere/capsule/box zones, atomic wearable slot sets, source-aware behavior/action contracts, saved form/keyword/form-list filters, HIGGS-authorized rigid dragging, correlated content receipts, removable callbacks and save-scoped customization. The native DLL builds without a changed VRIK DLL. Activation requires the additive HIGGS hand/routing API implemented in the cooperation fork; released HIGGS001 alone does not provide that service. Native/game qualification remains distinct from the production-core and protocol checks.
+
+The optional [ordinary inventory provider SDK helper](docs/ordinary-inventory-provider.md) composes those public slot contracts with HIGGS's shared native inventory executor. A consumer supplies selection/acceptance policy and content projection; it reuses asynchronous selection, transactions and actual grip/release receipts without implementing its own pickup or inventory mutation machinery.
 
 Build the native adapter with `python tools/build_game.py --sdk-root <public-SKSE-source> --higgs-root <synergy-HIGGS-checkout> --output <external-directory>`. `tools/build.py` remains the headless foundation/SDK fixture. See the adapter page for dependency pins, provider registration, phases and remaining limits.
 
@@ -14,7 +16,7 @@ The [unpublished Nexus draft packaging](docs/release-draft.md) separates the unc
 
 The separate [configuration API](docs/configuration.md) stores save-scoped placement overrides without changing authored defaults or the original definition ABI. It exposes effective copied placement and eligibility, with provider/key persistence and revision-checked edits. This service remains definition-scoped; instance-specific placement uses the separate table below.
 
-The additive [instance API](docs/instances.md) now supports transient equipment-provider-owned logical instances of existing definitions, with explicit body-anchor binding, independent activation, pinned template revisions and coherent copied effective placement. Equipment keys come from the caller; activation persistence, equipment-node binding, content previews and item transactions remain later services.
+The additive [instance API](docs/instances.md) supports transient equipment-provider-owned logical instances of existing definitions, with independent activation, pinned template revisions and coherent copied effective placement. Equipment keys come from the caller. Separate runtime/extension tables provide equipment-node bindings, previews and set publication; content executors retain inventory operations and assignment persistence.
 
 The separate [atomic activation table](docs/instance-activation.md) changes requested activation for a bounded set of one writer's existing instances in one revision-checked transaction. It permits deactivation of missing/changed templates without repinning them, preserves old ABI layouts and saved state, and does not infer worn equipment or presentation eligibility.
 

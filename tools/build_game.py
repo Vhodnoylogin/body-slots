@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,11 +41,13 @@ def main():
     cmake = Path(cmake).resolve()
     ctest = cmake.with_name('ctest.exe' if os.name == 'nt' else 'ctest')
     higgs = args.higgs_root.resolve()
-    sources = [f for directory in ('include', 'src', 'tests', 'tools') for f in (ROOT / directory).rglob('*')
+    sources = [f for directory in ('include', 'src', 'tests', 'tools', 'examples') for f in (ROOT / directory).rglob('*')
                if f.is_file() and f.suffix in ('.h', '.cpp', '.py', '.c')]
     sources.append(ROOT / 'CMakeLists.txt')
-    dependencies = [higgs / 'include' / name for name in ('higgsinterface001.h', 'higgshandapi.h', 'higgshandrouting.h', 'higgshandoperations.h', 'hand_broker.h')]
-    dependencies += [higgs / 'src' / name for name in ('hand_broker.cpp', 'hand_runtime.cpp')]
+    closure = higgs / 'cmake/HiggsServices.cmake'
+    dependencies = [closure,higgs/'include/higgsinterface001.h']
+    dependencies += [higgs / name for name in re.findall(r'\$\{HIGGS_SERVICE_ROOT\}/([^"\n]+)',closure.read_text(encoding='utf-8'))
+                     if Path(name).suffix in ('.h','.hpp','.inl','.c','.cc','.cpp','.cxx')]
     pins = {str(f): sha(f) for f in sources + dependencies}
     commands = []
 
@@ -64,13 +67,17 @@ def main():
             configure.append(f'-DFETCHCONTENT_SOURCE_DIR_{name.upper()}={args.dependency_sources.resolve() / (name + "-src")}')
     run('configure', configure)
     run('build', [cmake, '--build', output / 'native', '--config', 'Release', '--target',
-                  'BodySlots', 'body_slots_runtime_tests', 'body_slots_higgs_integration_tests', '-j', '6'])
+                  'BodySlots', 'body_slots_runtime_tests', 'body_slots_zone_tests', 'body_slots_higgs_integration_tests',
+                  'body_slots_inventory_provider_tests', '-j', '6'])
     run('tests', [ctest, '--test-dir', output / 'native', '-C', 'Release', '--output-on-failure'])
     run('dll-probe', [sys.executable, '-B', ROOT / 'tools/probe_game_dll.py', output / 'native/Release/BodySlots.dll'])
     for path, digest in pins.items():
         if sha(Path(path)) != digest:
             raise RuntimeError(f'input changed during build; rerun against stable inputs: {path}')
     dll = output / 'native/Release/BodySlots.dll'
+    changed = [name for name,digest in pins.items() if sha(Path(name)) != digest]
+    if changed:
+        raise RuntimeError('Build inputs changed while compiling/testing; rerun with stable sources: ' + ', '.join(changed))
     manifest = {'sourceSha256': pins, 'commands': commands, 'dll': {'path': str(dll), 'bytes': dll.stat().st_size, 'sha256': sha(dll)},
                 'gameStarts': 0, 'qualification': 'Native adapter linked; production cores and copied contracts checked offline. No game, pose, scene, hardware or HIGGS/PLANCK native qualification.'}
     (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')

@@ -41,10 +41,14 @@ public:
         Candidate&, std::uint64_t& handle) const noexcept;
     Status PrepareRemove(std::uint64_t owner, std::uint64_t handle,
         std::uint64_t expectedGeneration, std::uint64_t expectedRevision, Candidate&) const noexcept;
+    Status PrepareBatchUpsert(std::uint64_t owner,const char* provider,const InstanceSpec*,const std::uint64_t* revisions,
+        std::uint32_t count,std::uint64_t expectedGeneration,Candidate&,std::uint64_t* handles) const;
+    Status PrepareEquipmentRemoval(std::uint64_t owner,const char* equipmentKey,std::uint64_t expectedGeneration,Candidate&) const noexcept;
     Status PrepareActivation(std::uint64_t owner, const ActivationChange*, std::uint32_t count,
         std::uint64_t expectedGeneration, std::uint64_t expectedView, Candidate&) const noexcept;
     Status PrepareRelease(std::uint64_t owner, bool definitionsChanged, Candidate&) const noexcept;
     Status PrepareInvalidation(Candidate&) const noexcept;
+    Status EnsureInvalidation(Candidate& candidate) const noexcept { return candidate.changed_?Status::Ok:PrepareInvalidation(candidate); }
     Status PrepareReset(Candidate&) const noexcept;
     void Apply(const Candidate& candidate) noexcept { if (candidate.changed_) Commit(candidate.state_); }
 private:
@@ -59,6 +63,7 @@ Status ResetSaveScope(InstanceView* committed) noexcept;
 // Runtime reads a coherent registry snapshot and derives ownership from live
 // registry leases. These are internal helpers, never client-supplied identities.
 Status RuntimeClientIdentity(std::uint64_t token, bool writer, char provider[64]) noexcept;
+Status RuntimeConfigurationReader(std::uint64_t token) noexcept;
 Status RuntimeOwnsInstance(std::uint64_t writer, std::uint64_t handle) noexcept;
 Status CopyRuntimeConfiguration(ConfiguredInstanceRecord*, std::uint32_t capacity, InstanceView*) noexcept;
 using RuntimeReleaseHook = Status (*)(std::uint64_t) noexcept;
