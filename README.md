@@ -1,10 +1,14 @@
 # Body Slots
 
-Private initial extraction of declarative body-slot management from VRIK.
+Private Body Slots development: independent slot management and interaction for Skyrim VR.
 
-Body Slots owns definitions, stable keys, local placement and generic content policy. VRIK remains responsible for body binding, hand detection, interaction and presentation. Definitions are authored outside Skyrim; visual authoring belongs in a separate Slots mode in [Morphbench](https://github.com/Vhodnoylogin/morphbench), using its existing model and skeleton viewer.
+Body Slots owns definitions, stable keys, saved placement, body/equipment binding, zones, activation, content-provider dispatch and presentation. VRIK supplies the body and virtual-hand observations; HIGGS supplies authoritative hand states, input arbitration and granted physical operations. Offline visual authoring belongs in the Slots mode of [Morphbench](https://github.com/Vhodnoylogin/morphbench).
 
 This first development snapshot is not a released or game-tested mod. It contains newly written code; reconstructed VRIK code stays in its separate private repository.
+
+The new [runtime API](docs/runtime.md) and [independent game adapter](docs/game-adapter.md) implement spherical zones, versioned behavior/action contracts, correlated content receipts, removable callbacks and save-scoped binding/visual overrides. The native DLL builds without a changed VRIK DLL. Activation requires the additive HIGGS hand/routing API implemented in the cooperation fork; released HIGGS001 alone does not provide that service. Native/game qualification remains distinct from the production-core and protocol checks.
+
+Build the native adapter with `python tools/build_game.py --sdk-root <public-SKSE-source> --higgs-root <synergy-HIGGS-checkout> --output <external-directory>`. `tools/build.py` remains the headless foundation/SDK fixture. See the adapter page for dependency pins, provider registration, phases and remaining limits.
 
 The [unpublished Nexus draft packaging](docs/release-draft.md) separates the unchanged runtime DLL from a mod-author SDK/example archive. Its label `0.1.0-alpha.1` does not change the existing plugin/ABI versions. Licensing is to be finalized before publication; no license grant or public-source/visibility change is made by draft packaging.
 

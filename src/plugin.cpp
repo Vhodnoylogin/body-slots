@@ -11,6 +11,11 @@
 #include "configuration.h"
 #include "instances.h"
 #include "instance_configuration.h"
+#include "runtime.h"
+#include "runtime_saved.h"
+#if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
+#include "game_adapter.h"
+#endif
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -35,6 +40,7 @@ constexpr const char* kPluginName = "BodySlots";
 constexpr UInt32 kSerializationId = 0x534C5342; // BSLS
 constexpr UInt32 kConfigurationRecord = 0x46435342; // BSCF
 constexpr UInt32 kInstanceConfigurationRecord = 0x49435342; // BSCI
+constexpr UInt32 kRuntimeConfigurationRecord = 0x54525342; // BSRT
 struct PluginState {
     std::mutex mutex;
     bool loaded = false, packagesLoaded = false;
@@ -63,6 +69,10 @@ void Log(const std::filesystem::path& directory, const std::string& message) noe
     } catch (...) {}
 }
 bool BeginSaveScope(body_slots::InstanceView* committed = nullptr) noexcept {
+    body_slots::detail::InvalidateRuntime();
+#if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
+    body_slots::game::Reset();
+#endif
     const auto status = body_slots::detail::ResetSaveScope(committed);
     if (status != body_slots::Status::Ok) Log(State().packages, "save scope reset failed");
     return status == body_slots::Status::Ok;
@@ -71,11 +81,15 @@ void OnRevert(SKSESerializationInterface*) noexcept { BeginSaveScope(); }
 void OnSave(SKSESerializationInterface* serialization) noexcept {
     try {
         if (!serialization || !serialization->WriteRecord) return;
-        std::vector<std::uint8_t> definitions, instances; bool hasInstances = false;
-        const auto status = body_slots::detail::SaveConfigurationBatch(definitions, instances, hasInstances);
+        std::vector<std::uint8_t> definitions, instances, runtime; bool hasInstances = false, hasRuntime = false;
+        const auto status = body_slots::detail::SaveConfigurationBatch(definitions, instances, hasInstances, runtime, hasRuntime);
         if (status != body_slots::Status::Ok) { Log(State().packages, "customization batch encoding failed"); return; }
         // BSCI requires its BSCF partner on load. Writing it first makes a failed
         // second write reject the incomplete batch; already-written IO is not rolled back.
+        if (hasRuntime && !serialization->WriteRecord(kRuntimeConfigurationRecord,
+            body_slots::detail::kRuntimeCustomizationSaveVersion, runtime.data(), static_cast<UInt32>(runtime.size()))) {
+            Log(State().packages, "runtime customization save failed"); return;
+        }
         if (hasInstances && !serialization->WriteRecord(kInstanceConfigurationRecord,
             body_slots::detail::kInstanceCustomizationSaveVersion, instances.data(), static_cast<UInt32>(instances.size()))) {
             Log(State().packages, "instance customization save failed"); return;
@@ -91,7 +105,7 @@ void OnLoad(SKSESerializationInterface* serialization) noexcept {
     if (!BeginSaveScope(&loadView)) return;
     try {
         if (!serialization || !serialization->GetNextRecordInfo || !serialization->ReadRecordData) return;
-        std::vector<std::uint8_t> definitions, instances; bool seenDefinitions = false, seenInstances = false;
+        std::vector<std::uint8_t> definitions, instances, runtime; bool seenDefinitions = false, seenInstances = false, seenRuntime = false;
         UInt32 type = 0, version = 0, length = 0;
         while (serialization->GetNextRecordInfo(&type, &version, &length)) {
             std::vector<std::uint8_t>* candidate = nullptr;
@@ -101,14 +115,28 @@ void OnLoad(SKSESerializationInterface* serialization) noexcept {
             } else if (type == kInstanceConfigurationRecord && !seenInstances && version == body_slots::detail::kInstanceCustomizationSaveVersion
                 && length >= body_slots::detail::kInstanceCustomizationSaveHeaderBytes && length <= body_slots::detail::kMaxInstanceCustomizationSaveBytes) {
                 seenInstances = true; candidate = &instances;
+            } else if (type == kRuntimeConfigurationRecord && !seenRuntime && version == body_slots::detail::kRuntimeCustomizationSaveVersion
+                && length >= 16 && length <= body_slots::detail::kMaxRuntimeCustomizationSaveBytes) {
+                seenRuntime = true; candidate = &runtime;
             } else { Log(State().packages, "customization load rejected duplicate/unknown/unbounded record batch"); return; }
             candidate->resize(length);
             if (serialization->ReadRecordData(candidate->data(), length) != length) {
                 Log(State().packages, "customization load rejected truncated record"); return;
             }
         }
-        if (seenInstances && !seenDefinitions) { Log(State().packages, "instance customization load missing BSCF partner"); return; }
-        if (seenDefinitions && body_slots::detail::LoadConfigurationBatch(&definitions, seenInstances ? &instances : nullptr,
+        if ((seenInstances || seenRuntime) && !seenDefinitions) { Log(State().packages, "customization load missing BSCF partner"); return; }
+        if (seenRuntime) {
+            const auto resolver = [](std::uint32_t oldId, std::uint32_t* out, void* context) -> bool {
+                auto* api = static_cast<SKSESerializationInterface*>(context);
+                UInt32 resolved = 0;
+                if (!api->ResolveFormId || !api->ResolveFormId(oldId, &resolved)) return false;
+                *out = static_cast<std::uint32_t>(resolved); return true;
+            };
+            if (body_slots::detail::RemapRuntimeCustomizationForms(runtime, resolver, serialization) != body_slots::Status::Ok) {
+                Log(State().packages, "runtime customization form remap failed; no batch applied"); return;
+            }
+        }
+        if (seenDefinitions && body_slots::detail::LoadConfigurationBatch(&definitions, seenInstances ? &instances : nullptr, seenRuntime ? &runtime : nullptr,
             loadView.saveGeneration, loadView.viewRevision) != body_slots::Status::Ok)
             Log(State().packages, "customization load rejected invalid/stale batch; no prefix was applied");
     } catch (...) { Log(State().packages, "customization load internal error; author defaults remain effective"); }
@@ -116,6 +144,11 @@ void OnLoad(SKSESerializationInterface* serialization) noexcept {
 void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
     try {
         if (!message || !message->sender || std::strcmp(message->sender, "SKSE")) return;
+#if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
+        if (message->type == SKSEMessagingInterface::kMessage_PostPostLoad) {
+            body_slots::game::Connect(); return;
+        }
+#endif
         if (message->type == SKSEMessagingInterface::kMessage_PreLoadGame || message->type == SKSEMessagingInterface::kMessage_NewGame) {
             OnRevert(nullptr); return;
         }
@@ -158,7 +191,7 @@ void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
 
 extern "C" __declspec(dllexport) bool SKSEPlugin_Query(const SKSEInterface* skse, PluginInfo* info) noexcept {
     if (!info) return false;
-    info->infoVersion = PluginInfo::kInfoVersion; info->name = kPluginName; info->version = 2;
+    info->infoVersion = PluginInfo::kInfoVersion; info->name = kPluginName; info->version = 3;
     try { return Compatible(skse); } catch (...) { return false; }
 }
 extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse) noexcept {
@@ -180,6 +213,9 @@ extern "C" __declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse)
         serialization->SetSaveCallback(handle, OnSave);
         serialization->SetLoadCallback(handle, OnLoad);
         state.handle = handle; state.packages = directory; state.loaded = true;
+#if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
+        body_slots::game::Initialize(skse);
+#endif
         return true;
     } catch (...) { return false; }
 }

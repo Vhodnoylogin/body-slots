@@ -91,19 +91,21 @@ def main():
         run(command)
         return target
 
-    dll = compile_target("BodySlots", ["src/registry.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/plugin.cpp"], True)
+    dll = compile_target("BodySlots", ["src/registry.cpp", "src/runtime_saved.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/runtime.cpp", "src/plugin.cpp"], True)
     package = output / "examples/potion-belt.bslots"
     run([sys.executable, "-B", ROOT / "tools/author.py", ROOT / "examples/potion-belt.json", "--output", package])
     if not args.skip_tests:
         compile_target("consumer_fixture", ["tests/consumer_fixture.cpp"], True)
         native = compile_target("native_tests", ["tests/native_tests.cpp", "src/validation.cpp", "src/package.cpp"])
-        configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        configuration = compile_target("configuration_tests", ["tests/configuration_tests.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
         instances = compile_target("instance_tests", ["tests/instance_tests.cpp"])
         activation = compile_target("instance_activation_tests", ["tests/instance_activation_tests.cpp"])
         activation_store = compile_target("instance_activation_store_tests", ["tests/instance_activation_store_tests.cpp", "src/instances.cpp", "src/validation.cpp"])
         instance_configuration = compile_target("instance_configuration_tests", ["tests/instance_configuration_tests.cpp", "src/instance_configuration.cpp", "src/configuration_serialization.cpp", "src/validation.cpp"])
         native_placement = compile_target("native_placement_tests", ["tests/native_placement_tests.cpp"])
         native_policy = compile_target("native_policy_tests", ["tests/native_policy_tests.cpp"])
+        runtime = compile_target("runtime_tests", ["tests/runtime_tests.cpp", "src/runtime.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        run([runtime])
         run([sys.executable, "-B", ROOT / "tests/test_author.py"])
         run([native, dll, package, output])
         run([configuration])

@@ -3,6 +3,8 @@
 #include "body_slots_instance_activation_api.h"
 #include <array>
 
+namespace body_slots { struct ConfiguredInstanceRecord; }
+
 namespace body_slots::detail {
 Status ValidateInstanceSpec(const InstanceSpec&) noexcept;
 Status ValidateActivationChanges(const ActivationChange*, std::uint32_t count) noexcept;
@@ -54,4 +56,11 @@ private:
 // Save-scope invalidation is separate from a standalone configuration reset.
 Status ResetSaveScope() noexcept;
 Status ResetSaveScope(InstanceView* committed) noexcept;
+// Runtime reads a coherent registry snapshot and derives ownership from live
+// registry leases. These are internal helpers, never client-supplied identities.
+Status RuntimeClientIdentity(std::uint64_t token, bool writer, char provider[64]) noexcept;
+Status RuntimeOwnsInstance(std::uint64_t writer, std::uint64_t handle) noexcept;
+Status CopyRuntimeConfiguration(ConfiguredInstanceRecord*, std::uint32_t capacity, InstanceView*) noexcept;
+using RuntimeReleaseHook = Status (*)(std::uint64_t) noexcept;
+void SetRuntimeReleaseHook(RuntimeReleaseHook) noexcept;
 } // namespace body_slots::detail

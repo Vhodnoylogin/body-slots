@@ -3,8 +3,10 @@
 #include "runtime_token.h"
 #include "instances.h"
 #include "instance_configuration.h"
+#include "runtime_saved.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -12,7 +14,9 @@
 
 namespace body_slots::detail {
 constexpr std::size_t kMaxWriters = 64, kMaxObservers = 64, kMaxClients = kMaxWriters + kMaxObservers;
-struct Client { std::uint64_t token = 0; char provider[64]{}; };
+struct Client { std::uint64_t token = 0; char provider[64]{}; bool releasing = false; };
+std::atomic<RuntimeReleaseHook> runtimeReleaseHook{nullptr};
+void SetRuntimeReleaseHook(RuntimeReleaseHook hook) noexcept { runtimeReleaseHook.store(hook,std::memory_order_release); }
 struct Customizer { std::uint64_t token = 0; char identity[64]{}; };
 struct Registry {
     std::mutex mutex;
@@ -22,11 +26,12 @@ struct Registry {
     CustomizationStore customizations{};
     InstanceStore instances{};
     InstanceCustomizationStore instanceCustomizations{};
+    RuntimeCustomizationData runtimeCustomizations{};
     std::uint32_t count = 0;
     std::uint64_t revision = 1, nextToken = 1, nextSlot = 1, nextDefinitionRevision = 1;
     std::uint64_t configurationRevision = 1;
     Client* FindClient(std::uint64_t token) noexcept {
-        if (token) for (auto& c : clients) if (c.token == token) return &c;
+        if (token) for (auto& c : clients) if (c.token == token && !c.releasing) return &c;
         return nullptr;
     }
     Customizer* FindCustomizer(std::uint64_t token) noexcept {
@@ -96,15 +101,30 @@ Status BS_CALL RegisterObserver(std::uint64_t* client) noexcept {
 }
 Status BS_CALL ReleaseClient(std::uint64_t token) noexcept {
     return Guard([&] {
+        auto transition = std::make_unique<InstanceStore::Candidate>();
+        // Revoke registration/invocation first, then drain callback code outside
+        // the registry mutex. A callback cannot release its own live stack.
+        auto& state=State();
+        { std::lock_guard<std::mutex> lock(state.mutex);
+            auto* client=state.FindClient(token); if(!client)return Status::Unauthorized;
+            client->releasing=true;
+        }
+        const auto hook=runtimeReleaseHook.load(std::memory_order_acquire);
+        const auto drained=hook?hook(token):Status::Ok;
+        if(drained!=Status::Ok) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            for(auto& client:state.clients)if(client.token==token)client.releasing=false;
+            return drained;
+        }
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
-        auto* c = s.FindClient(token); if (!c) return Status::Unauthorized;
+        Client* c=nullptr;for(auto& client:s.clients)if(client.token==token)c=&client;
+        if(!c)return Status::Unauthorized;
         std::uint32_t out = 0;
         bool owned = false;
         for (std::uint32_t i = 0; i < s.count; ++i) if (!std::strcmp(s.records[i].definition.provider, c->provider)) owned = true;
-        if (owned && !s.CanAdvance(0, 0)) return Status::LimitExceeded;
-        auto transition = std::make_unique<InstanceStore::Candidate>();
+        if (owned && !s.CanAdvance(0, 0)) { c->releasing=false;return Status::LimitExceeded; }
         const auto status = s.instances.PrepareRelease(token, owned, *transition);
-        if (status != Status::Ok) return status;
+        if (status != Status::Ok) { c->releasing=false;return status; }
         for (std::uint32_t i = 0; i < s.count; ++i)
             if (std::strcmp(s.records[i].definition.provider, c->provider)) s.records[out++] = s.records[i];
         if (owned) { s.count = out; ++s.revision; ++s.configurationRevision; }
@@ -629,6 +649,7 @@ Status ResetSaveScope(InstanceView* committed) noexcept {
         auto customizationTransition = std::make_unique<InstanceCustomizationStore::Candidate>();
         s.instanceCustomizations.PrepareReset(*customizationTransition);
         s.customizations = {}; ++s.configurationRevision;
+        s.runtimeCustomizations = {};
         s.instanceCustomizations.Apply(*customizationTransition); s.instances.Apply(*transition);
         if (committed) *committed = InstanceHeader(s, 0);
         return Status::Ok;
@@ -636,26 +657,39 @@ Status ResetSaveScope(InstanceView* committed) noexcept {
 }
 Status ResetSaveScope() noexcept { return ResetSaveScope(nullptr); }
 Status SaveConfigurationBatch(std::vector<std::uint8_t>& definitions, std::vector<std::uint8_t>& instances, bool& hasInstances) noexcept {
+    std::vector<std::uint8_t> runtime;bool hasRuntime=false;
+    return SaveConfigurationBatch(definitions,instances,hasInstances,runtime,hasRuntime);
+}
+Status SaveConfigurationBatch(std::vector<std::uint8_t>& definitions, std::vector<std::uint8_t>& instances, bool& hasInstances,
+    std::vector<std::uint8_t>& runtime,bool& hasRuntime) noexcept {
     return Guard([&] {
         auto definitionData = std::make_unique<CustomizationStore>();
         auto instanceData = std::make_unique<InstanceCustomizationData>();
+        auto runtimeData = std::make_unique<RuntimeCustomizationData>();
         { auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
-            *definitionData = s.customizations; s.instanceCustomizations.CopyTo(*instanceData); }
-        std::vector<std::uint8_t> definitionBytes, instanceBytes;
+            *definitionData = s.customizations; s.instanceCustomizations.CopyTo(*instanceData); *runtimeData=s.runtimeCustomizations; }
+        std::vector<std::uint8_t> definitionBytes, instanceBytes,runtimeBytes;
         auto status = EncodeCustomizations(*definitionData, definitionBytes); if (status != Status::Ok) return status;
         status = EncodeInstanceCustomizations(*instanceData, instanceBytes); if (status != Status::Ok) return status;
+        status = EncodeRuntimeCustomizations(*runtimeData,runtimeBytes);if(status!=Status::Ok)return status;
         definitions.swap(definitionBytes); instances.swap(instanceBytes); hasInstances = instanceData->count != 0;
+        runtime.swap(runtimeBytes);hasRuntime=runtimeData->count!=0;
         return Status::Ok;
     });
 }
 Status LoadConfigurationBatch(const std::vector<std::uint8_t>* definitions, const std::vector<std::uint8_t>* instances,
     std::uint64_t scope, std::uint64_t view) noexcept {
+    return LoadConfigurationBatch(definitions,instances,nullptr,scope,view);
+}
+Status LoadConfigurationBatch(const std::vector<std::uint8_t>* definitions,const std::vector<std::uint8_t>* instances,
+    const std::vector<std::uint8_t>* runtime,std::uint64_t scope,std::uint64_t view) noexcept {
     return Guard([&] {
-        if (instances && !definitions) return Status::InvalidArgument;
+        if ((instances||runtime) && !definitions) return Status::InvalidArgument;
         if ((definitions && definitions->size() > kMaxCustomizationSaveBytes) ||
             (instances && instances->size() > kMaxInstanceCustomizationSaveBytes)) return Status::InvalidArgument;
         auto definitionData = std::make_unique<CustomizationStore>();
         auto instanceData = std::make_unique<InstanceCustomizationData>();
+        auto runtimeData = std::make_unique<RuntimeCustomizationData>();
         if (definitions) {
             const auto status = DecodeCustomizations(definitions->data(), static_cast<std::uint32_t>(definitions->size()), *definitionData);
             if (status != Status::Ok) return status;
@@ -664,6 +698,7 @@ Status LoadConfigurationBatch(const std::vector<std::uint8_t>* definitions, cons
             const auto status = DecodeInstanceCustomizations(instances->data(), static_cast<std::uint32_t>(instances->size()), *instanceData);
             if (status != Status::Ok) return status;
         }
+        if(runtime){if(runtime->size()>kMaxRuntimeCustomizationSaveBytes)return Status::InvalidArgument;const auto status=DecodeRuntimeCustomizations(runtime->data(),static_cast<std::uint32_t>(runtime->size()),*runtimeData);if(status!=Status::Ok)return status;}
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
         if (!CurrentInstanceView(s, scope, view)) return Status::Conflict;
         if (s.configurationRevision == std::numeric_limits<std::uint64_t>::max()) return Status::LimitExceeded;
@@ -672,12 +707,86 @@ Status LoadConfigurationBatch(const std::vector<std::uint8_t>* definitions, cons
         auto customizationTransition = std::make_unique<InstanceCustomizationStore::Candidate>();
         status = s.instanceCustomizations.PrepareReplace(*instanceData, *customizationTransition); if (status != Status::Ok) return status;
         s.customizations = *definitionData; ++s.configurationRevision;
+        s.runtimeCustomizations=*runtimeData;
         s.instanceCustomizations.Apply(*customizationTransition); s.instances.Apply(*transition); return Status::Ok;
     });
 }
 const InstanceConfigurationApi kInstanceConfigurationApi{sizeof(InstanceConfigurationApi), kInstanceConfigurationApiVersion,
     kConfiguredInstancesCapability | kSavedInstanceCustomizationCapability, ApplyInstanceCustomization, ClearInstanceCustomization,
     CopyConfiguredInstances, CopyInstanceCustomizations, EvaluateConfiguredInstanceEligibility};
+Status RuntimeClientIdentity(std::uint64_t token, bool writer, char provider[64]) noexcept {
+    return Guard([&] {
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* c = s.FindClient(token);
+        if (!c || (writer && !c->provider[0])) return Status::Unauthorized;
+        if (provider) std::memcpy(provider, c->provider, 64);
+        return Status::Ok;
+    });
+}
+Status RuntimeOwnsInstance(std::uint64_t token, std::uint64_t handle) noexcept {
+    return Guard([&] {
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        const auto* c = s.FindClient(token);
+        if (!c || !c->provider[0]) return Status::Unauthorized;
+        const auto* entry = s.instances.Find(handle);
+        if (!entry) return Status::NotFound;
+        return entry->owner == token ? Status::Ok : Status::Unauthorized;
+    });
+}
+Status CopyRuntimeConfiguration(ConfiguredInstanceRecord* records, std::uint32_t capacity, InstanceView* view) noexcept {
+    return CopyRuntimeConfigurationWithCustomizations(records,capacity,view,nullptr);
+}
+Status CopyRuntimeConfigurationWithCustomizations(ConfiguredInstanceRecord* records,std::uint32_t capacity,
+    InstanceView* view,RuntimeCustomizationData* customizations) noexcept {
+    return Guard([&] {
+        if (!records || !view || capacity < kMaxInstances) return Status::InvalidArgument;
+        auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);
+        for (std::uint32_t i = 0; i < s.instances.Count(); ++i) records[i] = ConfiguredInstance(s, s.instances.At(i));
+        if(customizations)*customizations=s.runtimeCustomizations;
+        *view = InstanceHeader(s, s.instances.Count()); return Status::Ok;
+    });
+}
+Status SetSavedRuntimeCustomization(std::uint64_t writer,std::uint64_t handle,const RuntimeBindingSpec* binding,
+    const SlotVisualSpec* visual) noexcept {
+    return Guard([&] {
+        if(!binding&&!visual)return Status::InvalidArgument;
+        if(binding){const auto status=ValidateRuntimeBinding(*binding);if(status!=Status::Ok)return status;}
+        if(visual){const auto status=ValidateRuntimeVisual(*visual);if(status!=Status::Ok)return status;}
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);const auto* client=s.FindClient(writer);
+        if(!client||!client->provider[0])return Status::Unauthorized;
+        const auto* instance=s.instances.Find(handle);if(!instance)return Status::NotFound;if(instance->owner!=writer)return Status::Unauthorized;
+        const auto configured=ConfiguredInstance(s,*instance);RuntimeCustomization value{};
+        value.key.instance=configured.instance.key;std::memcpy(value.key.definitionProvider,configured.instance.definitionProvider,64);std::memcpy(value.key.definitionKey,configured.instance.definitionKey,64);
+        auto index=s.runtimeCustomizations.count;for(std::uint32_t i=0;i<s.runtimeCustomizations.count;++i)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[i].key,value.key)){index=i;value=s.runtimeCustomizations.entries[i];break;}
+        if(index==s.runtimeCustomizations.count&&index==kMaxInstances)return Status::LimitExceeded;
+        if(binding){value.binding=*binding;value.fieldMask|=kSavedRuntimeBinding;}if(visual){value.visual=*visual;value.fieldMask|=kSavedRuntimeVisual;}
+        if(index<s.runtimeCustomizations.count&&!std::memcmp(&value,&s.runtimeCustomizations.entries[index],sizeof(value)))return Status::Ok;
+        auto transition=std::make_unique<InstanceStore::Candidate>();const auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;
+        s.runtimeCustomizations.entries[index]=value;if(index==s.runtimeCustomizations.count)++s.runtimeCustomizations.count;s.instances.Apply(*transition);return Status::Ok;
+    });
+}
+Status CopySavedRuntimeCustomizations(std::uint64_t reader,RuntimeCustomizationRecord* records,std::uint32_t capacity,InstanceView* view) noexcept {
+    return Guard([&]{
+        if(!view||capacity>kMaxInstances||(capacity&&!records))return Status::InvalidArgument;
+        if(view->structSize!=sizeof(InstanceView)||view->version!=kInstanceApiVersion||view->reserved)return Status::UnsupportedVersion;
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);if(!s.FindClient(reader))return Status::Unauthorized;
+        *view=InstanceHeader(s,s.runtimeCustomizations.count);if(capacity<s.runtimeCustomizations.count)return Status::BufferTooSmall;
+        std::copy(s.runtimeCustomizations.entries.begin(),s.runtimeCustomizations.entries.begin()+s.runtimeCustomizations.count,records);return Status::Ok;
+    });
+}
+Status ClearSavedRuntimeCustomization(std::uint64_t writer,const InstanceCustomizationKey* key,std::uint32_t mask,std::uint64_t scope,std::uint64_t view) noexcept {
+    return Guard([&]{
+        if(!key||ValidateInstanceCustomizationKey(*key)!=Status::Ok||!mask||(mask&~3u))return Status::InvalidArgument;
+        auto& s=State();std::lock_guard<std::mutex> lock(s.mutex);const auto* client=s.FindClient(writer);if(!client||!client->provider[0]||std::strcmp(client->provider,key->instance.ownerProvider))return Status::Unauthorized;
+        if(!CurrentInstanceView(s,scope,view))return Status::Conflict;
+        std::uint32_t index=0;for(;index<s.runtimeCustomizations.count;++index)if(SameInstanceCustomizationKey(s.runtimeCustomizations.entries[index].key,*key))break;
+        if(index==s.runtimeCustomizations.count)return Status::NotFound;
+        auto transition=std::make_unique<InstanceStore::Candidate>();auto status=s.instances.PrepareInvalidation(*transition);if(status!=Status::Ok)return status;
+        auto& record=s.runtimeCustomizations.entries[index];record.fieldMask&=~mask;if(mask&kSavedRuntimeBinding)record.binding={};if(mask&kSavedRuntimeVisual)record.visual={};
+        if(!record.fieldMask){for(auto i=index+1;i<s.runtimeCustomizations.count;++i)s.runtimeCustomizations.entries[i-1]=s.runtimeCustomizations.entries[i];s.runtimeCustomizations.entries[--s.runtimeCustomizations.count]={};}
+        s.instances.Apply(*transition);return Status::Ok;
+    });
+}
 const InstanceApi kInstanceApi{sizeof(InstanceApi), kInstanceApiVersion,
     kRuntimeInstancesCapability | kBodyAnchorInstancesCapability, UpsertInstance, RemoveInstance,
     CopyEffectiveInstances, EvaluateInstanceEligibility};
