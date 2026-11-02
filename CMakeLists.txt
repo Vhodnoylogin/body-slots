@@ -13,7 +13,7 @@ include("${BODY_SLOTS_HIGGS_SDK}/cmake/HiggsServices.cmake")
 # RE/ names and must never shadow CommonLib's engine declarations.
 set(BS_HIGGS_HEADERS "${CMAKE_CURRENT_BINARY_DIR}/contracts/higgs")
 file(MAKE_DIRECTORY "${BS_HIGGS_HEADERS}")
-foreach(header IN ITEMS higgsinterface001.h higgshandapi.h higgshandrouting.h higgsgrantmutation.h higgsinventory.h higgstransactions.h)
+foreach(header IN ITEMS higgsinterface001.h higgshandapi.h higgshandrouting.h higgsgrantmutation.h higgsinputcontext.h higgsinventory.h higgstransactions.h)
     configure_file("${BODY_SLOTS_HIGGS_SDK}/include/${header}" "${BS_HIGGS_HEADERS}/${header}" COPYONLY)
 endforeach()
 include(FetchContent)

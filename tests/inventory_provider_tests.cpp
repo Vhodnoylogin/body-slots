@@ -93,5 +93,25 @@ void ExactHeldIdentity(){
         f.Close();
     }
 }
+void MenuAcrossWithdrawal(){
+    for(unsigned mode=0;mode<2;++mode){Fixture f(20+mode);CHECK(f.Select());
+        CHECK(f.provider.Tick().stage==InventoryProviderStage::Selecting);
+        if(mode==1){HiggsHands::Inventory().Drain();f.provider.Tick();
+            HiggsHands::Transactions().Drain(HiggsHands::Now());const auto p=f.provider.Tick();
+            CHECK(p.receipt.stage==HIGGS_TX_WAIT_GRIP&&f.engine.withdrawals==1&&f.engine.stock==2&&
+                  f.Slot().contentVersion==0&&!f.observed[0].heldRefId);}
+        HiggsHands::Service().SetInputContext(1,HiggsHands::Now());
+        auto p=f.provider.CopyProgress();for(unsigned i=0;i<10&&p.stage!=InventoryProviderStage::Cancelled;++i)p=f.Pump();
+        CHECK(p.stage==InventoryProviderStage::Cancelled&&f.Slot().contentVersion==0&&f.engine.stock==3&&
+              f.engine.withdrawals==mode&&f.engine.compensations==mode&&!f.observed[0].heldRefId&&f.engine.stores==0);
+        if(mode==1)CHECK((p.receipt.receiptFlags&HIGGS_TX_COMPENSATION_CONFIRMED)&&
+                        p.receipt.disposition==HIGGS_DISPOSITION_INVENTORY);
+        // Closing UI cannot resume the old action or perform a second withdrawal.
+        HiggsHands::Service().SetInputContext(0,HiggsHands::Now());
+        for(unsigned i=0;i<3;++i)f.Pump();
+        CHECK(f.engine.stock==3&&f.engine.withdrawals==mode&&f.engine.compensations==mode&&f.Slot().contentVersion==0);
+        HiggsHands::Service().Input(Left,HIGGS_INPUT_GRIP,false,HiggsHands::Now());f.Close();
+    }
 }
-int main(){try{RoundTrip();Refusal();MissingAnchor();LostInstance();ResetDuringSelection();CompensatedWithdrawal();UncertainMutation();ResetAfterCommit();ExactHeldIdentity();std::cout<<"PASS ordinary public inventory provider "<<checks<<" checks\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+}
+int main(){try{RoundTrip();Refusal();MissingAnchor();LostInstance();ResetDuringSelection();CompensatedWithdrawal();UncertainMutation();ResetAfterCommit();ExactHeldIdentity();MenuAcrossWithdrawal();std::cout<<"PASS ordinary public inventory provider "<<checks<<" checks\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

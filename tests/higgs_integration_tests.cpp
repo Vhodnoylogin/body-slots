@@ -98,11 +98,15 @@ HIGGS_HandStatus HIGGS_HAND_CALL DragFence(uint64_t owner,const HIGGS_GrantedMut
     if(dragFenceMode==1)CHECK(!active->broker.Release(owner,request->grant));
     if(dragFenceMode==2){HIGGS_HandSnapshot expired{};CHECK(!active->broker.Copy(owner,expired,HiggsHands::Now()+UINT64_C(10000000000)));}
     if(dragFenceMode==3)CHECK(!active->broker.Unregister(owner));
+    if(dragFenceMode==6){
+        active->broker.SetInputContext(1,HiggsHands::Now());
+        active->broker.SetInputContext(0,HiggsHands::Now());
+    }
     actualDragCallback=callback;actualDragContext=context;
     return active->broker.WithAuthorizedAction(owner,*request,DragCallback,nullptr,*result);
 }
 void DragAuthorityCases(){
-    for(unsigned mode=0;mode<6;++mode){
+    for(unsigned mode=0;mode<7;++mode){
         char key[32]{};std::snprintf(key,sizeof(key),"drag-case-%u",mode);
         Pilot p(key);active=&p;p.frame=100+mode*100;p.Frame();p.broker.MarkMainThread();
         CHECK(!p.broker.Authorize(p.provider,p.executor,p.recognizer,Left));

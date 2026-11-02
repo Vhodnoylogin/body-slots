@@ -13,6 +13,7 @@
 #include "higgshandapi.h"
 #include "higgshandrouting.h"
 #include "higgsgrantmutation.h"
+#include "higgsinputcontext.h"
 #include "higgsinterface001.h"
 #include <algorithm>
 #include <array>
@@ -29,7 +30,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 std::uint64_t Now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 struct CachedInput {
-    std::uint64_t epoch{}, frame{}, observation{}, sampledAt{};
+    std::uint64_t epoch{}, frame{}, observation{}, sampledAt{}, inputContext{};
     std::array<std::uint32_t, 2> categories{};
     std::array<std::uint64_t, 2> samples{};
 };
@@ -67,6 +68,12 @@ public:
 private:
     static void OnFrame() noexcept;
     static void HIGGS_HAND_CALL OnInput(const HIGGS_HandInput*, void*) noexcept;
+    static void HIGGS_HAND_CALL OnInputContext(const HIGGS_InputContextState*,const HIGGS_InputContextState* current,void* context) noexcept {
+        if(!current||!context)return;
+        auto& stamp=static_cast<Adapter*>(context)->inputContext_;
+        auto previous=stamp.load(std::memory_order_acquire);
+        while(previous<current->generation&&!stamp.compare_exchange_weak(previous,current->generation,std::memory_order_acq_rel,std::memory_order_acquire)){}
+    }
     static void HIGGS_HAND_CALL OnDragSelected(const HIGGS_ActionRequest*,void*) noexcept {}
     void ClearVisuals();
     void Present(const RuntimeRecord&, RE::NiNode*);
@@ -85,6 +92,8 @@ private:
     HIGGS_HandRegistration recognizer_{};
     HIGGS_HandExecutor dragExecutor_{};
     bool connected_{}, resetRequested_{};
+    std::atomic<std::uint64_t> inputContext_{};
+    std::uint64_t handledInputContext_{};
     CachedInput cache_{};
     std::vector<Candidate> candidates_;
     std::vector<Visual> visuals_;
@@ -182,6 +191,18 @@ void Adapter::Connect() {
     if (api.RegisterClient(&info, &client) != HIGGS_HAND_OK) return;
     if (api.SubscribeRecognizer(client, &OnInput, this, &recognizer) != HIGGS_HAND_OK) { api.UnregisterClient(client); return; }
     if(api.RegisterExecutor(client,&OnDragSelected,this,&dragExecutor)!=HIGGS_HAND_OK){api.UnregisterClient(client);return;}
+    // Optional additive service. The callback only stamps a generation: it never
+    // calls runtime, inventory or HIGGS during an external transition callback.
+    const auto queryContext=reinterpret_cast<HIGGS_QueryInputContextInterfaceFn>(GetProcAddress(module,"HIGGS_QueryInputContextInterface"));
+    HIGGS_InputContextInterface context{};
+    if(queryContext&&queryContext(1,sizeof(context),&context)==HIGGS_HAND_OK){
+        HIGGS_InputContextState initial{};initial.structSize=sizeof(initial);
+        HIGGS_HandRegistration subscription{};
+        if(!context.CopyContext||!context.Subscribe||context.Subscribe(client,&OnInputContext,this,&subscription)!=HIGGS_HAND_OK||
+           context.CopyContext(client,&initial)!=HIGGS_HAND_OK){api.UnregisterClient(client);return;}
+        // Subscribe before copying; monotonic publication cannot overwrite a newer callback.
+        OnInputContext(nullptr,&initial,this);
+    }
     std::uint64_t reader{};
     struct PhaseRequest { void* (*getInterface)(unsigned int) = nullptr; } phase;
     const auto* messaging = SKSE::GetMessagingInterface();
@@ -240,6 +261,7 @@ void Adapter::Input(const HIGGS_HandInput& input) {
     if(input.edge==HIGGS_INPUT_UP){SlotEditingSnapshot editing{};const bool editingEnabled=detail::ReadEditingMode(editing);std::lock_guard lock(mutex_);if((activeDrag_.requestId&&activeDrag_.epoch==input.epoch&&activeDrag_.physicalHands==input.physicalHand&&dragStart_.editingRevision&&input.button==editing.mode.button)||(dragCandidate_.request&&dragCandidate_.input.epoch==input.epoch&&dragCandidate_.input.physicalHand==input.physicalHand&&dragCandidate_.input.button==input.button)){releasedInput_[input.physicalHand-1]=input.inputId;}(void)editingEnabled;}
     CachedInput cached{};
     { std::lock_guard lock(mutex_); if (!connected_) return; cached = cache_; }
+    if(cached.inputContext!=inputContext_.load(std::memory_order_acquire))return;
     const auto now = Now(); const auto handIndex = input.physicalHand - 1;
     if (!cached.frame || cached.epoch != input.epoch || cached.observation != input.snapshot.observationId ||
         now < cached.sampledAt || now - cached.sampledAt > 100000000) return;
@@ -441,6 +463,15 @@ void Adapter::Present(const RuntimeRecord& record, RE::NiNode* parent) {
 void Adapter::Tick() {
     bool reset{};
     { std::lock_guard lock(mutex_); if (!connected_) return; reset = resetRequested_; resetRequested_ = false; }
+    const auto inputContext=inputContext_.load(std::memory_order_acquire);
+    if(inputContext!=handledInputContext_){
+        // UI open+close between main frames still invalidates old offers/drag.
+        // Already dispatched content operations retain their actual receipt path.
+        CancelDrag();std::vector<Candidate> cancelled;
+        {std::lock_guard lock(mutex_);cache_={};cancelled.swap(candidates_);}
+        for(const auto& c:cancelled)routing_.CancelRecognizedAction(client_,c.request,c.offer.context.input.epoch,6);
+        handledInputContext_=inputContext;
+    }
     if (reset) {
         CancelDrag();
         ClearVisuals(); anchors_.clear(); retainedBody_.reset(); lastBody_ = nullptr; lastCell_ = nullptr; ++bodyGeneration_;
@@ -511,7 +542,7 @@ void Adapter::Tick() {
             if (!exists) { if (it->wrapper && it->wrapper->parent) it->wrapper->parent->DetachChild(it->wrapper.get()); it = visuals_.erase(it); } else ++it;
         }
     }
-    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = Now();
+    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = Now();cached.inputContext=inputContext;
     for (unsigned i = 0; i < 2; ++i) {
         cached.samples[i] = frame.hands[i].sampleId;
         const auto& hand = snapshot.hands[i];
