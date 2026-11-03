@@ -55,7 +55,8 @@ private: std::shared_ptr<Callback> callback_; bool entered_=false;
 struct Pending {
     ActionRequest request{}; std::uint64_t owner=0;
     CommitStage stage=CommitStage::Accepted;
-    bool committed=false,handCommitted=false; ContentCommit receipt{}, last{};
+    bool committed=false,handCommitted=false,handCompensated=false,authoritySettled=false,terminalReceipt=false;
+    ContentCommit receipt{}, last{};
 };
 struct State {
     std::mutex mutex;
@@ -116,6 +117,7 @@ bool LegacyPolicyAllows(const State& s,std::uint64_t handle,const RuntimeInput& 
     for(const auto& sample:s.policySamples)if(sample.instanceHandle==handle&&sample.epoch==input.epoch&&sample.handObservationId==input.handStateRevision&&sample.physicalHand==input.physicalHand&&(sample.source==0||sample.source==source)&&sample.category==input.contentCategory&&sample.known&&sample.allowed)return true;return false;
 }
 bool Terminal(CommitStage stage) { return stage==CommitStage::Completed || stage==CommitStage::Failed || stage==CommitStage::Cancelled; }
+bool Reserved(const Pending& pending) { return !Terminal(pending.stage)||!pending.authoritySettled; }
 void InvalidateOffers(State& s) {
     ++s.policy; s.offers.clear();s.offerSources.clear();
     // A Pending exists only after DispatchSelected starts its assigned executor.
@@ -262,16 +264,18 @@ Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* com
             if(p.owner!=writer)return Status::Unauthorized;
             if(commit->epoch!=s.epoch||commit->epoch!=req.grant.epoch||commit->higgsRequestId!=req.grant.requestId||commit->higgsGrantId!=req.grant.grantId||commit->instanceHandle!=req.offer.context.slot.configured.instance.instanceHandle||commit->expectedContentVersion!=req.offer.context.slot.contentVersion)return Status::Conflict;
             if(!std::memcmp(&p.last,commit,sizeof(*commit))||(p.committed&&!std::memcmp(&p.receipt,commit,sizeof(*commit))))return Status::Ok;
-            if(Terminal(p.stage))return Status::Conflict;
+            if(p.terminalReceipt)return Status::Conflict;
             auto* row=Find(s,commit->instanceHandle);if(!row)return Status::NotFound;
             const auto stage=static_cast<CommitStage>(commit->stage);
-            if(stage==CommitStage::Accepted) {if(p.stage!=CommitStage::Accepted)return Status::Conflict;}
+            if(stage==CommitStage::Accepted) {if(p.stage!=CommitStage::Accepted||p.authoritySettled)return Status::Conflict;}
             else if(stage==CommitStage::Committed) {
-                if(p.committed||row->contentVersion!=commit->expectedContentVersion||commit->contentVersion!=row->contentVersion+1||!commit->contentVersion||((commit->quantity==0)!=(commit->contentIdentity==0)))return Status::Conflict;
+                if(p.authoritySettled||p.committed||row->contentVersion!=commit->expectedContentVersion||commit->contentVersion!=row->contentVersion+1||!commit->contentVersion||((commit->quantity==0)!=(commit->contentIdentity==0)))return Status::Conflict;
                 row->contentVersion=commit->contentVersion;row->contentIdentity=commit->contentIdentity;row->quantity=commit->quantity;
                 row->runtimeRevision=++s.revision;row->presentationState=static_cast<std::uint32_t>(PresentationState::Pending);
-                p.committed=true;p.receipt=*commit;s.offers.clear();events.push_back(Event(s,*row,RuntimeEventKind::ContentChanged));
+                p.committed=p.handCommitted=true;p.receipt=*commit;s.offers.clear();events.push_back(Event(s,*row,RuntimeEventKind::ContentChanged));
             } else if(stage==CommitStage::Completed && !p.committed && commit->contentVersion!=row->contentVersion) return Status::Conflict;
+            if((stage==CommitStage::Failed||stage==CommitStage::Cancelled)&&p.handCommitted&&!p.committed&&!p.authoritySettled)return Status::Conflict;
+            if(Terminal(stage))p.authoritySettled=p.terminalReceipt=true;
             p.stage=stage;p.last=*commit;
         }
         Events(events);return Status::Ok;
@@ -285,6 +289,44 @@ Status BS_CALL SetVisual(std::uint64_t writer,std::uint64_t handle,const SlotVis
         if(visual->contentVersion!=row->contentVersion)return Status::Conflict;
         }
         status=SetSavedRuntimeCustomization(writer,handle,nullptr,visual);if(status!=Status::Ok)return status;return SyncConfiguration();
+    });
+}
+Status BS_CALL PublishContentObservation(std::uint64_t writer,const ContentObservation* input,
+                                         std::uint64_t* contentVersion) noexcept {
+    return GuardRuntime([&] {
+        if(!input||!contentVersion)return Status::InvalidArgument;
+        const auto observation=*input;
+        if(observation.structSize!=sizeof(observation)||observation.reserved||!observation.epoch||
+           !observation.saveGeneration||!observation.instanceHandle||
+           ((observation.quantity==0)!=(observation.contentIdentity==0)))return Status::InvalidArgument;
+        auto status=RuntimeOwnsInstance(writer,observation.instanceHandle);if(status!=Status::Ok)return status;
+        status=SyncConfiguration();if(status!=Status::Ok)return status;
+        std::vector<RuntimeEvent> events;
+        std::uint64_t version=0;
+        {
+            auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
+            if(!Own(writer,observation.instanceHandle))return Status::Unauthorized;
+            auto* row=Find(s,observation.instanceHandle);if(!row)return Status::NotFound;
+            if(observation.epoch!=s.epoch||observation.saveGeneration!=s.configuration.saveGeneration||
+               observation.expectedContentVersion!=row->contentVersion)return Status::Conflict;
+            version=row->contentVersion;
+            if(observation.contentIdentity!=row->contentIdentity||observation.quantity!=row->quantity) {
+                if(s.dragSlot==observation.instanceHandle)return Status::Conflict;
+                for(const auto& pending:s.pending)
+                    if(pending.request.offer.context.slot.configured.instance.instanceHandle==observation.instanceHandle&&
+                       Reserved(pending))return Status::Conflict;
+                if(version==UINT64_MAX)return Status::LimitExceeded;
+                version=++row->contentVersion;
+                row->contentIdentity=observation.contentIdentity;row->quantity=observation.quantity;
+                row->runtimeRevision=++s.revision;
+                row->presentationState=static_cast<std::uint32_t>(PresentationState::Pending);
+                row->displayedContentVersion=0;
+                InvalidateOffers(s);
+                events.push_back(Event(s,*row,RuntimeEventKind::ContentChanged));
+            }
+        }
+        *contentVersion=version;
+        Events(events);return Status::Ok;
     });
 }
 ActionProgress Progress(const Pending& pending) {
@@ -394,7 +436,7 @@ Status CollectOffers(const RuntimeInput& input,ActionOffer* output,std::uint32_t
             if(!input.available){*count=0;return Status::Ok;}policy=s.policy;
             for(const auto& c:s.behaviors){auto* row=Find(s,c->behavior.instanceHandle);if(!row||row->availability||!(row->insideHands&input.physicalHand)||!(row->configured.instance.effective.handMask&input.physicalHand)||(!c->offers2&&input.contentCategory&&!(row->configured.instance.effective.contentMask&input.contentCategory)))continue;
                 if(!c->offers2&&!LegacyPolicyAllows(s,c->behavior.instanceHandle,input))continue;
-                bool reserved=s.dragSlot==c->behavior.instanceHandle;for(const auto& p:s.pending)if(!Terminal(p.stage)&&p.request.offer.context.slot.configured.instance.instanceHandle==c->behavior.instanceHandle)reserved=true;
+                bool reserved=s.dragSlot==c->behavior.instanceHandle;for(const auto& p:s.pending)if(Reserved(p)&&p.request.offer.context.slot.configured.instance.instanceHandle==c->behavior.instanceHandle)reserved=true;
                 if(!reserved){SourceActionContext context{{*row,input},{IncomingItem(s,c->behavior.instanceHandle,input,1),IncomingItem(s,c->behavior.instanceHandle,input,2)}};work.push_back({c,context});}
             }
         }
@@ -433,11 +475,11 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
             if(!row||row->availability||!(row->insideHands&grant.physicalHand)||row->bodyGeneration!=offer.context.slot.bodyGeneration||row->anchorGeneration!=offer.context.slot.anchorGeneration||row->contentVersion!=offer.context.slot.contentVersion)return Status::Conflict;
             for(const auto& used:s.used)if(used.epoch==grant.epoch&&used.sequence==grant.inputSequence&&used.hand==grant.physicalHand)return Status::Conflict;
             if(s.dragSlot==row->configured.instance.instanceHandle)return Status::Conflict;
-            for(const auto& p:s.pending)if(!Terminal(p.stage)&&p.request.offer.context.slot.configured.instance.instanceHandle==row->configured.instance.instanceHandle)return Status::Conflict;
+            for(const auto& p:s.pending)if(Reserved(p)&&p.request.offer.context.slot.configured.instance.instanceHandle==row->configured.instance.instanceHandle)return Status::Conflict;
             for(const auto& c:s.behaviors)if(c->id==offer.behavior)callback=c;
             if(!callback)return Status::NotFound;
             for(const auto& source:s.offerSources)if(source.offerId==offer.offerId)incoming=source.incoming;
-            if(s.pending.size()==kMaxPendingActions){auto old=std::find_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return Terminal(p.stage);});if(old==s.pending.end())return Status::LimitExceeded;s.pending.erase(old);}
+            if(s.pending.size()==kMaxPendingActions){auto old=std::find_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return !Reserved(p);});if(old==s.pending.end())return Status::LimitExceeded;s.pending.erase(old);}
             request={offer,grant,Allocate(s)};if(!request.requestId)return Status::LimitExceeded;
             if(s.used.size()==kMaxActionOffers)s.used.erase(s.used.begin());s.used.push_back({grant.epoch,grant.inputSequence,grant.physicalHand});
             Pending pending{};pending.request=request;pending.owner=callback->owner;s.pending.push_back(pending);
@@ -452,7 +494,7 @@ void InvalidateRuntime() noexcept {
     try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);++s.revision;InvalidateOffers(s);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
 }
 Status ReserveDragSlot(std::uint64_t handle,std::uint64_t request,std::uint64_t epoch,std::uint64_t revision) noexcept {
-    return GuardRuntime([&]{auto& s=Runtime();std::lock_guard lock(s.mutex);const auto* row=Find(s,handle);if(!request||!row||s.epoch!=epoch||row->runtimeRevision!=revision||row->availability||s.dragSlot)return Status::Conflict;for(const auto& pending:s.pending)if(!Terminal(pending.stage)&&pending.request.offer.context.slot.configured.instance.instanceHandle==handle)return Status::Conflict;s.dragSlot=handle;s.dragRequest=request;InvalidateOffers(s);return Status::Ok;});
+    return GuardRuntime([&]{auto& s=Runtime();std::lock_guard lock(s.mutex);const auto* row=Find(s,handle);if(!request||!row||s.epoch!=epoch||row->runtimeRevision!=revision||row->availability||s.dragSlot)return Status::Conflict;for(const auto& pending:s.pending)if(Reserved(pending)&&pending.request.offer.context.slot.configured.instance.instanceHandle==handle)return Status::Conflict;s.dragSlot=handle;s.dragRequest=request;InvalidateOffers(s);return Status::Ok;});
 }
 void ReleaseDragSlot(std::uint64_t request) noexcept {
     try{auto& s=Runtime();std::lock_guard lock(s.mutex);if(s.dragRequest==request){s.dragSlot=0;s.dragRequest=0;InvalidateOffers(s);}}catch(...){}
@@ -473,8 +515,37 @@ Status CopyActionProgress(ActionProgress* output,std::uint32_t capacity,std::uin
     return GuardRuntime([&]{if(!count||capacity>kMaxPendingActions||(capacity&&!output))return Status::InvalidArgument;auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);*count=static_cast<std::uint32_t>(s.pending.size());if(capacity<s.pending.size())return Status::BufferTooSmall;for(std::size_t i=0;i<s.pending.size();++i)output[i]=Progress(s.pending[i]);return Status::Ok;});
 }
 void SetContentCommitValidator(ContentCommitValidator validator) noexcept {contentValidator.store(validator,std::memory_order_release);}
-Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage) noexcept {
-    return GuardRuntime([&]{if(!request||!epoch||(stage!=CommitStage::Failed&&stage!=CommitStage::Cancelled&&stage!=CommitStage::Committed&&stage!=CommitStage::Completed))return Status::InvalidArgument;auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);for(auto& pending:s.pending)if(pending.request.grant.requestId==request&&pending.request.grant.epoch==epoch){if(stage==CommitStage::Committed||stage==CommitStage::Completed){if(!Terminal(pending.stage))pending.handCommitted=true;}else if(!Terminal(pending.stage)&&(!pending.handCommitted||pending.committed))pending.stage=stage;return Status::Ok;}return Status::NotFound;});
+Status CopyPendingHandActions(PendingHandAction* output,std::uint32_t capacity,std::uint32_t* count) noexcept {
+    return GuardRuntime([&]{
+        if(!count||capacity>kMaxPendingActions||(capacity&&!output))return Status::InvalidArgument;
+        auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
+        *count=static_cast<std::uint32_t>(std::count_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return !p.authoritySettled;}));
+        if(capacity<*count)return Status::BufferTooSmall;
+        std::uint32_t index=0;for(const auto& p:s.pending)if(!p.authoritySettled)output[index++]={p.request.grant,p.request.offer.higgsExecutor};
+        return Status::Ok;
+    });
+}
+Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage,bool compensated,bool noncommitConfirmed) noexcept {
+    return GuardRuntime([&]{
+        if(!request||!epoch||(stage!=CommitStage::Failed&&stage!=CommitStage::Cancelled&&stage!=CommitStage::Committed&&stage!=CommitStage::Completed))return Status::InvalidArgument;
+        auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
+        for(auto& pending:s.pending)if(pending.request.grant.requestId==request&&pending.request.grant.epoch==epoch){
+            if(stage==CommitStage::Committed||stage==CommitStage::Completed){
+                pending.handCommitted=true; // An irreversible fact survives local cancellation.
+                if(!pending.committed&&!pending.terminalReceipt&&!pending.handCompensated)pending.authoritySettled=false;
+            }
+            if(compensated&&Terminal(stage)){
+                pending.handCompensated=true;
+                pending.authoritySettled=true;
+                if(!pending.terminalReceipt)pending.stage=CommitStage::Cancelled;
+            }else if(stage==CommitStage::Failed||stage==CommitStage::Cancelled){
+                if(noncommitConfirmed&&(!pending.handCommitted||pending.committed))pending.authoritySettled=true;
+                if(!pending.terminalReceipt)pending.stage=stage;
+            }
+            return Status::Ok;
+        }
+        return Status::NotFound;
+    });
 }
 Status ReportPresentation(std::uint64_t handle,std::uint64_t visual,std::uint64_t content,PresentationState state) noexcept {
     return GuardRuntime([&]{if(state!=PresentationState::Ready&&state!=PresentationState::Failed)return Status::InvalidArgument;auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);auto* row=Find(s,handle);if(!row)return Status::NotFound;if(row->visualRevision!=visual||row->contentVersion!=content||row->visual.contentVersion!=content)return Status::Conflict;row->displayedContentVersion=state==PresentationState::Ready?content:0;row->presentationState=static_cast<std::uint32_t>(state);row->runtimeRevision=++s.revision;return Status::Ok;});
@@ -483,6 +554,11 @@ const RuntimeApi& GetRuntimeApi() noexcept {return api;}
 const ZoneApi& GetZoneApi() noexcept {return zoneApi;}
 const ContentPolicyApi& GetContentPolicyApi() noexcept{return contentPolicyApi;}
 const BehaviorApi& GetBehaviorApi() noexcept{return behaviorApi;}
+const ContentObservationApi& GetContentObservationApi() noexcept {
+    static const ContentObservationApi table{sizeof(ContentObservationApi),kContentObservationApiVersion,1,
+                                              PublishContentObservation};
+    return table;
+}
 } // namespace body_slots::detail
 extern "C" __declspec(dllexport) const body_slots::RuntimeApi* BS_CALL BodySlots_QueryRuntimeInterface(std::uint32_t version,std::uint32_t size) noexcept {
     if(version!=body_slots::kRuntimeApiVersion||size!=sizeof(body_slots::RuntimeApi))return nullptr;return &body_slots::detail::GetRuntimeApi();
@@ -495,4 +571,8 @@ extern "C" __declspec(dllexport) const body_slots::ContentPolicyApi* BS_CALL Bod
 }
 extern "C" __declspec(dllexport) const body_slots::BehaviorApi* BS_CALL BodySlots_QueryBehaviorInterface(std::uint32_t version,std::uint32_t size) noexcept {
     return version==body_slots::kBehaviorApiVersion&&size==sizeof(body_slots::BehaviorApi)?&body_slots::detail::GetBehaviorApi():nullptr;
+}
+extern "C" __declspec(dllexport) const body_slots::ContentObservationApi* BS_CALL BodySlots_QueryContentObservationInterface(std::uint32_t version,std::uint32_t size) noexcept {
+    return version==body_slots::kContentObservationApiVersion&&size==sizeof(body_slots::ContentObservationApi)?
+        &body_slots::detail::GetContentObservationApi():nullptr;
 }

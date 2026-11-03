@@ -137,6 +137,10 @@ int main() {
         offers=GetOffers(7);selected=offers[0];++epoch;Frame();CHECK(DispatchSelected(selected,Grant(selected),&request)==Status::Conflict);
         fail=true;offers=GetOffers(8);selected=offers[0];CHECK(DispatchSelected(selected,Grant(selected),&request)==Status::Unavailable);CHECK(DispatchSelected(selected,Grant(selected),&request)==Status::Conflict);fail=false;
         CHECK(runtime.CopyActionStatus(owner,request,&progress)==Status::Ok&&progress.stage==static_cast<std::uint32_t>(CommitStage::Failed));
+        // The failed slot stays reserved; the independent second slot can offer.
+        const auto remaining=GetOffers(80);CHECK(!remaining.empty());
+        for(const auto& offer:remaining)CHECK(offer.context.slot.configured.instance.instanceHandle!=selected.context.slot.configured.instance.instanceHandle);
+        CHECK(ApplyHandResult(last.grant.requestId,last.grant.epoch,CommitStage::Cancelled)==Status::Ok);
         offers=GetOffers(81);selected=offers[0];CHECK(DispatchSelected(selected,Grant(selected),&request)==Status::Ok);CHECK(ApplyHandResult(last.grant.requestId,last.grant.epoch,CommitStage::Cancelled)==Status::Ok);commit=Receipt(last,CommitStage::Committed);CHECK(runtime.ReportContentCommit(owner,&commit)==Status::Conflict);CHECK(runtime.CopyActionStatus(owner,request,&progress)==Status::Ok&&progress.stage==5);
         commitImmediately=true;offers=GetOffers(9);selected=offers[0];CHECK(DispatchSelected(selected,Grant(selected),&request)==Status::Ok);CHECK(runtime.CopyActionStatus(owner,request,&progress)==Status::Ok&&progress.committed);commitImmediately=false;completed=Receipt(last,CommitStage::Completed);CHECK(runtime.ReportContentCommit(owner,&completed)==Status::Ok);
         selfRemove=true;offers=GetOffers(10);CHECK(selfRemoveResult==Status::Conflict);selfRemove=false;

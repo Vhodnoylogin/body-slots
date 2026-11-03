@@ -22,7 +22,8 @@ def main():
     for symbol in ('SKSEPlugin_Query', 'SKSEPlugin_Load', 'BodySlots_QueryInterface', 'BodySlots_QueryRuntimeInterface',
                    'BodySlots_QueryInstanceInterface', 'BodySlots_QueryInstanceConfigurationInterface', 'BodySlots_QueryGameInterface',
                    'BodySlots_QueryZoneInterface', 'BodySlots_QueryManipulationInterface', 'BodySlots_QueryEquipmentInterface',
-                   'BodySlots_QueryContentPolicyInterface', 'BodySlots_QueryBehaviorInterface'):
+                   'BodySlots_QueryContentPolicyInterface', 'BodySlots_QueryBehaviorInterface',
+                   'BodySlots_QueryContentObservationInterface'):
         getattr(dll, symbol)
     class Header(C.Structure):
         _fields_ = [('size', C.c_uint32), ('version', C.c_uint32), ('capabilities', C.c_uint64)]
@@ -30,6 +31,7 @@ def main():
         ('BodySlots_QueryZoneInterface', 48, 3), ('BodySlots_QueryManipulationInterface', 48, 3),
         ('BodySlots_QueryEquipmentInterface', 40, 3), ('BodySlots_QueryContentPolicyInterface', 48, 3),
         ('BodySlots_QueryBehaviorInterface', 24, 1),
+        ('BodySlots_QueryContentObservationInterface', 24, 1),
     ):
         extension = getattr(dll, symbol)
         extension.argtypes = [C.c_uint32, C.c_uint32]

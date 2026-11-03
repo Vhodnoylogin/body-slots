@@ -115,6 +115,23 @@ Adapter& State() { static Adapter state; return state; }
 Status ValidateContentCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     return State().ValidateCommit(commit, request);
 }
+bool ObserveHandResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result) noexcept {
+    if(result.structSize!=sizeof(result)||result.requestId!=action.grant.requestId||
+       result.epoch!=action.grant.epoch||result.inputId!=action.grant.inputSequence||
+       result.executor!=action.executor||(result.receiptFlags&~7u))return false;
+    const bool irreversible=(result.receiptFlags&(HIGGS_RECEIPT_INVENTORY_COMMITTED|HIGGS_RECEIPT_PHYSICAL_CONFIRMED))!=0;
+    const bool compensated=(result.receiptFlags&HIGGS_RECEIPT_COMPENSATED)!=0;
+    // Stage cancellation alone cannot erase an already observed side effect.
+    if(irreversible||result.stage==HIGGS_ACTION_COMMITTED||result.stage==HIGGS_ACTION_COMPLETED)
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Committed);
+    if(result.stage==HIGGS_ACTION_COMPLETED)
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Completed,compensated,false);
+    else if(result.stage==HIGGS_ACTION_CANCELLED)
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Cancelled,compensated,false);
+    else if(result.stage==HIGGS_ACTION_REJECTED)
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Failed,compensated,false);
+    return true;
+}
 RuntimeTransform CopyTransform(const RE::NiTransform& t) {
     RuntimeTransform out{};
     out.position[0] = t.translate.x; out.position[1] = t.translate.y; out.position[2] = t.translate.z;
@@ -220,7 +237,7 @@ void Adapter::Connect() {
 Status Adapter::ValidateCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     HIGGS_ActionResult result{}; result.structSize = sizeof(result);
     if (!client_ || api_.CopyActionResult(client_, request.grant.requestId, &result) != HIGGS_HAND_OK) return Status::Unavailable;
-    if (result.epoch != commit.epoch || result.inputId != request.grant.inputSequence || result.executor != request.offer.higgsExecutor)
+    if (result.epoch != commit.epoch || !ObserveHandResult({request.grant,request.offer.higgsExecutor},result))
         return Status::Conflict;
     const auto stage = static_cast<CommitStage>(commit.stage);
     if (stage == CommitStage::Committed)
@@ -235,20 +252,14 @@ Status Adapter::ValidateCommit(const ContentCommit& commit, const ActionRequest&
     return hand.grant == commit.higgsGrantId && hand.owner == request.offer.higgsClient ? Status::Ok : Status::Conflict;
 }
 void Adapter::SynchronizeActions() {
-    std::array<ActionProgress, kMaxPendingActions> progress{}; std::uint32_t count{};
-    if (detail::CopyActionProgress(progress.data(), progress.size(), &count) != Status::Ok) return;
+    std::array<detail::PendingHandAction, kMaxPendingActions> progress{}; std::uint32_t count{};
+    if (detail::CopyPendingHandActions(progress.data(), progress.size(), &count) != Status::Ok) return;
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto& action = progress[i];
-        if (action.stage == static_cast<std::uint32_t>(CommitStage::Completed) ||
-            action.stage == static_cast<std::uint32_t>(CommitStage::Failed) || action.stage == static_cast<std::uint32_t>(CommitStage::Cancelled)) continue;
         HIGGS_ActionResult result{}; result.structSize = sizeof(result);
         const auto status = api_.CopyActionResult(client_, action.grant.requestId, &result);
-        if (status == HIGGS_HAND_OK && (result.stage == HIGGS_ACTION_COMMITTED || result.stage == HIGGS_ACTION_COMPLETED))
-            detail::ApplyHandResult(action.grant.requestId, action.grant.epoch, CommitStage::Committed);
-        if (status == HIGGS_HAND_NOT_FOUND || (status == HIGGS_HAND_OK && result.stage == HIGGS_ACTION_CANCELLED))
-            detail::ApplyHandResult(action.grant.requestId, action.grant.epoch, CommitStage::Cancelled);
-        else if (status == HIGGS_HAND_OK && result.stage == HIGGS_ACTION_REJECTED)
-            detail::ApplyHandResult(action.grant.requestId, action.grant.epoch, CommitStage::Failed);
+        // Missing/evicted HIGGS history is uncertainty, never a noncommit receipt.
+        if(status==HIGGS_HAND_OK)ObserveHandResult(action,result);
     }
 }
 void Adapter::OnFrame() noexcept { try { State().Tick(); } catch (...) { State().Reset(); detail::InvalidateRuntime(); } }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the independent Skyrim VR adapter and both production-core test suites.
+"""Build the independent Skyrim VR adapter and production-core test suites.
 
 No deployment, game launch, writable MO2 access or proprietary Havok SDK is used.
 The legacy build.py command remains the SDK/foundation fixture build.
@@ -68,7 +68,7 @@ def main():
     run('configure', configure)
     run('build', [cmake, '--build', output / 'native', '--config', 'Release', '--target',
                   'BodySlots', 'body_slots_runtime_tests', 'body_slots_zone_tests', 'body_slots_higgs_integration_tests',
-                  'body_slots_inventory_provider_tests', '-j', '6'])
+                  'body_slots_inventory_provider_tests', 'body_slots_content_observation_tests', '-j', '6'])
     run('tests', [ctest, '--test-dir', output / 'native', '-C', 'Release', '--output-on-failure'])
     run('dll-probe', [sys.executable, '-B', ROOT / 'tools/probe_game_dll.py', output / 'native/Release/BodySlots.dll'])
     for path, digest in pins.items():

@@ -29,6 +29,9 @@ struct InventoryProviderConfig {
     std::int32_t priority=0;
     OrdinaryItemPolicy policy=nullptr;
     void* policyContext=nullptr;
+    // Withdrawal always uses Down. Up storage requires a fresh, unconsumed
+    // release; it cannot reuse the Up owned by an earlier consumed Down.
+    std::uint32_t storeEdge=HIGGS_INPUT_DOWN;
 };
 enum class InventoryProviderStage : std::uint32_t {
     Detached,Ready,Queued,Selecting,Transferring,Reporting,Completed,Cancelled,RecoveryRequired
