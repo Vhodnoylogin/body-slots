@@ -27,6 +27,8 @@
 
 namespace body_slots::game {
 const Api* RegistryApi() noexcept;
+void ConnectHiggsRegionActions(void* module) noexcept;
+void ResetHiggsRegionActions() noexcept;
 namespace {
 using Clock = std::chrono::steady_clock;
 std::uint64_t Now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
@@ -194,6 +196,7 @@ void Adapter::Connect() {
     const auto module = GetModuleHandleW(L"higgs_vr.dll");
     // Spatial collaboration is independent of the VRIK-backed slot adapter.
     ConnectHiggsRegions(module);
+    ConnectHiggsRegionActions(module);
     const auto query = module ? reinterpret_cast<HIGGS_QueryHandInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandInterface")) : nullptr;
     HIGGS_HandInterface api{};
     if (!GetModuleHandleW(L"vrik.dll") || !query || query(HIGGS_HAND_ABI_VERSION, sizeof(api), &api) != HIGGS_HAND_OK) return;
@@ -572,7 +575,7 @@ Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
 }
 void Initialize(const void* skse) noexcept { try { State().Initialize(skse); } catch (...) {} }
 void Connect() noexcept { try { State().Connect(); } catch (...) {} }
-void Reset() noexcept { State().Reset(); ResetHiggsRegions(); }
+void Reset() noexcept { State().Reset(); ResetHiggsRegions(); ResetHiggsRegionActions(); }
 }
 extern "C" const body_slots::Api* BS_CALL BodySlots_QueryInterface(std::uint32_t, std::uint32_t) noexcept;
 namespace body_slots::game {

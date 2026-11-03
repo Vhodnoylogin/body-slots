@@ -73,4 +73,7 @@ Status RuntimeOwnsInstance(std::uint64_t writer, std::uint64_t handle) noexcept;
 Status CopyRuntimeConfiguration(ConfiguredInstanceRecord*, std::uint32_t capacity, InstanceView*) noexcept;
 using RuntimeReleaseHook = Status (*)(std::uint64_t) noexcept;
 void SetRuntimeReleaseHook(RuntimeReleaseHook) noexcept;
+// Optional separately linked region-action service participates in the same
+// registry-owned revoke/drain boundary without coupling the registry to HIGGS.
+void SetRegionActionsReleaseHook(RuntimeReleaseHook) noexcept;
 } // namespace body_slots::detail

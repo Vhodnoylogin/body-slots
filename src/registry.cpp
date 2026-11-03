@@ -20,7 +20,9 @@ namespace body_slots::detail {
 constexpr std::size_t kMaxWriters = 64, kMaxObservers = 64, kMaxClients = kMaxWriters + kMaxObservers;
 struct Client { std::uint64_t token = 0; char provider[64]{}; bool releasing = false; };
 std::atomic<RuntimeReleaseHook> runtimeReleaseHook{nullptr};
+std::atomic<RuntimeReleaseHook> regionActionsReleaseHook{nullptr};
 void SetRuntimeReleaseHook(RuntimeReleaseHook hook) noexcept { runtimeReleaseHook.store(hook,std::memory_order_release); }
+void SetRegionActionsReleaseHook(RuntimeReleaseHook hook) noexcept { regionActionsReleaseHook.store(hook,std::memory_order_release); }
 struct Customizer { std::uint64_t token = 0; char identity[64]{}; };
 struct Registry {
     std::mutex mutex;
@@ -114,7 +116,11 @@ Status BS_CALL ReleaseClient(std::uint64_t token) noexcept {
             client->releasing=true;
         }
         const auto hook=runtimeReleaseHook.load(std::memory_order_acquire);
-        const auto drained=hook?hook(token):Status::Ok;
+        auto drained=hook?hook(token):Status::Ok;
+        if(drained==Status::Ok) {
+            const auto regionHook=regionActionsReleaseHook.load(std::memory_order_acquire);
+            if(regionHook)drained=regionHook(token);
+        }
         if(drained!=Status::Ok) {
             std::lock_guard<std::mutex> lock(state.mutex);
             for(auto& client:state.clients)if(client.token==token)client.releasing=false;

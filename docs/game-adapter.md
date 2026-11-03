@@ -1,5 +1,7 @@
 # Independent Skyrim VR adapter
 
+The separate [region-action connection](region-actions.md) is negotiated before the VRIK-backed player-slot adapter. It uses HIGGS's own palm observations, common input and main-phase authorized dispatch for arbitrary owned region definitions; it does not require `vrik.dll` merely to register that service. The body-node/equipment presentation and virtual-hand path below retains its existing VRIK requirement.
+
 When the optional HIGGS Context v1 table is present, the adapter subscribes to its copied context generation. Its callback only publishes a monotonic atomic stamp. Old spatial input caches refuse new offers immediately; the next main frame cancels provisional drag and undispatched candidates even if the UI both opened and closed between frames. It retains already dispatched content operations for their real receipts/recovery. Older cooperation providers without this table retain the existing hand-availability/fence checks; they do not gain the new context-boundary behavior. No native VRIK interaction or public Body Slots table changes are introduced.
 
 Body Slots owns slot binding, spatial detection, interaction dispatch and presentation. VRIK remains the body and virtual-pose owner. HIGGS owns hand state, grip/trigger input, arbitration, grants and physical execution. The [canonical concept](https://github.com/Vhodnoylogin/body-pouches/blob/main/docs/trinity-synergy/concept-en.md) is maintained only in Body Pouches; this page documents this repository's implemented adapter.

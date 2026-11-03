@@ -94,7 +94,7 @@ void Prune(RegionsState& s) {
     for(std::uint32_t i=0;i<s.regionCount;) { const auto owner=s.regions[i].owner; check(owner); if(i<s.regionCount && s.regions[i].owner==owner) ++i; }
     for(std::size_t i=0;i<s.writers.size();++i) check(s.writers[i].owner);
 }
-RegionUnavailableReason SampleReason(const InteractionRegionSpec& spec, const RegionEvaluationFrame& frame, const RegionEvaluation& e) {
+RegionUnavailableReason SampleReason(const InteractionRegionSpec& spec, const RegionEvaluationFrame& frame, const RegionEvaluation& e, bool independentFrames=false) {
     if(!e.anchor.valid || !e.probe.valid) return RegionUnavailableReason::Missing;
     if(e.anchor.valid!=1 || e.probe.valid!=1 || e.anchor.reserved || e.probe.reserved[0] || e.probe.reserved[1] || e.probe.reservedTail ||
         !ValidSource(e.anchor.source) || !ValidSource(e.probe.source) || e.anchor.kind!=spec.anchorKind)
@@ -102,7 +102,7 @@ RegionUnavailableReason SampleReason(const InteractionRegionSpec& spec, const Re
     const auto& a=e.anchor.source; const auto& p=e.probe.source;
     if(a.epoch!=frame.epoch || p.epoch!=frame.epoch || a.saveGeneration!=frame.saveGeneration || p.saveGeneration!=frame.saveGeneration)
         return RegionUnavailableReason::ScopeMismatch;
-    if(a.frame!=p.frame || a.frame>frame.frame || a.timeSeconds>frame.timeSeconds || p.timeSeconds>frame.timeSeconds ||
+    if((!independentFrames && (a.frame!=p.frame || a.frame>frame.frame)) || p.frame>frame.frame || a.timeSeconds>frame.timeSeconds || p.timeSeconds>frame.timeSeconds ||
         std::abs(a.timeSeconds-p.timeSeconds)>spec.maxSampleSkewSeconds)
         return RegionUnavailableReason::Incoherent;
     if(frame.timeSeconds-a.timeSeconds>spec.maxSampleAgeSeconds || frame.timeSeconds-p.timeSeconds>spec.maxSampleAgeSeconds)
@@ -117,28 +117,33 @@ bool SameGeneration(const RegionObservation& previous, const RegionEvaluation& c
     return previous.anchor.source.generation==current.anchor.source.generation && previous.probe.source.generation==current.probe.source.generation;
 }
 RegionObservation Evaluate(const InteractionRegionRecord& region, const RegionEvaluationFrame& frame, const RegionEvaluation& evaluation,
-    const RegionObservation* previous, std::uint64_t sequence) {
+    const RegionObservation* previous, std::uint64_t sequence, bool independentFrames=false) {
     RegionObservation out{}; out.regionId=region.regionId; out.regionRevision=region.revision; out.sequence=sequence;
     out.evaluated=frame; out.anchor=evaluation.anchor; out.probe=evaluation.probe;
-    auto unavailable=SampleReason(region.spec,frame,evaluation);
+    auto unavailable=SampleReason(region.spec,frame,evaluation,independentFrames);
     const double distance=ZonePointSignedDistance(region.spec.shape,evaluation.anchor.world,evaluation.probe.world);
     if(unavailable==RegionUnavailableReason::None && !std::isfinite(distance)) unavailable=RegionUnavailableReason::InvalidSnapshot;
     const bool sameGeneration=previous && SameGeneration(*previous,evaluation);
+    const bool sameProbe=independentFrames && sameGeneration && SameIdentity(previous->probe.source,evaluation.probe.source) &&
+        evaluation.probe.source.sampleId==previous->probe.source.sampleId && evaluation.probe.source.frame==previous->probe.source.frame &&
+        evaluation.probe.source.timeSeconds==previous->probe.source.timeSeconds &&
+        std::equal(evaluation.probe.world,evaluation.probe.world+3,previous->probe.world);
     if(unavailable==RegionUnavailableReason::None && sameGeneration &&
-        (evaluation.anchor.source.sampleId<=previous->anchor.source.sampleId || evaluation.probe.source.sampleId<=previous->probe.source.sampleId ||
-         evaluation.anchor.source.frame<=previous->anchor.source.frame || evaluation.probe.source.frame<=previous->probe.source.frame ||
+        ((independentFrames ? evaluation.anchor.source.sampleId<previous->anchor.source.sampleId : evaluation.anchor.source.sampleId<=previous->anchor.source.sampleId) || (!sameProbe && evaluation.probe.source.sampleId<=previous->probe.source.sampleId) ||
+         (independentFrames ? evaluation.anchor.source.frame<previous->anchor.source.frame : evaluation.anchor.source.frame<=previous->anchor.source.frame) || (!sameProbe && evaluation.probe.source.frame<=previous->probe.source.frame) ||
          evaluation.anchor.source.timeSeconds<previous->anchor.source.timeSeconds || evaluation.probe.source.timeSeconds<previous->probe.source.timeSeconds))
         unavailable=RegionUnavailableReason::RepeatedSample;
     out.unavailableReason=static_cast<std::uint32_t>(unavailable);
     if(unavailable!=RegionUnavailableReason::None) return out;
     const bool continuous=previous && sameGeneration && previous->regionRevision==region.revision && PriorInside(*previous) &&
-        previous->evaluated.frame<kMax && frame.frame==previous->evaluated.frame+1 && frame.timeSeconds>=previous->evaluated.timeSeconds &&
+        previous->evaluated.frame<kMax && (sameProbe ? frame.frame==previous->evaluated.frame : frame.frame==previous->evaluated.frame+1) && frame.timeSeconds>=previous->evaluated.timeSeconds &&
         frame.timeSeconds-previous->evaluated.timeSeconds<=region.spec.maxContinuityGapSeconds &&
-        evaluation.anchor.source.frame==previous->anchor.source.frame+1 && evaluation.probe.source.frame==previous->probe.source.frame+1;
+        (independentFrames ? evaluation.anchor.source.frame>=previous->anchor.source.frame : evaluation.anchor.source.frame==previous->anchor.source.frame+1) &&
+        (sameProbe || evaluation.probe.source.frame==previous->probe.source.frame+1);
     const bool inside=distance <= (continuous ? double(region.spec.exitOutset) : -double(region.spec.enterInset));
     if(!inside) { out.state=static_cast<std::uint32_t>(RegionSpatialState::Outside); return out; }
     out.enteredAtSeconds=continuous ? previous->enteredAtSeconds : frame.timeSeconds;
-    out.dwellElapsedSeconds=frame.timeSeconds-out.enteredAtSeconds;
+    out.dwellElapsedSeconds=sameProbe && continuous ? previous->dwellElapsedSeconds : frame.timeSeconds-out.enteredAtSeconds;
     out.state=static_cast<std::uint32_t>(out.dwellElapsedSeconds>=region.spec.dwellSeconds ? RegionSpatialState::Ready :
         (continuous ? RegionSpatialState::Dwelling : RegionSpatialState::Inside));
     return out;
@@ -260,6 +265,21 @@ Status ValidateInteractionRegion(const InteractionRegionSpec& s) noexcept {
     return ValidateZoneShape(s.shape);
 }
 const RegionsApi& GetRegionsApi() noexcept { return api; }
+Status CopyOwnedInteractionRegion(std::uint64_t writer, std::uint64_t id, std::uint64_t expected,
+    InteractionRegionRecord& output) noexcept {
+    return Guard([&] {
+        auto& s=State(); std::lock_guard lock(s.mutex); Prune(s);
+        if(RuntimeClientIdentity(writer,true,nullptr)!=Status::Ok) return Status::Unauthorized;
+        auto* entry=Find(s,id); if(!entry) return Status::NotFound;
+        if(entry->owner!=writer) return Status::Unauthorized;
+        if(entry->record.revision!=expected) return Status::Conflict;
+        output=entry->record; return Status::Ok;
+    });
+}
+RegionObservation EvaluateInteractionRegion(const InteractionRegionRecord& region, const RegionEvaluationFrame& frame,
+    const RegionEvaluation& evaluation, const RegionObservation* previous, std::uint64_t sequence, bool independentFrames) noexcept {
+    return Evaluate(region,frame,evaluation,previous,sequence,independentFrames);
+}
 void SetInteractionRegionsScope(std::uint64_t epoch, std::uint64_t save) noexcept {
     try { auto& s=State(); std::lock_guard lock(s.mutex);
         SyncScope(s);
