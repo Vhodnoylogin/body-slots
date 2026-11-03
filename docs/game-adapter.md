@@ -16,6 +16,8 @@ Only the public HIGGS headers are imported into the build tree. Its complete inc
 
 ## Provider registration
 
+The independent optional [HIGGS native mouth/stash connection](higgs-native-regions.md) registers its spatial callback before checking for the VRIK-backed player-slot integration described below. Its callback receives real current-phase HIGGS sources, owns only region geometry and returns to HIGGS's existing native executor. It does not require a VRIK DLL, subscribe a second input recognizer or implement another inventory consumer.
+
 1. Register a definition writer and create an active instance through the existing registry/instance APIs. Author packages supply definitions; they do not invent equipment identity or automatically create a live slot for every installed bag.
 2. Register the content provider's own client and executor with HIGGS. Read `BodySlots_QueryGameInterface` to obtain the Body Slots recognizer client. Explicitly authorize that recognizer for the provider executor using HIGGS's routing table.
 3. Bind the instance to a body node, a worn-item-gated body node, or a node beneath the exact worn armor model. Register its immutable action-offer callback and selected execution callback with the provider's HIGGS client/executor identifiers. Hand states are forwarded from HIGGS; providers do not invent more occupancy states.

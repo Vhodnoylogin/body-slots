@@ -2,6 +2,7 @@
 #include "body_slots_runtime_api.h"
 #include "body_slots_behavior_api.h"
 #include "body_slots_content_observation_api.h"
+#include "body_slots_regions_api.h"
 namespace body_slots::detail {
 struct HandProbe {
     std::uint32_t physicalHand, valid;
@@ -43,6 +44,11 @@ void SetContentCommitValidator(ContentCommitValidator) noexcept;
 Status ApplyHandResult(std::uint64_t higgsRequestId,std::uint64_t epoch,CommitStage,
                        bool compensated=false,bool noncommitConfirmed=true) noexcept;
 void InvalidateRuntime() noexcept;
+// Trusted native-provider adapter only. Scope acceptance, publication and copy
+// share the runtime invalidation fence; callers cannot select a save generation.
+Status PublishProviderRegions(std::uint64_t writer, const RegionEvaluationFrame&,
+    const RegionEvaluation*, std::uint32_t count, RegionObservation*,
+    std::uint32_t capacity, RegionsView*) noexcept;
 Status ReserveDragSlot(std::uint64_t instanceHandle,std::uint64_t requestId,std::uint64_t epoch,std::uint64_t runtimeRevision) noexcept;
 void ReleaseDragSlot(std::uint64_t requestId) noexcept;
 Status ReportPresentation(std::uint64_t instanceHandle, std::uint64_t visualRevision,

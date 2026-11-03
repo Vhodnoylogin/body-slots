@@ -45,7 +45,7 @@ def main():
                if f.is_file() and f.suffix in ('.h', '.cpp', '.py', '.c')]
     sources.append(ROOT / 'CMakeLists.txt')
     closure = higgs / 'cmake/HiggsServices.cmake'
-    dependencies = [closure,higgs/'include/higgsinterface001.h']
+    dependencies = [closure,higgs/'include/higgsinterface001.h',higgs/'include/higgsnativeregions.h']
     dependencies += [higgs / name for name in re.findall(r'\$\{HIGGS_SERVICE_ROOT\}/([^"\n]+)',closure.read_text(encoding='utf-8'))
                      if Path(name).suffix in ('.h','.hpp','.inl','.c','.cc','.cpp','.cxx')]
     pins = {str(f): sha(f) for f in sources + dependencies}
@@ -69,7 +69,8 @@ def main():
     run('build', [cmake, '--build', output / 'native', '--config', 'Release', '--target',
                   'BodySlots', 'body_slots_runtime_tests', 'body_slots_zone_tests', 'body_slots_higgs_integration_tests',
                   'body_slots_inventory_provider_tests', 'body_slots_content_observation_tests',
-                  'body_slots_region_tests', 'body_slots_geometry_tests', 'body_slots_regions_c_discovery', '-j', '6'])
+                  'body_slots_region_tests', 'body_slots_geometry_tests', 'body_slots_regions_c_discovery',
+                  'body_slots_higgs_native_regions_tests', '-j', '6'])
     run('tests', [ctest, '--test-dir', output / 'native', '-C', 'Release', '--output-on-failure'])
     run('dll-probe', [sys.executable, '-B', ROOT / 'tools/probe_game_dll.py', output / 'native/Release/BodySlots.dll'])
     for path, digest in pins.items():

@@ -15,6 +15,7 @@
 #include "higgsgrantmutation.h"
 #include "higgsinputcontext.h"
 #include "higgsinterface001.h"
+#include "main/higgs_native_regions.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -191,6 +192,8 @@ RE::NiAVObject* Adapter::ResolveAnchor(const RuntimeRecord& record, RE::PlayerCh
 void Adapter::Connect() {
     { std::lock_guard lock(mutex_); if (connected_) return; }
     const auto module = GetModuleHandleW(L"higgs_vr.dll");
+    // Spatial collaboration is independent of the VRIK-backed slot adapter.
+    ConnectHiggsRegions(module);
     const auto query = module ? reinterpret_cast<HIGGS_QueryHandInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandInterface")) : nullptr;
     HIGGS_HandInterface api{};
     if (!GetModuleHandleW(L"vrik.dll") || !query || query(HIGGS_HAND_ABI_VERSION, sizeof(api), &api) != HIGGS_HAND_OK) return;
@@ -569,7 +572,7 @@ Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
 }
 void Initialize(const void* skse) noexcept { try { State().Initialize(skse); } catch (...) {} }
 void Connect() noexcept { try { State().Connect(); } catch (...) {} }
-void Reset() noexcept { State().Reset(); }
+void Reset() noexcept { State().Reset(); ResetHiggsRegions(); }
 }
 extern "C" const body_slots::Api* BS_CALL BodySlots_QueryInterface(std::uint32_t, std::uint32_t) noexcept;
 namespace body_slots::game {

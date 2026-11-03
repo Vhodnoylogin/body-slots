@@ -494,6 +494,20 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
         *requestId=request.requestId;return status;
     });
 }
+Status PublishProviderRegions(std::uint64_t writer,const RegionEvaluationFrame& frame,
+    const RegionEvaluation* evaluations,std::uint32_t count,RegionObservation* observations,
+    std::uint32_t capacity,RegionsView* view) noexcept {
+    return GuardRuntime([&] {
+        auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
+        if(!frame.epoch||!frame.saveGeneration||frame.saveGeneration!=CurrentSaveGeneration())return Status::Conflict;
+        SetInteractionRegionsScope(frame.epoch,frame.saveGeneration);
+        const auto& regions=GetRegionsApi();
+        auto status=regions.Publish(writer,&frame,evaluations,count,view);
+        if(status!=Status::Ok)return status;
+        const auto revision=view->revision;
+        return regions.CopyObservations(writer,revision,observations,capacity,view);
+    });
+}
 void InvalidateRuntime() noexcept {
     try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);InvalidateInteractionRegions();++s.revision;InvalidateOffers(s);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
 }
