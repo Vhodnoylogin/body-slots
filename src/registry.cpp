@@ -746,6 +746,16 @@ Status RuntimeClientIdentity(std::uint64_t token, bool writer, char provider[64]
         return Status::Ok;
     });
 }
+std::uint64_t CurrentSaveGeneration() noexcept {
+    try { auto& s=State(); std::lock_guard<std::mutex> lock(s.mutex); return s.instances.Generation(); }
+    catch(...) { return 0; }
+}
+bool RuntimeWriterLeaseExists(std::uint64_t token) noexcept {
+    try { auto& s=State(); std::lock_guard<std::mutex> lock(s.mutex);
+        if(token)for(const auto& c:s.clients)if(c.token==token&&c.provider[0])return true;
+        return false;
+    } catch(...) { return true; } // Uncertain observation must not retire a lease.
+}
 Status RuntimeOwnsInstance(std::uint64_t token, std::uint64_t handle) noexcept {
     return Guard([&] {
         auto& s = State(); std::lock_guard<std::mutex> lock(s.mutex);

@@ -4,9 +4,10 @@
 
 namespace body_slots {
 constexpr std::uint32_t kZoneApiVersion = 1;
-enum class ZoneShapeKind : std::uint32_t { Sphere = 1, Capsule = 2, Box = 3 };
+enum class ZoneShapeKind : std::uint32_t { Sphere = 1, Capsule = 2, Box = 3, Cylinder = 4 };
 // Slot-local Skyrim units. The slot rotation/positive uniform anchor scale apply
-// to every field. A capsule with coincident ends is a sphere. Bounds are closed.
+// to every field. A capsule with coincident ends is a sphere. A cylinder has
+// distinct center/end cap centres and flat endcaps. Bounds are closed.
 struct ZoneShape {
     std::uint32_t structSize, kind;
     float center[3], end[3], halfExtents[3], radius;
@@ -32,7 +33,7 @@ struct SavedZoneShape {
 };
 struct ZoneApi {
     std::uint32_t structSize, version;
-    std::uint64_t capabilities; // bit0 shape override/save, bit1 immutable probe queries
+    std::uint64_t capabilities; // bit0 shape override/save, bit1 immutable probe queries, bit2 finite cylinder
     // Owner writer OR dedicated configuration customizer. Exact nonzero save/view
     // protects against races. Missing overrides use the effective Definition1 sphere.
     Status (BS_CALL *SetShape)(std::uint64_t editor, std::uint64_t instanceHandle,

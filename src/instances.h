@@ -63,6 +63,11 @@ Status ResetSaveScope(InstanceView* committed) noexcept;
 // Runtime reads a coherent registry snapshot and derives ownership from live
 // registry leases. These are internal helpers, never client-supplied identities.
 Status RuntimeClientIdentity(std::uint64_t token, bool writer, char provider[64]) noexcept;
+// Registry-owned save generation; zero means it could not be observed safely.
+std::uint64_t CurrentSaveGeneration() noexcept;
+// Unlike invocation authority, lease existence includes a pending release that
+// may still roll back after callback draining fails.
+bool RuntimeWriterLeaseExists(std::uint64_t token) noexcept;
 Status RuntimeConfigurationReader(std::uint64_t token) noexcept;
 Status RuntimeOwnsInstance(std::uint64_t writer, std::uint64_t handle) noexcept;
 Status CopyRuntimeConfiguration(ConfiguredInstanceRecord*, std::uint32_t capacity, InstanceView*) noexcept;

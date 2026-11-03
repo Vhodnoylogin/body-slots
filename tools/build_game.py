@@ -68,7 +68,8 @@ def main():
     run('configure', configure)
     run('build', [cmake, '--build', output / 'native', '--config', 'Release', '--target',
                   'BodySlots', 'body_slots_runtime_tests', 'body_slots_zone_tests', 'body_slots_higgs_integration_tests',
-                  'body_slots_inventory_provider_tests', 'body_slots_content_observation_tests', '-j', '6'])
+                  'body_slots_inventory_provider_tests', 'body_slots_content_observation_tests',
+                  'body_slots_region_tests', 'body_slots_geometry_tests', 'body_slots_regions_c_discovery', '-j', '6'])
     run('tests', [ctest, '--test-dir', output / 'native', '-C', 'Release', '--output-on-failure'])
     run('dll-probe', [sys.executable, '-B', ROOT / 'tools/probe_game_dll.py', output / 'native/Release/BodySlots.dll'])
     for path, digest in pins.items():

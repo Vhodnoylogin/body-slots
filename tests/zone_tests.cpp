@@ -46,6 +46,16 @@ int main(){try{
     std::array<SavedZoneShape,kMaxInstances> saved{};CHECK(zones.CopySavedShapes(reader,saved.data(),kMaxInstances,&iv)==Status::Ok&&iv.count==1&&saved[0].shape.kind==2);
     std::vector<std::uint8_t> defs,inst,bytes;bool hasInst=false,hasRuntime=false;CHECK(SaveConfigurationBatch(defs,inst,hasInst,bytes,hasRuntime)==Status::Ok&&hasRuntime&&bytes.size()==16+kRuntimeCustomizationSaveRecordBytes);RuntimeCustomizationData decoded{};CHECK(DecodeRuntimeCustomizations(bytes.data(),static_cast<std::uint32_t>(bytes.size()),decoded)==Status::Ok&&decoded.count==1&&decoded.shapes[0].kind==2);
     auto malformed=bytes;malformed.back()=1;auto untouched=decoded;CHECK(DecodeRuntimeCustomizations(malformed.data(),static_cast<std::uint32_t>(malformed.size()),decoded)==Status::InvalidArgument&&!std::memcmp(&decoded,&untouched,sizeof(decoded)));
+    // A persisted cylinder must retain flat caps rather than silently becoming a capsule.
+    auto cylinder=capsule;cylinder.kind=static_cast<std::uint32_t>(ZoneShapeKind::Cylinder);
+    CHECK(zones.capabilities&4);
+    CHECK(zones.SetShape(owner,created.instanceHandle,&cylinder,iv.saveGeneration,iv.viewRevision)==Status::Ok);
+    CHECK(zones.CopySavedShapes(reader,saved.data(),kMaxInstances,&iv)==Status::Ok&&saved[0].shape.kind==4);
+    CHECK(SaveConfigurationBatch(defs,inst,hasInst,bytes,hasRuntime)==Status::Ok);
+    CHECK(DecodeRuntimeCustomizations(bytes.data(),static_cast<std::uint32_t>(bytes.size()),decoded)==Status::Ok&&decoded.shapes[0].kind==4);
+    ++frame.frame;++frame.timeSeconds;frame.hands[0].sampleId=frame.hands[1].sampleId=frame.frame;CHECK(UpdateRuntime(frame)==Status::Ok);
+    probe.valid=1;probe.frame=frame.frame;probe.world[0]=10.5f;probe.world[1]=0;
+    CHECK(zones.QueryZones(reader,&probe,zoneRows.data(),kMaxInstances,&rv)==Status::Ok&&!zoneRows[0].containsProbe&&zoneRows[0].shape.kind==4);
     CHECK(zones.ClearShape(other,&saved[0].key,iv.saveGeneration,iv.viewRevision)==Status::Unauthorized);CHECK(zones.ClearShape(owner,&saved[0].key,iv.saveGeneration,iv.viewRevision)==Status::Ok);CHECK(zones.CopySavedShapes(reader,saved.data(),kMaxInstances,&iv)==Status::Ok&&iv.count==0);
     RuntimeBindingSpec binding{sizeof(RuntimeBindingSpec),1,0,0,{}};CHECK(runtime.SetBinding(owner,created.instanceHandle,&binding)==Status::Ok);CHECK(SaveConfigurationBatch(defs,inst,hasInst,bytes,hasRuntime)==Status::Ok);bytes.resize(16+816);Put32(bytes,4,1);Put32(bytes,8,816);CHECK(DecodeRuntimeCustomizations(bytes.data(),static_cast<std::uint32_t>(bytes.size()),decoded)==Status::Ok&&decoded.entries[0].fieldMask==1&&decoded.shapes[0].kind==0);
     const auto& manipulation=GetManipulationApi();SlotEditingSnapshot mode{};SlotEditingMode editing{sizeof(SlotEditingMode),1,Both,1};CHECK(manipulation.SetEditingMode(owner,&editing,1,&mode)==Status::Unauthorized);CHECK(manipulation.SetEditingMode(customizer,&editing,1,&mode)==Status::Ok&&mode.revision==2);CHECK(manipulation.SetEditingMode(customizer,&editing,1,&mode)==Status::Conflict);

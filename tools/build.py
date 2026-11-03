@@ -56,7 +56,7 @@ def main():
     log.write_text("Body Slots standalone authored definitions and saved configuration build\n", encoding="utf-8")
     commands = []
     activation_results = []
-    source_paths = list((ROOT / "src").glob("*.cpp")) + list((ROOT / "src").glob("*.h")) + list((ROOT / "include").glob("*.h"))
+    source_paths = list((ROOT / "src").rglob("*.cpp")) + list((ROOT / "src").rglob("*.h")) + list((ROOT / "include").glob("*.h"))
     source_paths += [ROOT / p for p in ("tests/instance_activation_tests.cpp", "tests/instance_activation_store_tests.cpp", "tools/build.py", "README.md", "docs/instance-activation.md")]
     source_pins = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
 
@@ -91,7 +91,7 @@ def main():
         run(command)
         return target
 
-    dll = compile_target("BodySlots", ["src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/manipulation.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/runtime.cpp", "src/plugin.cpp"], True)
+    dll = compile_target("BodySlots", ["src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/manipulation.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp", "src/native_placement.cpp", "src/native_policy.cpp", "src/package.cpp", "src/runtime.cpp", "src/main/interaction_regions.cpp", "src/plugin.cpp"], True)
     package = output / "examples/potion-belt.bslots"
     run([sys.executable, "-B", ROOT / "tools/author.py", ROOT / "examples/potion-belt.json", "--output", package])
     if not args.skip_tests:
@@ -104,9 +104,9 @@ def main():
         instance_configuration = compile_target("instance_configuration_tests", ["tests/instance_configuration_tests.cpp", "src/instance_configuration.cpp", "src/configuration_serialization.cpp", "src/validation.cpp"])
         native_placement = compile_target("native_placement_tests", ["tests/native_placement_tests.cpp"])
         native_policy = compile_target("native_policy_tests", ["tests/native_policy_tests.cpp"])
-        runtime = compile_target("runtime_tests", ["tests/runtime_tests.cpp", "src/runtime.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        runtime = compile_target("runtime_tests", ["tests/runtime_tests.cpp", "src/runtime.cpp", "src/main/interaction_regions.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
         run([runtime])
-        zones = compile_target("zone_tests", ["tests/zone_tests.cpp", "src/runtime.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/manipulation.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
+        zones = compile_target("zone_tests", ["tests/zone_tests.cpp", "src/runtime.cpp", "src/main/interaction_regions.cpp", "src/registry.cpp", "src/runtime_saved.cpp", "src/zone_geometry.cpp", "src/content_policy.cpp", "src/manipulation.cpp", "src/instances.cpp", "src/instance_configuration.cpp", "src/validation.cpp", "src/configuration_serialization.cpp"])
         run([zones])
         run([sys.executable, "-B", ROOT / "tests/test_author.py"])
         run([native, dll, package, output])

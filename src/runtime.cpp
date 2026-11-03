@@ -3,6 +3,7 @@
 #include "validation.h"
 #include "runtime_saved.h"
 #include "zone_geometry.h"
+#include "main/interaction_regions.h"
 #include "content_policy.h"
 #include <algorithm>
 #include <array>
@@ -357,7 +358,7 @@ Status BS_CALL QueryZones(std::uint64_t reader,const ZoneProbe* probe,ZoneRecord
         for(std::uint32_t i=0;i<s.rows.size();++i){const auto& row=s.rows[i];const auto* shape=FindShape(s,row.configured.instance.instanceHandle);if(!shape)return Status::InternalError;records[i]={row.configured.instance.instanceHandle,s.epoch,s.frame,s.revision,row.bodyGeneration,row.anchorGeneration,row.world,shape->shape,row.availability,(probe->valid&&row.availability==0&&ZoneContainsPoint(shape->shape,row.world,probe->world))?1u:0u,row.insideHands,shape->overridden};}return Status::Ok;
     });
 }
-const ZoneApi zoneApi{sizeof(ZoneApi),kZoneApiVersion,3,SetZoneShape,ClearZoneShape,QueryZones,CopySavedZoneShapes};
+const ZoneApi zoneApi{sizeof(ZoneApi),kZoneApiVersion,7,SetZoneShape,ClearZoneShape,QueryZones,CopySavedZoneShapes};
 Status BS_CALL SetContentPolicy(std::uint64_t editor,std::uint64_t handle,const SlotContentPolicy* policy,std::uint64_t save,std::uint64_t view) noexcept {
     return GuardRuntime([&]{const auto status=SetSavedContentPolicy(editor,handle,policy,save,view);return status==Status::Ok?SyncConfiguration():status;});
 }
@@ -422,6 +423,9 @@ Status UpdateRuntime(const RuntimeFrame& frame) noexcept {
                 }
             }
             if(changed)InvalidateOffers(s);
+            // Serialize scope acceptance with invalidation. The region service
+            // also checks the registry generation before accepting this scope.
+            SetInteractionRegionsScope(frame.epoch,s.configuration.saveGeneration);
         }
         Events(events);return Status::Ok;
     });
@@ -491,7 +495,7 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
     });
 }
 void InvalidateRuntime() noexcept {
-    try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);++s.revision;InvalidateOffers(s);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
+    try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);InvalidateInteractionRegions();++s.revision;InvalidateOffers(s);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
 }
 Status ReserveDragSlot(std::uint64_t handle,std::uint64_t request,std::uint64_t epoch,std::uint64_t revision) noexcept {
     return GuardRuntime([&]{auto& s=Runtime();std::lock_guard lock(s.mutex);const auto* row=Find(s,handle);if(!request||!row||s.epoch!=epoch||row->runtimeRevision!=revision||row->availability||s.dragSlot)return Status::Conflict;for(const auto& pending:s.pending)if(Reserved(pending)&&pending.request.offer.context.slot.configured.instance.instanceHandle==handle)return Status::Conflict;s.dragSlot=handle;s.dragRequest=request;InvalidateOffers(s);return Status::Ok;});
@@ -560,6 +564,10 @@ const ContentObservationApi& GetContentObservationApi() noexcept {
     return table;
 }
 } // namespace body_slots::detail
+extern "C" __declspec(dllexport) const body_slots::RegionsApi* BS_CALL BodySlots_QueryRegionsInterface(std::uint32_t version,std::uint32_t size) noexcept {
+    if(version!=body_slots::kRegionsApiVersion||size!=sizeof(body_slots::RegionsApi))return nullptr;
+    return &body_slots::detail::GetRegionsApi();
+}
 extern "C" __declspec(dllexport) const body_slots::RuntimeApi* BS_CALL BodySlots_QueryRuntimeInterface(std::uint32_t version,std::uint32_t size) noexcept {
     if(version!=body_slots::kRuntimeApiVersion||size!=sizeof(body_slots::RuntimeApi))return nullptr;return &body_slots::detail::GetRuntimeApi();
 }
