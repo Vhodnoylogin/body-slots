@@ -1,6 +1,6 @@
 # Body Slots
 
-Private Body Slots development: independent slot management and interaction for Skyrim VR.
+Body Slots development: independent slot management and interaction for Skyrim VR.
 
 Body Slots owns definitions, stable keys, saved placement, body/equipment binding, zones, activation, content-provider dispatch and presentation. VRIK supplies the body and virtual-hand observations; HIGGS supplies authoritative hand states, input arbitration and granted physical operations. Offline visual authoring belongs in the Slots mode of [Morphbench](https://github.com/Vhodnoylogin/morphbench).
 
@@ -12,7 +12,7 @@ The optional [ordinary inventory provider SDK helper](docs/ordinary-inventory-pr
 
 Build the native adapter with `python tools/build_game.py --sdk-root <public-SKSE-source> --higgs-root <synergy-HIGGS-checkout> --output <external-directory>`. `tools/build.py` remains the headless foundation/SDK fixture. See the adapter page for dependency pins, provider registration, phases and remaining limits.
 
-The [unpublished Nexus draft packaging](docs/release-draft.md) separates the unchanged runtime DLL from a mod-author SDK/example archive. Its label `0.1.0-alpha.1` does not change the existing plugin/ABI versions. Licensing is to be finalized before publication; no license grant or public-source/visibility change is made by draft packaging.
+The [unpublished Nexus draft packaging](docs/release-draft.md) separates the unchanged runtime DLL from a mod-author SDK/example archive. Its label `0.1.0-alpha.1` does not change the existing plugin/ABI versions. Licensing is to be finalized before distributing a release. This is public development source, not a new license grant or a published runtime release.
 
 The separate [configuration API](docs/configuration.md) stores save-scoped placement overrides without changing authored defaults or the original definition ABI. It exposes effective copied placement and eligibility, with provider/key persistence and revision-checked edits. This service remains definition-scoped; instance-specific placement uses the separate table below.
 
@@ -25,5 +25,7 @@ The separate [saved instance configuration API](docs/instance-configuration.md) 
 The additive [native14 placement compatibility service](docs/native-placement.md) owns the original fourteen raw local poses when VRIK explicitly attaches. It preserves their existing global INI persistence and does not mix them with per-save customization or generic registry identities. Native interaction/rendering and old equipment arrays remain in VRIK.
 
 The separate [native14 policy service](docs/native-policy.md) owns per-slot visibility, physical-hand restrictions, six legacy weapon-class filters and hover-haptic preferences. Public copied observations are read-only; the compatibility owner commits complete revision-checked banks. Both native services retain their existing persistence semantics and remain distinct from generic slot instances.
+
+The [source provenance note](docs/source-provenance.md) records the bounded history review before opening this repository. The original fourteen-slot compatibility banks are optional; reconstructed VRIK implementation remains separate.
 
 The only maintained architecture concept and its [implementation ledger](https://github.com/Vhodnoylogin/body-pouches/blob/main/docs/trinity-synergy/implementation-status.md) are in [Body Pouches](https://github.com/Vhodnoylogin/body-pouches/tree/main/docs/trinity-synergy). This repository documents its own implemented contracts.
