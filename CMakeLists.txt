@@ -122,3 +122,13 @@ if(MSVC)
     target_link_options(body_slots_region_actions_tests PRIVATE /STACK:8388608)
 endif()
 add_test(NAME body_slots_region_actions COMMAND body_slots_region_actions_tests)
+
+# Optional SDK example and test. The plugin itself has no PLANCK link dependency.
+set(BODY_SLOTS_PLANCK_SDK "" CACHE PATH "PLANCK source checkout with actor capture timestamps")
+if(BODY_SLOTS_PLANCK_SDK)
+    add_executable(body_slots_planck_region_anchor_tests src/test/planck_region_anchor_tests.cpp
+        examples/planck_region_anchor.cpp "${BODY_SLOTS_PLANCK_SDK}/src/synergy_runtime.cpp")
+    target_include_directories(body_slots_planck_region_anchor_tests PRIVATE examples include
+        "${BODY_SLOTS_PLANCK_SDK}/include" "${BS_HIGGS_HEADERS}")
+    add_test(NAME body_slots_planck_region_anchor COMMAND body_slots_planck_region_anchor_tests)
+endif()
