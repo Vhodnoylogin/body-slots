@@ -132,3 +132,27 @@ if(BODY_SLOTS_PLANCK_SDK)
         "${BODY_SLOTS_PLANCK_SDK}/include" "${BS_HIGGS_HEADERS}")
     add_test(NAME body_slots_planck_region_anchor COMMAND body_slots_planck_region_anchor_tests)
 endif()
+
+set(BODY_SLOTS_PLANCK_POSE_SDK "" CACHE PATH "PLANCK source checkout with the optional named pose query")
+if(BODY_SLOTS_PLANCK_POSE_SDK)
+    add_executable(body_slots_planck_pose_region_anchor_tests src/test/planck_pose_region_anchor_tests.cpp
+        examples/planck_pose_region_anchor.cpp)
+    target_include_directories(body_slots_planck_pose_region_anchor_tests PRIVATE examples include
+        "${BODY_SLOTS_PLANCK_POSE_SDK}/include" "${BS_HIGGS_HEADERS}")
+    add_test(NAME body_slots_planck_pose_region_anchor COMMAND body_slots_planck_pose_region_anchor_tests)
+endif()
+
+set(BODY_SLOTS_HIGGS_GRIP_SDK "" CACHE PATH "HIGGS source checkout with the optional one-shot grip interface")
+if(BODY_SLOTS_HIGGS_GRIP_SDK)
+    add_executable(body_slots_grip_region_action_tests src/test/grip_region_action_tests.cpp
+        examples/grip_region_action.cpp)
+    target_include_directories(body_slots_grip_region_action_tests PRIVATE examples include
+        "${BODY_SLOTS_HIGGS_GRIP_SDK}/include")
+    add_test(NAME body_slots_grip_region_action COMMAND body_slots_grip_region_action_tests)
+endif()
+
+if(BODY_SLOTS_PLANCK_POSE_SDK AND BODY_SLOTS_HIGGS_GRIP_SDK)
+    target_compile_definitions(body_slots_planck_pose_region_anchor_tests PRIVATE BODY_SLOTS_COMPACT_PAIR_TEST _CRT_SECURE_NO_WARNINGS)
+    target_sources(body_slots_planck_pose_region_anchor_tests PRIVATE examples/grip_region_action.cpp ${BS_CORE})
+    target_include_directories(body_slots_planck_pose_region_anchor_tests PRIVATE src "${BODY_SLOTS_HIGGS_GRIP_SDK}/include")
+endif()

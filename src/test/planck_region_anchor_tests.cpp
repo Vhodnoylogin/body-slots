@@ -31,6 +31,11 @@ Status BS_CALL Publish(std::uint64_t writer, std::uint64_t id, std::uint64_t exp
 PlanckStatus PLANCK_CALL StaleTime(PlanckToken, PlanckActorRef, std::uint64_t, std::uint64_t*) {
     return PLANCK_STALE;
 }
+PlanckStatus PLANCK_CALL CopyOriginalPrefix(PlanckToken client, std::uint32_t handle, PlanckActorPhysics* actor,
+    PlanckBodyPhysics* bodies, std::uint32_t capacity, std::uint32_t* count) {
+    actor->size = 72;
+    return PlanckSynergy::GetAPI()->CopyActorPhysics(client, handle, actor, bodies, capacity, count);
+}
 }
 
 int main() {
@@ -70,6 +75,12 @@ int main() {
     CHECK(update() == Status::Ok && revision == 1); // Re-reading doesn't restamp or advance.
 
     PlanckSynergyAPI stale = *planck; stale.CopyActorSampleTime = StaleTime;
+    if (sizeof(PlanckActorPhysics) > 72) {
+        CHECK(anchor.Update(&stale, scratch) == Status::Ok && seen.valid && revision == 1);
+    }
+    stale.CopyActorPhysics = CopyOriginalPrefix;
+    auto legacy = *planck; legacy.CopyActorPhysics = CopyOriginalPrefix;
+    CHECK(anchor.Update(&legacy, scratch) == Status::Ok && seen.valid && revision == 1);
     CHECK(anchor.Update(&stale, scratch) == Status::Unavailable && !seen.valid);
     CHECK(update() == Status::Conflict && !seen.valid); // Cannot resurrect a withdrawn sample.
     capture(3, PlanckSynergy::MonotonicNowNs());

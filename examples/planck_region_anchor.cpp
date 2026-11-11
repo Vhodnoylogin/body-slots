@@ -1,6 +1,6 @@
 #include "planck_region_anchor.h"
+#include "planck_anchor_transform.h"
 #include <chrono>
-#include <cmath>
 #include <cstddef>
 #include <limits>
 
@@ -18,21 +18,16 @@ bool SameActor(const PlanckActorRef& a, const PlanckActorRef& b) {
     return a.handle == b.handle && a.actorGeneration == b.actorGeneration && a.epoch == b.epoch;
 }
 
-bool WorldTransform(const PlanckBodyPhysics& body, float units, RuntimeTransform& out) {
-    if (!std::isfinite(units) || units <= 0) return false;
-    const auto& p = body.worldPosition;
-    const auto& q = body.worldRotation;
-    const double x = q[0], y = q[1], z = q[2], w = q[3];
-    const double norm = x*x + y*y + z*z + w*w;
-    if (!std::isfinite(norm) || std::abs(norm - 1.0) > 0.002) return false;
-    const double k = 2.0 / norm;
-    // PLANCK supplies worldFromBody as xyzw. Body Slots multiplies a
-    // column vector by this row-major matrix, in the same world axes.
-    out = {{p.x * units, p.y * units, p.z * units},
-           {float(1-k*(y*y+z*z)), float(k*(x*y-w*z)), float(k*(x*z+w*y)),
-            float(k*(x*y+w*z)), float(1-k*(x*x+z*z)), float(k*(y*z-w*x)),
-            float(k*(x*z-w*y)), float(k*(y*z+w*x)), float(1-k*(x*x+y*y))}, 1};
-    return std::isfinite(out.position[0]) && std::isfinite(out.position[1]) && std::isfinite(out.position[2]);
+template<class Actor>
+bool ReadCaptureTime(const PlanckSynergyAPI& planck, PlanckToken client, const Actor& actor, std::uint64_t& time) {
+    if constexpr (requires { actor.observedAtNs; }) {
+        if (actor.size >= offsetof(Actor, observedAtNs) + sizeof(actor.observedAtNs)) {
+            time = actor.observedAtNs;
+            return time != 0;
+        }
+    }
+    // Earlier revision-2 providers return the 72-byte prefix and require this exact-sample lookup.
+    return planck.CopyActorSampleTime(client, actor.actor, actor.sample, &time) == PLANCK_OK;
 }
 }
 
@@ -83,7 +78,7 @@ Status PlanckRegionAnchor::Update(const PlanckSynergyAPI* planck, std::span<Plan
         scratch.data(), static_cast<std::uint32_t>(scratch.size()), &count);
     if (copied == PLANCK_BUFFER) return fail(Status::BufferTooSmall);
     if (copied != PLANCK_OK || count > scratch.size() || count != actor.bodyCount || target.index >= count ||
-        actor.size != sizeof(actor) || !SameActor(actor.actor, target.actor) || !actor.sample || !actor.mainFrame)
+        actor.size < offsetof(PlanckActorPhysics, ragdolled) + sizeof(actor.ragdolled) || !SameActor(actor.actor, target.actor) || !actor.sample || !actor.mainFrame)
         return fail(Status::Unavailable);
     const auto& body = scratch[target.index];
     if (body.size != sizeof(body) || !SameActor(body.body.actor, target.actor) || body.body.index != target.index ||
@@ -91,7 +86,7 @@ Status PlanckRegionAnchor::Update(const PlanckSynergyAPI* planck, std::span<Plan
         return fail(Status::Unavailable);
 
     std::uint64_t time{};
-    if (planck->CopyActorSampleTime(target_.planckClient, actor.actor, actor.sample, &time) != PLANCK_OK)
+    if (!ReadCaptureTime(*planck, target_.planckClient, actor, time))
         return fail(Status::Unavailable);
     const auto now = NowNs();
     if (time <= openedAtNs_ || time > now || now-time > target_.maxAgeNs)
@@ -103,7 +98,8 @@ Status PlanckRegionAnchor::Update(const PlanckSynergyAPI* planck, std::span<Plan
     anchor.structSize = sizeof(anchor);
     anchor.kind = static_cast<std::uint32_t>(RegionAnchorKind::Npc);
     anchor.valid = 1;
-    if (!WorldTransform(body, target_.skyrimUnitsPerMetre, anchor.world)) return fail(Status::InvalidArgument);
+    if (!WorldFromPlanckPose(body.worldPosition.x, body.worldPosition.y, body.worldPosition.z,
+                             body.worldRotation, target_.skyrimUnitsPerMetre, anchor.world)) return fail(Status::InvalidArgument);
     anchor.source = {"PLANCK", "actor-body", (std::uint64_t(target.actor.handle) << 32) | target.index,
         target.bodyGeneration, actor.sample, scope.epoch, scope.saveGeneration, actor.mainFrame,
         double(time) / 1e9, static_cast<std::uint32_t>(RegionUnits::SkyrimWorld), 0};
