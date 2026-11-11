@@ -69,10 +69,10 @@ void Log(const std::filesystem::path& directory, const std::string& message) noe
     } catch (...) {}
 }
 bool BeginSaveScope(body_slots::InstanceView* committed = nullptr) noexcept {
-    body_slots::detail::InvalidateRuntime();
 #if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
     body_slots::game::Reset();
 #endif
+    body_slots::detail::InvalidateRuntime();
     const auto status = body_slots::detail::ResetSaveScope(committed);
     if (status != body_slots::Status::Ok) Log(State().packages, "save scope reset failed");
     return status == body_slots::Status::Ok;
@@ -148,9 +148,19 @@ void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
         if (message->type == SKSEMessagingInterface::kMessage_PostPostLoad) {
             body_slots::game::Connect(); return;
         }
+        if (message->type == SKSEMessagingInterface::kMessage_PostLoadGame) {
+            // SKSE VR passes the boolean value in the pointer itself, with length one.
+            body_slots::game::SetWorldPlayable(message->dataLen == 1 && reinterpret_cast<std::uintptr_t>(message->data) == 1);
+            return;
+        }
 #endif
         if (message->type == SKSEMessagingInterface::kMessage_PreLoadGame || message->type == SKSEMessagingInterface::kMessage_NewGame) {
-            OnRevert(nullptr); return;
+            if (!BeginSaveScope()) return;
+#if defined(BODY_SLOTS_WITH_GAME_ADAPTER)
+            if (message->type == SKSEMessagingInterface::kMessage_NewGame)
+                body_slots::game::SetWorldPlayable(true);
+#endif
+            return;
         }
         if (message->type != SKSEMessagingInterface::kMessage_PostLoad) return;
         auto& state = State(); std::lock_guard<std::mutex> lock(state.mutex);

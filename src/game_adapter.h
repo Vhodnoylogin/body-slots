@@ -4,4 +4,5 @@ namespace body_slots::game {
 void Initialize(const void* skse) noexcept;
 void Connect() noexcept;
 void Reset() noexcept;
+void SetWorldPlayable(bool playable) noexcept;
 }

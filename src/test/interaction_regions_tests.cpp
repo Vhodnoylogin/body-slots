@@ -1,5 +1,6 @@
 // Actual bounded interaction-region core + registry leases. No engine doubles.
 #include "main/interaction_regions.h"
+#include "main/standalone_region_scope.h"
 #include "instances.h"
 #include "zone_geometry.h"
 #include <cmath>
@@ -147,6 +148,45 @@ void RegistrySaveReset() {
     CHECK(f.Publish({f.Evaluation()})==Status::Ok); f.State(RegionSpatialState::Ready); CHECK(f.Row().dwellElapsedSeconds==0);
     SetInteractionRegionsScope(f.epoch-1,oldSave); f.Tick(); CHECK(f.Publish({f.Evaluation()})==Status::Ok);
 }
+void StandaloneWorldLifecycle() {
+    Fixture f;
+    StandaloneRegionScope source;
+    int body{}, world{}, replacement{};
+    StandaloneRegionScope::Scene scene{f.save, &body, &world, 10};
+    auto phase = [&] {
+        const auto epoch = source.ObserveFrame([&] { return scene; });
+        SetInteractionRegionsScope(epoch, epoch ? scene.save : 0);
+        return epoch;
+    };
+    CHECK(!phase()); // Startup and unsolicited successful notifications cannot authorize a scope.
+    source.LoadFinished(true, f.save); CHECK(!phase());
+    source.BeforeReset(f.save); source.LoadFinished(true, f.save); CHECK(!phase());
+    source.BeforeReset(f.save);
+    CHECK(ResetSaveScope() == Status::Ok); f.save = scene.save = CurrentSaveGeneration();
+    source.LoadFinished(false, f.save); CHECK(!phase());
+    source.LoadFinished(true, f.save); CHECK(!phase()); // failed load remains closed until a new reset
+    source.BeforeReset(f.save);
+    CHECK(ResetSaveScope() == Status::Ok); f.save = scene.save = CurrentSaveGeneration();
+    source.LoadFinished(true, f.save);
+    f.epoch = phase(); CHECK(f.epoch && phase() == f.epoch);
+    f.Tick(); CHECK(f.Publish({f.Evaluation()}) == Status::Ok);
+    scene.world = nullptr; CHECK(!phase() && f.Copy().empty());
+    f.Tick(); CHECK(f.Publish({f.Evaluation()}) == Status::Unavailable);
+    scene.world = &world; const auto fresh = phase(); CHECK(fresh > f.epoch);
+    CHECK(f.Publish({f.Evaluation()}) == Status::Conflict); // queued old epoch
+    f.epoch = fresh; CHECK(f.Publish({f.Evaluation()}) == Status::Ok);
+    scene.world = &replacement; CHECK(phase() > fresh && f.Copy().empty());
+    auto epoch = phase(); ++scene.cell; CHECK(phase() > epoch);
+    epoch = phase(); scene.body = &replacement; CHECK(phase() > epoch);
+    epoch = phase();
+    CHECK(!source.ObserveFrame([]() -> StandaloneRegionScope::Scene { throw std::runtime_error("unavailable scene"); }));
+    InvalidateInteractionRegions();
+    CHECK(f.Copy().empty() && source.Playable() && phase() > epoch);
+    const auto approvedSave = scene.save;
+    ++scene.save; CHECK(!phase()); // a publisher cannot open a different save
+    scene.save = approvedSave; CHECK(phase() > epoch);
+    source.BeforeReset(f.save); CHECK(!phase() && f.Copy().empty());
+}
 void OwnershipRevisionAndCopies() {
     Fixture f; auto s=f.Spec(); InteractionRegionRecord unchanged{}; unchanged.regionId=999;
     CHECK(regions.UpsertRegion(f.other,&s,0,&unchanged)==Status::Unauthorized); CHECK(unchanged.regionId==999);
@@ -183,6 +223,27 @@ void IndependentPairsAndLeaseRelease() {
     f.Tick(); auto frame=RegionEvaluationFrame{sizeof(RegionEvaluationFrame),0,f.epoch,f.save,f.frame,f.time}; auto e=f.Evaluation();
     CHECK(regions.Publish(dead,&frame,&e,1,&view)==Status::Unauthorized);
     CHECK(f.Publish({e})==Status::Ok); f.State(RegionSpatialState::Inside);
+}
+void ReorderedBatchCommitsTogether() {
+    Fixture f;
+    f.Tick();
+    CHECK(f.Publish({f.Evaluation(0,0,0,10,20), f.Evaluation(10,0,0,11,20)}) == Status::Ok);
+    const auto initial = f.Copy();
+    CHECK(initial.size() == 2);
+    f.Tick();
+    auto inside = f.Evaluation(0,0,0,10,20);
+    auto outside = f.Evaluation(10,0,0,11,20);
+    auto wrongRevision = inside;
+    ++wrongRevision.expectedRegionRevision;
+    CHECK(f.Publish({outside, wrongRevision}) == Status::Conflict);
+    const auto unchanged = f.Copy();
+    CHECK(unchanged.size() == 2 && unchanged[0].sequence == initial[0].sequence &&
+          unchanged[1].sequence == initial[1].sequence);
+    CHECK(f.Publish({outside, inside}) == Status::Ok);
+    const auto rows = f.Copy();
+    CHECK(rows.size() == 2 && rows[0].anchor.source.identity == 11 && rows[1].anchor.source.identity == 10);
+    CHECK(rows[0].state == static_cast<std::uint32_t>(RegionSpatialState::Outside));
+    CHECK(rows[1].state == static_cast<std::uint32_t>(RegionSpatialState::Dwelling));
 }
 std::uint64_t releasingReader=0;
 std::uint32_t releasingRegionCount=0,releasingObservationCount=0;
@@ -224,7 +285,7 @@ void Capacities() {
 } // namespace
 int main() {
     try {
-        GeometryAndHysteresis(); DwellAndDiscontinuities(); InvalidSamplesAndScopes(); RegistrySaveReset(); OwnershipRevisionAndCopies(); IndependentPairsAndLeaseRelease(); RolledBackReleasePreservesRows(); Capacities();
+        GeometryAndHysteresis(); DwellAndDiscontinuities(); InvalidSamplesAndScopes(); RegistrySaveReset(); StandaloneWorldLifecycle(); OwnershipRevisionAndCopies(); IndependentPairsAndLeaseRelease(); ReorderedBatchCommitsTogether(); RolledBackReleasePreservesRows(); Capacities();
         std::cout<<"interaction region checks: "<<checks<<" passed\n"; return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }
 }

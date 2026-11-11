@@ -16,6 +16,9 @@
 #include "higgsinputcontext.h"
 #include "higgsinterface001.h"
 #include "main/higgs_native_regions.h"
+#include "main/interaction_regions.h"
+#include "main/standalone_region_scope.h"
+#include "instances.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -58,7 +61,18 @@ public:
         SKSE::Init(static_cast<const SKSE::LoadInterface*>(skse));
     }
     void Connect();
-    void Reset() { std::lock_guard lock(mutex_); resetRequested_ = true; cache_ = {}; }
+    void Reset() {
+        std::lock_guard lock(mutex_);
+        resetRequested_ = true;
+        cache_ = {};
+        standaloneScope_.BeforeReset(detail::CurrentSaveGeneration());
+        if (standaloneConnected_) detail::InvalidateInteractionRegions();
+    }
+    void SetWorldPlayable(bool playable) {
+        std::lock_guard lock(mutex_);
+        standaloneScope_.LoadFinished(playable, detail::CurrentSaveGeneration());
+        if (standaloneConnected_) detail::InvalidateInteractionRegions();
+    }
     void Tick();
     void Input(const HIGGS_HandInput&);
     Status ValidateCommit(const ContentCommit&, const ActionRequest&) noexcept;
@@ -70,6 +84,8 @@ public:
     }
 private:
     static void OnFrame() noexcept;
+    static void OnStandaloneFrame() noexcept;
+    void TickStandalone();
     static void HIGGS_HAND_CALL OnInput(const HIGGS_HandInput*, void*) noexcept;
     static void HIGGS_HAND_CALL OnInputContext(const HIGGS_InputContextState*,const HIGGS_InputContextState* current,void* context) noexcept {
         if(!current||!context)return;
@@ -94,7 +110,10 @@ private:
     HIGGS_HandClient client_{};
     HIGGS_HandRegistration recognizer_{};
     HIGGS_HandExecutor dragExecutor_{};
-    bool connected_{}, resetRequested_{};
+    bool connected_{}, resetRequested_{}, standaloneConnected_{};
+    detail::StandaloneRegionScope standaloneScope_;
+    RE::NiPointer<RE::NiAVObject> standaloneBody_;
+    RE::NiPointer<RE::bhkWorld> standaloneWorld_;
     std::atomic<std::uint64_t> inputContext_{};
     std::uint64_t handledInputContext_{};
     CachedInput cache_{};
@@ -192,14 +211,28 @@ RE::NiAVObject* Adapter::ResolveAnchor(const RuntimeRecord& record, RE::PlayerCh
     return found;
 }
 void Adapter::Connect() {
-    { std::lock_guard lock(mutex_); if (connected_) return; }
+    { std::lock_guard lock(mutex_); if (connected_ || standaloneConnected_) return; }
     const auto module = GetModuleHandleW(L"higgs_vr.dll");
     // Spatial collaboration is independent of the VRIK-backed slot adapter.
     ConnectHiggsRegions(module);
     ConnectHiggsRegionActions(module);
     const auto query = module ? reinterpret_cast<HIGGS_QueryHandInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandInterface")) : nullptr;
+    if (!module) return;
+    struct PhaseRequest { void* (*getInterface)(unsigned int) = nullptr; } phase;
+    const auto* messaging = SKSE::GetMessagingInterface();
+    if (!messaging || !messaging->Dispatch(0xF9279A57, &phase, sizeof(phase), "HIGGS") || !phase.getInterface) return;
+    auto* phases = static_cast<HiggsPluginAPI::IHiggsInterface001*>(phase.getInterface(1));
+    if (!phases) return;
+    // The native-region provider can also establish scope independently of the
+    // full slot adapter. No synthetic epoch may coexist with that provider.
+    if (!query) {
+        phases->AddPostVrikPostHiggsCallback(&OnStandaloneFrame);
+        std::lock_guard lock(mutex_);
+        standaloneConnected_ = true;
+        return;
+    }
     HIGGS_HandInterface api{};
-    if (!GetModuleHandleW(L"vrik.dll") || !query || query(HIGGS_HAND_ABI_VERSION, sizeof(api), &api) != HIGGS_HAND_OK) return;
+    if (!GetModuleHandleW(L"vrik.dll") || query(HIGGS_HAND_ABI_VERSION, sizeof(api), &api) != HIGGS_HAND_OK) return;
     constexpr auto needed = HIGGS_HAND_CAP_SNAPSHOT | HIGGS_HAND_CAP_INPUT_BROKER | HIGGS_HAND_CAP_OWNED_GRANTS | HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
     if ((api.capabilities & needed) != needed) return;
     const auto queryRouting = reinterpret_cast<HIGGS_QueryHandRoutingInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandRoutingInterface"));
@@ -227,11 +260,7 @@ void Adapter::Connect() {
         OnInputContext(nullptr,&initial,this);
     }
     std::uint64_t reader{};
-    struct PhaseRequest { void* (*getInterface)(unsigned int) = nullptr; } phase;
-    const auto* messaging = SKSE::GetMessagingInterface();
-    if (messaging) messaging->Dispatch(0xF9279A57, &phase, sizeof(PhaseRequest*), "HIGGS");
-    auto* phases = phase.getInterface ? static_cast<HiggsPluginAPI::IHiggsInterface001*>(phase.getInterface(1)) : nullptr;
-    if (RegistryApi()->RegisterObserver(&reader) != Status::Ok || !phases) {
+    if (RegistryApi()->RegisterObserver(&reader) != Status::Ok) {
         if (reader) RegistryApi()->ReleaseClient(reader);
         api.UnregisterClient(client); return;
     }
@@ -239,6 +268,35 @@ void Adapter::Connect() {
     std::lock_guard lock(mutex_);
     api_ = api; routing_ = routing; mutation_=mutation; client_ = client; recognizer_ = recognizer;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
     detail::SetContentCommitValidator(&ValidateContentCommit);
+}
+void Adapter::OnStandaloneFrame() noexcept {
+    auto& adapter = State();
+    try {
+        adapter.TickStandalone();
+    } catch (...) {
+        std::lock_guard lock(adapter.mutex_);
+        adapter.standaloneScope_.Observe({});
+        detail::InvalidateInteractionRegions();
+    }
+}
+void Adapter::TickStandalone() {
+    std::lock_guard lock(mutex_);
+    if (!standaloneConnected_) return;
+    RE::NiAVObject* body = nullptr;
+    RE::bhkWorld* world = nullptr;
+    std::uint64_t save = 0;
+    const auto epoch = standaloneScope_.ObserveFrame([&]() -> detail::StandaloneRegionScope::Scene {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* cell = player ? player->GetParentCell() : nullptr;
+        body = player ? player->Get3D(false) : nullptr;
+        world = cell && cell->IsAttached() ? cell->GetbhkWorld() : nullptr;
+        save = detail::CurrentSaveGeneration();
+        return {save, body, world, cell ? cell->GetFormID() : 0};
+    });
+    // A missing/failed observation drops these references only on the main thread.
+    standaloneBody_.reset(epoch ? body : nullptr);
+    standaloneWorld_.reset(epoch ? world : nullptr);
+    detail::SetInteractionRegionsScope(epoch, epoch ? save : 0);
 }
 Status Adapter::ValidateCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     HIGGS_ActionResult result{}; result.structSize = sizeof(result);
@@ -575,6 +633,7 @@ Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
 }
 void Initialize(const void* skse) noexcept { try { State().Initialize(skse); } catch (...) {} }
 void Connect() noexcept { try { State().Connect(); } catch (...) {} }
+void SetWorldPlayable(bool playable) noexcept { State().SetWorldPlayable(playable); }
 void Reset() noexcept { State().Reset(); ResetHiggsRegions(); ResetHiggsRegionActions(); }
 }
 extern "C" const body_slots::Api* BS_CALL BodySlots_QueryInterface(std::uint32_t, std::uint32_t) noexcept;

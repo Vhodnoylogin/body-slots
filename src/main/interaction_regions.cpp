@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <vector>
 
 namespace body_slots::detail {
 namespace {
@@ -18,9 +19,12 @@ struct WriterFrame { std::uint64_t owner = 0, frame = 0; double time = 0; };
 struct RegionsState {
     std::mutex mutex;
     std::array<RegionEntry, kMaxInteractionRegions> regions{};
-    std::array<ObservationEntry, kMaxRegionObservations> observations{};
+    std::vector<ObservationEntry> observations;
+    // Reused under the service mutex. Only a complete batch becomes visible.
+    std::vector<ObservationEntry> pendingObservations;
+    std::vector<RegionEvaluation> inputs;
     std::array<WriterFrame, 64> writers{};
-    std::uint32_t regionCount = 0, observationCount = 0;
+    std::uint32_t regionCount = 0;
     std::uint64_t epoch = 0, save = 0, revision = 1, sequence = 0, nextId = 1, nextRegionRevision = 1;
 };
 RegionsState& State() { static RegionsState state; return state; }
@@ -28,7 +32,7 @@ template<class F> Status Guard(F&& f) noexcept { try { return f(); } catch (...)
 bool CanAdvance(const RegionsState& s) { return s.revision < kMax && s.sequence < kMax; }
 void Advance(RegionsState& s) { ++s.revision; ++s.sequence; }
 void ClearObservations(RegionsState& s) {
-    s.observations={}; s.observationCount=0; s.writers={};
+    s.observations.clear(); s.pendingObservations.clear(); s.inputs.clear(); s.writers={};
 }
 void SyncScope(RegionsState& s) {
     if(s.save && s.save!=CurrentSaveGeneration()) {
@@ -63,12 +67,9 @@ RegionEntry* Find(RegionsState& s, std::uint64_t id) {
     return nullptr;
 }
 void RemoveObservations(RegionsState& s, std::uint64_t owner, std::uint64_t region = 0) {
-    std::uint32_t n=0;
-    for(std::uint32_t i=0;i<s.observationCount;++i)
-        if((owner && s.observations[i].owner != owner) || (!owner && s.observations[i].record.regionId != region))
-            s.observations[n++]=s.observations[i];
-    for(auto i=n;i<s.observationCount;++i) s.observations[i]={};
-    s.observationCount=n;
+    std::erase_if(s.observations, [=](const ObservationEntry& entry) {
+        return owner ? entry.owner == owner : entry.record.regionId == region;
+    });
 }
 bool RemoveOwner(RegionsState& s, std::uint64_t owner) {
     bool changed=false; std::uint32_t n=0;
@@ -78,7 +79,7 @@ bool RemoveOwner(RegionsState& s, std::uint64_t owner) {
     }
     for(auto i=n;i<s.regionCount;++i) s.regions[i]={};
     s.regionCount=n;
-    const auto before=s.observationCount; RemoveObservations(s,owner); changed |= before!=s.observationCount;
+    const auto before=s.observations.size(); RemoveObservations(s,owner); changed |= before!=s.observations.size();
     for(auto& w:s.writers) if(w.owner==owner) { w={}; changed=true; }
     return changed;
 }
@@ -201,7 +202,8 @@ Status BS_CALL CopyRegions(std::uint64_t reader, std::uint64_t expected, Interac
 }
 Status BS_CALL CopyObservations(std::uint64_t reader, std::uint64_t expected, RegionObservation* records, std::uint32_t capacity, RegionsView* view) noexcept {
     return Guard([&] { return Copy(reader,expected,records,capacity,view,[](const RegionsState& s, RegionObservation* output) {
-        if(output) for(std::uint32_t i=0;i<s.observationCount;++i) output[i]=s.observations[i].record; return s.observationCount;
+        if (output) for (const auto& entry : s.observations) *output++ = entry.record;
+        return static_cast<std::uint32_t>(s.observations.size());
     },kMaxRegionObservations); });
 }
 Status BS_CALL Publish(std::uint64_t writer, const RegionEvaluationFrame* frame, const RegionEvaluation* evaluations, std::uint32_t count, RegionsView* view) noexcept {
@@ -210,20 +212,21 @@ Status BS_CALL Publish(std::uint64_t writer, const RegionEvaluationFrame* frame,
         const auto f=*frame;
         if(f.structSize!=sizeof(f) || f.reserved || !f.epoch || !f.saveGeneration || !f.frame || !std::isfinite(f.timeSeconds) || f.timeSeconds<0) return Status::InvalidArgument;
         auto status=RuntimeClientIdentity(writer,true,nullptr); if(status!=Status::Ok) return status;
-        // Copy caller storage before taking the service lock; no retained pointers.
-        std::array<RegionEvaluation,kMaxRegionObservations> input{};
+        auto& s=State(); std::lock_guard lock(s.mutex); Prune(s);
+        auto& input = s.inputs;
+        input.clear();
+        if (count) input.assign(evaluations, evaluations + count);
         for(std::uint32_t i=0;i<count;++i) {
-            input[i]=evaluations[i]; const auto& e=input[i];
+            const auto& e=input[i];
             if(e.structSize!=sizeof(e) || e.reserved || !e.regionId || !e.expectedRegionRevision || e.anchor.structSize!=sizeof(e.anchor) ||
                 e.probe.structSize!=sizeof(e.probe) || !ValidIdentity(e.anchor.source) || !ValidIdentity(e.probe.source)) return Status::InvalidArgument;
             for(std::uint32_t j=0;j<i;++j) if(SamePair(e,input[j])) return Status::InvalidArgument;
         }
-        auto& s=State(); std::lock_guard lock(s.mutex); Prune(s);
         if(RuntimeClientIdentity(writer,true,nullptr)!=Status::Ok) return Status::Unauthorized;
         if(!s.epoch || !s.save) return Status::Unavailable;
         if(f.epoch!=s.epoch || f.saveGeneration!=s.save) return Status::Conflict;
         std::uint32_t preserved=0;
-        for(std::uint32_t i=0;i<s.observationCount;++i) if(s.observations[i].owner!=writer) ++preserved;
+        for (const auto& entry : s.observations) if (entry.owner != writer) ++preserved;
         if(count>kMaxRegionObservations-preserved) return Status::LimitExceeded;
         for(std::uint32_t i=0;i<count;++i) {
             auto* region=Find(s,input[i].regionId); if(!region) return Status::NotFound;
@@ -239,16 +242,20 @@ Status BS_CALL Publish(std::uint64_t writer, const RegionEvaluationFrame* frame,
             // publication fails. Keep the high-water mark; never rebase old time.
             RemoveObservations(s,writer); Advance(s); return Status::Conflict;
         }
-        std::array<ObservationEntry,kMaxRegionObservations> next{}; std::uint32_t n=0;
-        for(std::uint32_t i=0;i<s.observationCount;++i) if(s.observations[i].owner!=writer) next[n++]=s.observations[i];
-        for(std::uint32_t i=0;i<count;++i) {
+        auto& next = s.pendingObservations;
+        next.clear();
+        next.reserve(preserved + count);
+        for (const auto& entry : s.observations)
+            if (entry.owner != writer) next.push_back(entry);
+        for (const auto& sample : input) {
             const RegionObservation* previous=nullptr;
-            for(std::uint32_t j=0;j<s.observationCount;++j)
-                if(s.observations[j].owner==writer && SamePair(s.observations[j].record,input[i])) { previous=&s.observations[j].record; break; }
-            next[n++]={writer,Evaluate(Find(s,input[i].regionId)->record,f,input[i],previous,s.sequence+1)};
+            for (const auto& entry : s.observations)
+                if (entry.owner == writer && SamePair(entry.record, sample)) { previous = &entry.record; break; }
+            next.push_back({writer, Evaluate(Find(s,sample.regionId)->record,f,sample,previous,s.sequence+1)});
         }
-        s.observations=next; s.observationCount=n;
-        *(previousFrame ? previousFrame : empty)={writer,f.frame,f.timeSeconds}; Advance(s); *view=View(s,n); return Status::Ok;
+        s.observations.swap(next);
+        *(previousFrame ? previousFrame : empty)={writer,f.frame,f.timeSeconds}; Advance(s);
+        *view=View(s,static_cast<std::uint32_t>(s.observations.size())); return Status::Ok;
     });
 }
 const RegionsApi api{sizeof(RegionsApi),kRegionsApiVersion,3,Upsert,Remove,CopyRegions,Publish,CopyObservations};
