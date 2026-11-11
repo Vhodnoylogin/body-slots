@@ -5,14 +5,15 @@ namespace body_slots::examples {
 namespace {
 bool Projection(const ContentProjection& p){return (!p.identity)==(!p.quantity);}
 bool SameItem(const HIGGS_ItemIdentity& a,const HIGGS_ItemIdentity& b){return a.structSize==b.structSize&&a.kind==b.kind&&a.epoch==b.epoch&&a.instance==b.instance&&a.generation==b.generation&&a.provider==b.provider&&a.providerKey==b.providerKey&&a.instanceDataVersion==b.instanceDataVersion&&a.validFields==b.validFields&&a.baseFormId==b.baseFormId&&a.worldRefId==b.worldRefId&&a.quantity==b.quantity;}
-bool Same(const HIGGS_ActionRequest& h,const SourceActionRequest& s,std::uint64_t client,std::uint64_t executor){const auto& r=s.request;return h.structSize==sizeof(h)&&h.owner==client&&h.executor==executor&&h.requestId==r.grant.requestId&&h.grant==r.grant.grantId&&h.epoch==r.grant.epoch&&h.inputId==r.grant.inputSequence&&h.contextId==r.grant.contextId&&h.contextGeneration==r.grant.contextGeneration&&h.actionId==r.offer.proposal.executorAction&&h.physicalHands==r.grant.physicalHand;}
+bool Same(const HIGGS_ActionRequest& h,const SourceActionRequest& s,std::uint64_t client,std::uint64_t executor){const auto& r=s.request;return h.structSize==sizeof(h)&&h.owner==client&&h.executor==executor&&h.requestId==r.grant.requestId&&h.grant&&r.grant.grantId&&h.epoch==r.grant.epoch&&h.inputId==r.grant.inputSequence&&h.contextId==r.grant.contextId&&h.contextGeneration==r.grant.contextGeneration&&h.actionId==r.offer.proposal.executorAction&&h.physicalHands==r.grant.physicalHand;}
 std::uint32_t Evidence(const HIGGS_TransferState& s){std::uint32_t flags=0;if(s.receiptFlags&HIGGS_TX_DOMAIN_ATTESTED)flags|=HIGGS_RECEIPT_INVENTORY_COMMITTED;if(s.receiptFlags&(HIGGS_TX_NATIVE_RELEASE_CONFIRMED|HIGGS_TX_NATIVE_GRIP_CONFIRMED))flags|=HIGGS_RECEIPT_PHYSICAL_CONFIRMED;if(s.receiptFlags&HIGGS_TX_COMPENSATION_CONFIRMED)flags|=HIGGS_RECEIPT_COMPENSATED;return flags;}
 bool Released(HIGGS_HandStatus s){return s==HIGGS_HAND_OK||s==HIGGS_HAND_NOT_FOUND||s==HIGGS_HAND_STALE;}
 }
 Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const InventoryProviderConfig& c){
     {std::lock_guard lock(mutex_);if(attached_||behavior_||actionExecutor_)return Status::Conflict;}
     if(!t.slots||!t.behaviors||!t.game)return Status::InvalidArgument;
-    if(t.slots->structSize!=sizeof(RuntimeApi)||t.slots->version!=1||t.behaviors->structSize!=sizeof(BehaviorApi)||t.behaviors->version!=1||t.game->structSize!=sizeof(GameApi)||t.game->version!=1||t.hands.structSize!=sizeof(t.hands)||t.hands.abiVersion!=1||t.routing.structSize!=sizeof(t.routing)||t.routing.abiVersion!=1||t.inventory.structSize!=sizeof(t.inventory)||t.inventory.abiVersion!=1||t.transactions.structSize!=sizeof(t.transactions)||t.transactions.abiVersion!=1)return Status::UnsupportedVersion;
+    if(t.routes.abiVersion!=1 || t.routes.structSize!=sizeof(t.routes) || !t.routes.CheckSelectedAction || !t.routes.CopyClientLabel)return Status::UnsupportedVersion;
+    if(t.slots->structSize!=sizeof(RuntimeApi)||t.slots->version!=1||t.behaviors->structSize!=sizeof(BehaviorApi)||t.behaviors->version!=1||t.game->structSize!=sizeof(GameApi)||t.game->version!=1||t.hands.structSize!=sizeof(t.hands)||t.hands.abiVersion!=HIGGS_HAND_ABI_VERSION||t.routing.structSize!=sizeof(t.routing)||t.routing.abiVersion!=HIGGS_HAND_ROUTING_ABI_VERSION||t.inventory.structSize!=sizeof(t.inventory)||t.inventory.abiVersion!=HIGGS_INVENTORY_VERSION||t.transactions.structSize!=sizeof(t.transactions)||t.transactions.abiVersion!=HIGGS_TRANSACTIONS_VERSION)return Status::UnsupportedVersion;
     if(!c.writer||!c.instance||!c.higgsClient||!c.policy||!c.physicalHands||(c.physicalHands&~3u)||!c.timeoutMs||c.timeoutMs>2000||(c.storeEdge!=HIGGS_INPUT_DOWN&&c.storeEdge!=HIGGS_INPUT_UP)||!t.slots||!t.behaviors||!t.game||!t.game->CopyIntegration||!t.behaviors->RegisterSourceBehavior||!t.slots->RemoveBehavior||!t.slots->ReportContentCommit||!t.hands.RegisterExecutor||!t.hands.RemoveRegistration||!t.hands.CopySnapshot||!t.hands.CopyActionResult||!t.hands.ReportResult||!t.hands.ReleaseGrant||!t.routing.AuthorizeRecognizer||!t.routing.RevokeRecognizer||!t.inventory.GetExecutor||!t.inventory.RequestSelection||!t.inventory.CopySelection||!t.inventory.ReleaseSelection||!t.transactions.CopyHeldItem||!t.transactions.RequestTransfer||!t.transactions.CopyTransfer||!t.transactions.CancelTransfer)return Status::InvalidArgument;
     constexpr auto needed=HIGGS_INVENTORY_CAP_PLAYER_SELECTION|HIGGS_INVENTORY_CAP_DROP_TO_HAND|HIGGS_INVENTORY_CAP_STORE_HELD;
     if((t.inventory.capabilities&needed)!=needed)return Status::Unavailable;
@@ -20,7 +21,14 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
     {std::lock_guard lock(mutex_);tables_=t;config_=c;recognizer_=game.higgsRecognizerClient;stopping_=true;}
     auto status=t.hands.RegisterExecutor(c.higgsClient,Selected,this,&actionExecutor_);if(status){progress_.handStatus=status;return Status::Unavailable;}
     status=t.routing.AuthorizeRecognizer(c.higgsClient,actionExecutor_,recognizer_,c.physicalHands);if(status){if(Released(t.hands.RemoveRegistration(c.higgsClient,actionExecutor_)))actionExecutor_=0;progress_.handStatus=status;return Status::Unavailable;}
-    SourceBehaviorSpec spec{sizeof(spec),0,c.instance,this,Offers,Execute,c.higgsClient,actionExecutor_};
+    std::uint64_t label{};
+    if(t.routes.CopyClientLabel(c.higgsClient,&label)!=HIGGS_HAND_OK || !label || label==c.higgsClient){
+        t.routing.RevokeRecognizer(c.higgsClient,actionExecutor_,recognizer_);
+        if(Released(t.hands.RemoveRegistration(c.higgsClient,actionExecutor_)))actionExecutor_=0;
+        return Status::Unavailable;
+    }
+    executorLabel_=label;
+    SourceBehaviorSpec spec{sizeof(spec),0,c.instance,this,Offers,Execute,label,actionExecutor_};
     const auto registered=t.behaviors->RegisterSourceBehavior(c.writer,&spec,&behavior_);
     if(registered!=Status::Ok){t.routing.RevokeRecognizer(c.higgsClient,actionExecutor_,recognizer_);if(Released(t.hands.RemoveRegistration(c.higgsClient,actionExecutor_)))actionExecutor_=0;return registered;}
     {std::lock_guard lock(mutex_);attached_=true;stopping_=false;progress_={};progress_.stage=InventoryProviderStage::Ready;}return Status::Ok;
@@ -44,7 +52,7 @@ Status OrdinaryInventoryProvider::Offer(const SourceActionContext& c,SourceActio
 Status BS_CALL OrdinaryInventoryProvider::Execute(void* p,const SourceActionRequest* r){if(!p||!r)return Status::InvalidArgument;try{return static_cast<OrdinaryInventoryProvider*>(p)->Queue(*r);}catch(...){return Status::InternalError;}}
 Status OrdinaryInventoryProvider::Queue(const SourceActionRequest& r){
     std::lock_guard lock(mutex_);const auto& action=r.request;const auto hand=action.grant.physicalHand;
-    if(!attached_||stopping_||work_.selected.request.requestId||hand<1||hand>2||action.offer.higgsClient!=config_.higgsClient||action.offer.higgsExecutor!=actionExecutor_||action.offer.context.slot.configured.instance.instanceHandle!=config_.instance)return Status::Conflict;
+    if(!attached_||stopping_||work_.selected.request.requestId||hand<1||hand>2||action.offer.higgsClient!=executorLabel_||action.offer.higgsExecutor!=actionExecutor_||action.offer.context.slot.configured.instance.instanceHandle!=config_.instance)return Status::Conflict;
     const auto token=action.offer.proposal.executorAction;const auto& cached=offers_[token%offers_.size()];if(!token||cached.token!=token||cached.epoch!=action.grant.epoch||cached.input!=action.grant.inputSequence||cached.contentVersion!=action.offer.context.slot.contentVersion||!Same(selected_[hand-1],r,config_.higgsClient,actionExecutor_))return Status::Conflict;
     if(cached.plan.transferKind==HIGGS_TRANSFER_HAND_TO_INVENTORY&&(!r.incoming.known||!r.incoming.allowed||r.incoming.source!=1||!r.incoming.referenceId))return Status::Conflict;
     work_={};work_.selected=r;work_.plan=cached.plan;work_.held=cached.held;work_.authority=selected_[hand-1];progress_={};progress_.stage=InventoryProviderStage::Queued;progress_.slotRequest=action.requestId;progress_.higgsAction=action.grant.requestId;return Status::Ok;
@@ -72,7 +80,11 @@ void OrdinaryInventoryProvider::Advance(Work& w,InventoryProviderProgress& p){
     if(!w.transfer){
         if(!readable||original.stage==HIGGS_ACTION_CANCELLED||original.stage==HIGGS_ACTION_REJECTED||w.cancel){if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
         HIGGS_HandSnapshot snapshot{};snapshot.structSize=sizeof(snapshot);p.handStatus=tables_.hands.CopySnapshot(config_.higgsClient,&snapshot);
-        const auto hand=w.authority.physicalHands;if(p.handStatus||snapshot.epoch!=w.authority.epoch||snapshot.hands[hand-1].owner!=config_.higgsClient||snapshot.hands[hand-1].grant!=w.authority.grant){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+        const auto hand=w.authority.physicalHands;
+        std::uint64_t correlation{};
+        if(p.handStatus || snapshot.epoch!=w.authority.epoch ||
+           tables_.routes.CheckSelectedAction(config_.higgsClient,w.authority.requestId,w.authority.epoch,hand,&correlation)!=HIGGS_HAND_OK ||
+           correlation!=w.selected.request.grant.grantId || snapshot.hands[hand-1].grant!=correlation){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
         HIGGS_ItemIdentity item{};item.structSize=sizeof(item);
         if(w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND){
             if(!w.ticket){HIGGS_InventorySelectionRequest request{};request.structSize=sizeof(request);request.baseFormId=w.plan.baseFormId;request.epoch=w.authority.epoch;request.stackOrdinal=w.plan.stackOrdinal;request.quantity=w.plan.quantity;p.handStatus=tables_.inventory.RequestSelection(config_.higgsClient,&request,&w.ticket);if(p.handStatus){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}}

@@ -25,11 +25,13 @@ inline DragCommitOutcome CommitDragWithAuthority(const HIGGS_GrantMutationInterf
     const auto commit=+[](const HIGGS_ActionRequest* authorized,const HIGGS_HandSnapshot* current,void* raw)->HIGGS_HandStatus {
         auto& data=*static_cast<Context*>(raw);const auto& expected=*data.action;
         if(!authorized||!current||!current->worldReady||expected.physicalHands<1||expected.physicalHands>2||
-            authorized->requestId!=expected.requestId||authorized->grant!=expected.grant)return HIGGS_HAND_NOT_READY;
+            authorized->requestId!=expected.requestId || authorized->owner!=data.client ||
+            authorized->executor!=expected.executor || authorized->epoch!=expected.epoch ||
+            authorized->physicalHands!=expected.physicalHands || authorized->grant!=expected.grant)return HIGGS_HAND_NOT_READY;
         const auto& hand=current->hands[expected.physicalHands-1];
         constexpr std::uint32_t required=HIGGS_OBS_HELD_KNOWN|HIGGS_OBS_EQUIPMENT_KNOWN|HIGGS_OBS_TRACKING_VALID|HIGGS_OBS_PALM_VALID;
         if(hand.generation!=data.generation||(hand.observationMask&required)!=required||
-            hand.occupancy!=HIGGS_OCCUPANCY_EMPTY||hand.owner!=data.client||hand.grant!=expected.grant||
+            hand.occupancy!=HIGGS_OCCUPANCY_EMPTY||
             (hand.unavailableReasons&~HIGGS_HAND_REASON_EXISTING_USE))return HIGGS_HAND_STALE;
         data.status=FinishAuthorizedDrag(expected.requestId,true);
         return data.status==Status::Ok?HIGGS_HAND_OK:HIGGS_HAND_CONFLICT;

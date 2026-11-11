@@ -41,11 +41,11 @@ struct RegionActionRegistration {
     std::uint32_t structSize, reserved;
     std::uint64_t bindingId;
     HIGGS_HandExecutor higgsExecutor;
-    HIGGS_HandClient recognizerClient;
+    std::uint64_t recognizerClient; // public recognizer label for HIGGS HandRouting 2 delegation
 };
 struct RegionActionsIntegration {
     std::uint32_t structSize, version, connected, reserved;
-    HIGGS_HandClient recognizerClient;
+    std::uint64_t recognizerClient; // public, never usable as a client credential
     std::uint64_t epoch, saveGeneration, observationId;
 };
 struct RegionActionsApi {

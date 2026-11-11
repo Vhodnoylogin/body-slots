@@ -1,6 +1,7 @@
 // Production PLANCK registry and capture-time lookup with synthetic body poses.
 // The recording Body Slots sink implements its writer/revision/withdraw protocol.
 #include "planck_region_anchor.h"
+#include "main/planck_anchor_reader.h"
 #include "synergy_runtime.h"
 #include <array>
 #include <cmath>
@@ -66,6 +67,11 @@ int main() {
     const auto timestamp = PlanckSynergy::MonotonicNowNs();
     capture(2, timestamp);
     CHECK(update() == Status::Ok && seen.valid && revision == 1);
+    const detail::OwnedRegionSource owned{{sizeof(RegionPlanckBody),target.body.actor.handle,target.body.index,0,
+        target.body.actor.epoch,target.body.actor.actorGeneration,target.body.bodyGeneration},scope.epoch,scope.saveGeneration,timestamp-1};
+    RegionAnchorSnapshot real{};
+    CHECK(detail::ReadPlanckAnchor(*planck,client,owned,70,scratch,real)==Status::Ok);
+    CHECK(real.world.position[0]==70 && real.source.sampleId==seen.source.sampleId && real.source.timeSeconds==double(timestamp)/1e9);
     CHECK(seen.source.epoch == 93 && seen.source.saveGeneration == 55 && seen.source.frame == 2);
     CHECK(seen.source.timeSeconds == double(timestamp)/1e9 && seen.source.sampleId == scratch[0].sample);
     CHECK(seen.source.generation == target.body.bodyGeneration && seen.source.identity == (std::uint64_t(101) << 32));
@@ -81,12 +87,15 @@ int main() {
     stale.CopyActorPhysics = CopyOriginalPrefix;
     auto legacy = *planck; legacy.CopyActorPhysics = CopyOriginalPrefix;
     CHECK(anchor.Update(&legacy, scratch) == Status::Ok && seen.valid && revision == 1);
+    CHECK(detail::ReadPlanckAnchor(legacy,client,owned,70,scratch,real)==Status::Ok);
+    CHECK(detail::ReadPlanckAnchor(stale,client,owned,70,scratch,real)==Status::Unavailable);
     CHECK(anchor.Update(&stale, scratch) == Status::Unavailable && !seen.valid);
     CHECK(update() == Status::Conflict && !seen.valid); // Cannot resurrect a withdrawn sample.
     capture(3, PlanckSynergy::MonotonicNowNs());
     CHECK(update() == Status::Ok && seen.valid);
     PlanckSynergyAPI older = *planck; older.size = 128;
     CHECK(anchor.Update(&older, scratch) == Status::UnsupportedVersion && !seen.valid);
+    CHECK(detail::ReadPlanckAnchor(older,client,owned,70,scratch,real)==Status::UnsupportedVersion);
     older = *planck; older.capabilities &= ~PLANCK_CAP_SAMPLE_TIME;
     CHECK(anchor.Update(&older, scratch) == Status::UnsupportedVersion);
     capture(4, PlanckSynergy::MonotonicNowNs());
@@ -102,6 +111,7 @@ int main() {
     CHECK(update() == Status::Ok && seen.valid);
     ++body.lineage; // Same actor handle and body index, new physical generation.
     capture(7, PlanckSynergy::MonotonicNowNs());
+    CHECK(detail::ReadPlanckAnchor(*planck,client,owned,70,scratch,real)==Status::Unavailable);
     CHECK(update() == Status::Unavailable && !seen.valid);
     CHECK(planck->ReleaseClient(client) == PLANCK_OK);
     std::puts("PASS PLANCK actor pose to Body Slots region anchor");

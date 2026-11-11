@@ -1,5 +1,6 @@
 #include "region_actions.h"
 #include "interaction_regions.h"
+#include "owned_region_sources.h"
 #include "instances.h"
 #include "validation.h"
 #include "zone_geometry.h"
@@ -20,11 +21,13 @@ constexpr std::uint32_t kKnown=HIGGS_OBS_HELD_KNOWN|HIGGS_OBS_EQUIPMENT_KNOWN|HI
 constexpr std::uint64_t kInputAgeNs=100000000, kMax=std::numeric_limits<std::uint64_t>::max();
 thread_local unsigned callbackDepth=0;
 struct Binding {
-    std::uint64_t id{}, writer{}, anchorRevision{};
+    std::uint64_t id{}, writer{}, anchorRevision{}, openedAt{};
+    std::shared_ptr<const OwnedRegionSource> source;
     RegionActionBindingSpec spec{};
     InteractionRegionRecord region{};
     RegionAnchorSnapshot anchor{};
     HIGGS_HandExecutor executor{};
+    RegionInputEnded onInputEnd{};
     bool active=true, registering=true;
     unsigned inFlight{};
     std::array<RegionObservation,2> observations{};
@@ -33,7 +36,9 @@ struct Candidate {
     std::shared_ptr<Binding> binding;
     RegionActionContext context{};
     RegionActionProposal proposal{};
+    std::shared_ptr<const OwnedRegionSource> source;
     std::uint64_t token{}, requestId{};
+    std::uint64_t correlation{};
     HIGGS_ActionRequest selected{};
     bool claimed=false, dispatchEntered=false;
 };
@@ -43,7 +48,9 @@ struct Service {
     HIGGS_HandInterface hands{};
     HIGGS_HandRoutingInterface routing{};
     HIGGS_AuthorizedDispatchInterface dispatch{};
+    HIGGS_InputRoutesInterface routes{};
     HIGGS_HandClient recognizer{};
+    std::uint64_t recognizerLabel{};
     HIGGS_HandRegistration registration{};
     HIGGS_HandSnapshot snapshot{};
     std::uint64_t epoch{}, save{}, barredEpoch{}, nextBinding=1, nextCandidate=1, sequence{};
@@ -51,6 +58,13 @@ struct Service {
     bool connecting=false, ticking=false;
     std::vector<std::shared_ptr<Binding>> bindings;
     std::vector<std::shared_ptr<Candidate>> candidates;
+    std::vector<std::shared_ptr<Candidate>> held;
+    using BoundSource = std::pair<std::shared_ptr<Binding>,std::shared_ptr<const OwnedRegionSource>>;
+    using Sources = std::vector<BoundSource>;
+    std::shared_ptr<const Sources> sources=std::make_shared<Sources>();
+    ReadOwnedAnchor readPlanck{};
+    ReadPpbDigest readPpb{};
+    std::uint64_t scopeOpenedAt{};
 };
 Service& State() { static auto* s=new Service; return *s; }
 template<class F> Status Guard(F&& f) noexcept {try{return f();}catch(...){return Status::InternalError;}}
@@ -73,6 +87,18 @@ std::shared_ptr<Binding> Find(Service& s,std::uint64_t id) {
     for(auto& b:s.bindings)if(b->id==id)return b;
     return {};
 }
+void SetSource(Service& s, const std::shared_ptr<Binding>& b, std::shared_ptr<const OwnedRegionSource> source) {
+    auto updated = std::make_shared<Service::Sources>(*s.sources);
+    std::erase_if(*updated, [&](const auto& entry) {
+        return entry.first == b;
+    });
+    if (source)
+        updated->emplace_back(b, source);
+    s.sources = std::move(updated);
+    b->source = std::move(source);
+    b->anchor = {};
+    b->observations = {};
+}
 bool Fresh(std::uint64_t sample,std::uint64_t now,std::uint64_t maxAge=kInputAgeNs) {
     return sample && sample<=now && now-sample<=maxAge;
 }
@@ -87,7 +113,7 @@ bool Scope(Service& s,const HIGGS_HandSnapshot& snap) {
        !snap.observationId || !snap.sampledAtNs || snap.epoch<s.epoch)return false;
     if(s.epoch!=snap.epoch || s.save!=save) {
         if(s.epoch!=snap.epoch)s.observationHighWater=s.timeHighWater=s.generationHighWater=0;
-        s.epoch=snap.epoch;s.save=save;
+        s.epoch=snap.epoch;s.save=save;s.scopeOpenedAt=Now();
         for(auto& b:s.bindings)b->observations={};
     }
     if(snap.observationId<s.observationHighWater || snap.sampledAtNs<s.timeHighWater || snap.generation<s.generationHighWater ||
@@ -152,6 +178,7 @@ void HIGGS_HAND_CALL Selected(const HIGGS_ActionRequest* request,void* context) 
         }
     }catch(...){}
 }
+std::uint64_t TargetKey(const InteractionRegionSpec& region);
 void HIGGS_HAND_CALL Recognize(const HIGGS_HandInput* input,void*) noexcept {
     try {
         if(!input || input->structSize!=sizeof(*input) || input->physicalHand<1 || input->physicalHand>2 ||
@@ -159,23 +186,25 @@ void HIGGS_HAND_CALL Recognize(const HIGGS_HandInput* input,void*) noexcept {
            input->snapshot.epoch!=input->epoch || !Fresh(input->observedAtNs,Now()))return;
         const auto& hand=input->snapshot.hands[input->physicalHand-1];
         if(input->handGeneration!=hand.generation || input->poseObservationId!=hand.poseObservationId)return;
-        auto& s=State();HIGGS_HandInterface hands{};HIGGS_HandClient recognizer{};
+        auto& s=State();HIGGS_HandInterface hands{};HIGGS_InputRoutesInterface routes{};HIGGS_HandClient recognizer{};
         std::vector<std::shared_ptr<Binding>> bindings;
         {
             std::lock_guard lock(s.mutex);
             if(!s.recognizer || !Scope(s,input->snapshot) ||
                s.snapshot.epoch!=input->epoch || s.snapshot.observationId!=input->snapshot.observationId)return;
-            hands=s.hands;recognizer=s.recognizer;bindings=s.bindings;
+            hands=s.hands;routes=s.routes;recognizer=s.recognizer;bindings=s.bindings;
         }
         std::vector<std::shared_ptr<Candidate>> offered;
         for(auto& b:bindings) {
             RegionActionContext context{};
+            std::shared_ptr<const OwnedRegionSource> source;
             {
                 std::lock_guard lock(s.mutex);
                 if(!(b->spec.physicalHands&input->physicalHand) || b->spec.button!=input->button ||
                    !(b->spec.edgeMask&input->edge) || !Ready(s,*b,input->snapshot,input->physicalHand) ||
                    hand.grant || (hand.availability!=HIGGS_AVAILABILITY_READY && hand.availability!=HIGGS_AVAILABILITY_RESERVED))continue;
                 context={sizeof(context),0,b->id,b->anchorRevision,b->observations[input->physicalHand-1],*input};
+                source=b->source;
                 ++b->inFlight;
             }
             Lease lease(b);std::array<RegionActionProposal,kMaxRegionActionProposals> proposals{};std::uint32_t count=0;
@@ -194,7 +223,7 @@ void HIGGS_HAND_CALL Recognize(const HIGGS_HandInput* input,void*) noexcept {
                         (resource.availability==HIGGS_AVAILABILITY_READY || resource.availability==HIGGS_AVAILABILITY_RESERVED);
                 }
                 if(!resources)continue;
-                auto c=std::make_shared<Candidate>();c->binding=b;c->context=context;c->proposal=p;offered.push_back(c);
+                auto c=std::make_shared<Candidate>();c->binding=b;c->context=context;c->proposal=p;c->source=source;offered.push_back(c);
             }
         }
         std::stable_sort(offered.begin(),offered.end(),[](const auto& a,const auto& b){return a->proposal.priority>b->proposal.priority;});
@@ -202,14 +231,17 @@ void HIGGS_HAND_CALL Recognize(const HIGGS_HandInput* input,void*) noexcept {
             {
                 std::lock_guard lock(s.mutex);
                 if(!c->binding->active || s.nextCandidate==kMax || s.candidates.size()>=256 ||
-                   c->binding->anchorRevision!=c->context.anchorRevision)continue;
+                   c->binding->anchorRevision!=c->context.anchorRevision || c->binding->source!=c->source)continue;
                 c->token=s.nextCandidate++;s.candidates.push_back(c);
             }
             HIGGS_ActionCandidate candidate{};candidate.structSize=sizeof(candidate);candidate.physicalHands=c->proposal.physicalHands;
             candidate.inputId=input->inputId;candidate.epoch=input->epoch;candidate.handGeneration=input->handGeneration;
             candidate.executor=c->binding->executor;candidate.actionId=c->proposal.actionId;candidate.contextId=c->token;
             candidate.contextGeneration=c->context.anchorRevision;candidate.grantDurationMs=c->proposal.grantDurationMs;
-            HIGGS_HandRequestId request{};const auto result=hands.SubmitCandidate(recognizer,&candidate,&request);
+            HIGGS_HandRequestId request{};
+            const auto result=routes.SubmitOrderedCandidate
+                ? routes.SubmitOrderedCandidate(recognizer,&candidate,TargetKey(c->binding->region.spec),&request)
+                : hands.SubmitCandidate(recognizer,&candidate,&request);
             std::lock_guard lock(s.mutex);
             if(result==HIGGS_HAND_OK)c->requestId=request;
             else s.candidates.erase(std::remove(s.candidates.begin(),s.candidates.end(),c),s.candidates.end());
@@ -224,6 +256,15 @@ bool SameTarget(const RegionSampleSource& before,const RegionSampleSource& after
     return before.identity==after.identity && before.generation==after.generation && before.epoch==after.epoch &&
         before.saveGeneration==after.saveGeneration && !std::strcmp(before.provider,after.provider) && !std::strcmp(before.source,after.source);
 }
+std::uint64_t TargetKey(const InteractionRegionSpec& region) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const char* part : {region.provider, region.key}) {
+        for (const char* cursor = part; *cursor; ++cursor)
+            hash = (hash ^ static_cast<unsigned char>(*cursor)) * 1099511628211ULL;
+        hash *= 1099511628211ULL; // delimiter between the two stable public names
+    }
+    return hash ? hash : 1;
+}
 HIGGS_HandStatus HIGGS_HAND_CALL ExecuteAuthorized(const HIGGS_ActionRequest* request,const HIGGS_HandSnapshot* snapshot,void* context) noexcept {
     try {
         if(!request || !snapshot || !context)return HIGGS_HAND_INVALID_ARGUMENT;
@@ -234,14 +275,13 @@ HIGGS_HandStatus HIGGS_HAND_CALL ExecuteAuthorized(const HIGGS_ActionRequest* re
             if(!b->active || !c.claimed || request->requestId!=c.selected.requestId || request->executor!=b->executor ||
                request->grant!=c.selected.grant || request->epoch!=c.context.input.epoch ||
                s.save!=c.context.observation.evaluated.saveGeneration || CurrentSaveGeneration()!=s.save ||
-               !SameTarget(c.context.observation.anchor.source,b->anchor.source) || !Fresh(c.context.input.observedAtNs,Now()) ||
+               b->source!=c.source || !SameTarget(c.context.observation.anchor.source,b->anchor.source) || !Fresh(c.context.input.observedAtNs,Now()) ||
                !Ready(s,*b,*snapshot,c.context.input.physicalHand))return HIGGS_HAND_STALE;
             // New pose samples of the same target are re-evaluated. Replacement
             // source generations invalidate the original offer.
             for(unsigned hand=1;hand<=2;++hand)if(c.proposal.physicalHands&hand)
                 if(!SameHand(c.context.input.snapshot.hands[hand-1],snapshot->hands[hand-1]) ||
-                   !Fresh(c.context.input.snapshot.hands[hand-1].poseObservedAtNs,Now()) || !Fresh(snapshot->hands[hand-1].poseObservedAtNs,Now()) ||
-                   snapshot->hands[hand-1].owner!=b->spec.higgsClient || snapshot->hands[hand-1].grant!=request->grant)
+                   !Fresh(c.context.input.snapshot.hands[hand-1].poseObservedAtNs,Now()) || !Fresh(snapshot->hands[hand-1].poseObservedAtNs,Now()))
                     return HIGGS_HAND_STALE;
             execution.context=c.context;execution.context.observation=b->observations[c.context.input.physicalHand-1];
             execution.proposal=c.proposal;execution.request=*request;execution.currentSnapshot=*snapshot;
@@ -267,7 +307,7 @@ Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* inpu
             std::lock_guard lock(s.mutex);
             if(!s.recognizer)return Status::Unavailable;
             if(s.bindings.size()>=kMaxRegionActionBindings || s.nextBinding==kMax)return Status::LimitExceeded;
-            b->id=s.nextBinding++;s.bindings.push_back(b);hands=s.hands;routing=s.routing;recognizer=s.recognizer;
+            b->id=s.nextBinding++;b->openedAt=Now();s.bindings.push_back(b);hands=s.hands;routing=s.routing;recognizer=s.recognizerLabel;
         }
         HIGGS_HandExecutor executor{};
         auto status=hands.RegisterExecutor(spec.higgsClient,Selected,b.get(),&executor);
@@ -280,7 +320,7 @@ Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* inpu
         {
             std::lock_guard lock(s.mutex);b->executor=executor;b->registering=false;
             InteractionRegionRecord current{};
-            cancelled=!b->active || s.recognizer!=recognizer ||
+            cancelled=!b->active || s.recognizerLabel!=recognizer ||
                 CopyOwnedInteractionRegion(writer,spec.regionId,spec.regionRevision,current)!=Status::Ok;
             if(!cancelled)*output={sizeof(*output),0,b->id,executor,recognizer};
         }
@@ -295,21 +335,22 @@ Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* inpu
 Status BS_CALL Remove(std::uint64_t writer,std::uint64_t id) noexcept {
     return Guard([&] {
         auto& s=State();std::shared_ptr<Binding> b;std::vector<std::shared_ptr<Candidate>> cancelled;
-        HIGGS_HandInterface hands{};HIGGS_HandRoutingInterface routing{};HIGGS_HandClient recognizer{};
+        HIGGS_HandInterface hands{};HIGGS_HandRoutingInterface routing{};HIGGS_HandClient recognizer{};std::uint64_t label{};
         {
             std::lock_guard lock(s.mutex);b=Find(s,id);if(!b)return Status::NotFound;
             if(b->writer!=writer)return Status::Unauthorized;
-            b->active=false;b->observations={};if(b->registering)return Status::Unavailable;
-            hands=s.hands;routing=s.routing;recognizer=s.recognizer;
+            b->active=false;b->observations={};if(b->source)SetSource(s,b,{});if(b->registering)return Status::Unavailable;
+            hands=s.hands;routing=s.routing;recognizer=s.recognizer;label=s.recognizerLabel;
             for(auto& c:s.candidates)if(c->binding==b)cancelled.push_back(c);
         }
         Cancel(cancelled,routing,recognizer);
-        const auto route=routing.RevokeRecognizer(b->spec.higgsClient,b->executor,recognizer);
+        const auto route=routing.RevokeRecognizer(b->spec.higgsClient,b->executor,label);
         const auto removed=hands.RemoveRegistration(b->spec.higgsClient,b->executor);
         if(callbackDepth || route==HIGGS_HAND_PENDING || removed==HIGGS_HAND_PENDING)return Status::Unavailable;
         if(removed!=HIGGS_HAND_OK && removed!=HIGGS_HAND_NOT_FOUND && removed!=HIGGS_HAND_INVALID_CLIENT)return Convert(removed);
         std::unique_lock lock(s.mutex);s.drained.wait(lock,[&]{return !b->inFlight;});
         s.candidates.erase(std::remove_if(s.candidates.begin(),s.candidates.end(),[&](const auto& c){return c->binding==b;}),s.candidates.end());
+        s.held.erase(std::remove_if(s.held.begin(),s.held.end(),[&](const auto& c){return c->binding==b;}),s.held.end());
         s.bindings.erase(std::remove(s.bindings.begin(),s.bindings.end(),b),s.bindings.end());return Status::Ok;
     });
 }
@@ -330,6 +371,7 @@ Status BS_CALL Publish(std::uint64_t writer,std::uint64_t id,std::uint64_t expec
         if(!b)return Status::NotFound;
         if(b->writer!=writer)return Status::Unauthorized;
         if(!Owned(*b) || !s.epoch || CurrentSaveGeneration()!=s.save)return Status::Unavailable;
+        if(b->source)return Status::Conflict;
         if(expected!=b->anchorRevision)return Status::Conflict;
         if(!ValidAnchor(anchor,*b,s)) {b->anchor.valid=0;b->observations={};return Status::InvalidArgument;}
         if(b->anchorRevision) {
@@ -352,7 +394,7 @@ Status BS_CALL Integration(std::uint64_t reader,RegionActionsIntegration* output
         auto& s=State();std::lock_guard lock(s.mutex);
         const bool ready=s.recognizer && s.epoch>s.barredEpoch && s.save==CurrentSaveGeneration() &&
             s.snapshot.worldReady && s.snapshot.epoch==s.epoch && Fresh(s.snapshot.sampledAtNs,Now());
-        *output={sizeof(*output),1,ready?1u:0u,0,s.recognizer,ready?s.epoch:0,ready?s.save:0,ready?s.snapshot.observationId:0};return Status::Ok;
+        *output={sizeof(*output),1,ready?1u:0u,0,s.recognizerLabel,ready?s.epoch:0,ready?s.save:0,ready?s.snapshot.observationId:0};return Status::Ok;
     });
 }
 Status BS_CALL Observation(std::uint64_t writer,std::uint64_t id,std::uint32_t hand,RegionObservation* output) noexcept {
@@ -365,8 +407,233 @@ Status BS_CALL Observation(std::uint64_t writer,std::uint64_t id,std::uint32_t h
     });
 }
 const RegionActionsApi api{sizeof(api),1,1,Register,Remove,Publish,Integration,Observation};
+Status BS_CALL BindPlanck(std::uint64_t writer, std::uint64_t id, const RegionPlanckBody* target) noexcept {
+    return Guard([&] {
+        if (!target || target->structSize != sizeof(*target) || target->reserved || !target->worldEpoch ||
+            !target->actorHandle || !target->actorGeneration || !target->bodyGeneration)
+            return Status::InvalidArgument;
+        auto& s = State();
+        std::lock_guard lock(s.mutex);
+        const auto b = Find(s, id);
+        if (!b)
+            return Status::NotFound;
+        if (b->writer != writer)
+            return Status::Unauthorized;
+        if (b->region.spec.anchorKind != static_cast<std::uint32_t>(RegionAnchorKind::Npc))
+            return Status::InvalidArgument;
+        if (!s.readPlanck)
+            return Status::UnsupportedVersion;
+        if (!Owned(*b) || s.epoch <= s.barredEpoch || s.save != CurrentSaveGeneration() || !s.snapshot.worldReady ||
+            !Fresh(s.snapshot.sampledAtNs, Now()))
+            return Status::Unavailable;
+        if (b->source)
+            return Status::Conflict;
+        SetSource(s, b, std::make_shared<OwnedRegionSource>(OwnedRegionSource{*target, s.epoch, s.save, Now()}));
+        return Status::Ok;
+    });
+}
+Status BS_CALL Unbind(std::uint64_t writer, std::uint64_t id) noexcept {
+    return Guard([&] {
+        auto& s = State();
+        std::lock_guard lock(s.mutex);
+        const auto b = Find(s, id);
+        if (!b)
+            return Status::NotFound;
+        if (b->writer != writer)
+            return Status::Unauthorized;
+        if (!b->source)
+            return Status::NotFound;
+        SetSource(s, b, {});
+        return Status::Ok;
+    });
+}
+Status BS_CALL CopyPpbEvidence(std::uint64_t writer, std::uint64_t id, const PpbRegionQuery* query,
+                               PpbRegionEvidence* out) noexcept {
+    return Guard([&] {
+        if (!query || query->structSize != sizeof(*query) || !query->actorFormId ||
+            (query->hand != Left && query->hand != Right) || query->slot > 11 || query->leftTwin > 1 || !out ||
+            out->structSize != sizeof(*out))
+            return Status::InvalidArgument;
+        auto& s = State();
+        std::shared_ptr<Binding> binding;
+        ReadPpbDigest read{};
+        std::uint64_t epoch{}, save{}, opened{};
+        {
+            std::lock_guard lock(s.mutex);
+            binding = Find(s, id);
+            if (!binding)
+                return Status::NotFound;
+            if (binding->writer != writer)
+                return Status::Unauthorized;
+            if (!s.readPpb)
+                return Status::UnsupportedVersion;
+            if (!Owned(*binding) || s.epoch <= s.barredEpoch || !s.snapshot.worldReady ||
+                !Fresh(s.snapshot.sampledAtNs, Now()) || s.save != CurrentSaveGeneration())
+                return Status::Unavailable;
+            read = s.readPpb;
+            epoch = s.epoch;
+            save = s.save;
+            opened = std::max(s.scopeOpenedAt, binding->openedAt);
+        }
+        const auto start = Now();
+        PpbRegionEvidence result{};
+        result.structSize = sizeof(result);
+        auto status = read(*query, result);
+        if (status != Status::Ok)
+            return status;
+        const auto ageLimit = binding->region.spec.maxSampleAgeSeconds * 1000;
+        // PPB reports integer milliseconds since scan start. Use the older
+        // end of the one-ms uncertainty and reject scans preceding this scope.
+        if (start < opened || result.ppbAgeMs >= ((start - opened) / 1000000) ||
+            static_cast<double>(result.ppbAgeMs) + 1 > ageLimit)
+            return Status::Unavailable;
+        std::lock_guard lock(s.mutex);
+        if (!Owned(*binding) || s.epoch != epoch || s.barredEpoch >= epoch || s.save != save ||
+            save != CurrentSaveGeneration())
+            return Status::Unavailable;
+        result.logicalEpoch = epoch;
+        result.saveGeneration = save;
+        *out = result;
+        return Status::Ok;
+    });
+}
+const RegionSourcesApi sourcesApi{sizeof(sourcesApi),1,BindPlanck,Unbind,CopyPpbEvidence};
+
+void RefreshSources(Service& s, const HIGGS_HandSnapshot& snapshot) {
+    std::shared_ptr<const Service::Sources> sources;
+    ReadOwnedAnchor read{};
+    {
+        std::lock_guard lock(s.mutex);
+        sources = s.sources;
+        read = s.readPlanck;
+    }
+    for (const auto& [b, source] : *sources) {
+        RegionAnchorSnapshot anchor{};
+        const bool same = source->higgsEpoch == snapshot.epoch && source->saveGeneration == CurrentSaveGeneration();
+        const bool available = same && read && read(*source, anchor) == Status::Ok;
+        std::lock_guard lock(s.mutex);
+        if (!b->active || b->source != source)
+            continue;
+        const double now = double(Now()) / 1e9;
+        if (!available || !ValidAnchor(anchor, *b, s) || anchor.source.timeSeconds > now ||
+            now - anchor.source.timeSeconds > b->region.spec.maxSampleAgeSeconds || s.epoch <= s.barredEpoch ||
+            source->saveGeneration != CurrentSaveGeneration()) {
+            b->anchor.valid = 0;
+            b->observations = {};
+            continue;
+        }
+        const auto& old = b->anchor.source;
+        const auto& next = anchor.source;
+        if (old.sampleId == next.sampleId && old.frame == next.frame && old.timeSeconds == next.timeSeconds)
+            continue;
+        if (next.sampleId <= old.sampleId || next.frame <= old.frame || next.timeSeconds < old.timeSeconds ||
+            b->anchorRevision == kMax) {
+            b->anchor.valid = 0;
+            b->observations = {};
+            continue;
+        }
+        b->anchor = anchor;
+        ++b->anchorRevision;
+    }
+}
+Status BS_CALL SubscribeEnd(std::uint64_t writer, std::uint64_t id, RegionInputEnded callback) noexcept {
+    return Guard([&] {
+        if (!callback)
+            return Status::InvalidArgument;
+        auto& s = State();
+        std::lock_guard lock(s.mutex);
+        const auto b = Find(s, id);
+        if (!b)
+            return Status::NotFound;
+        if (b->writer != writer)
+            return Status::Unauthorized;
+        if (!Owned(*b))
+            return Status::Unavailable;
+        if (!(b->spec.edgeMask & 1))
+            return Status::InvalidArgument;
+        if (!s.routes.CopySequence || !s.routes.CheckSelectedAction)
+            return Status::UnsupportedVersion;
+        if (b->onInputEnd)
+            return Status::Conflict;
+        b->onInputEnd = callback;
+        return Status::Ok;
+    });
+}
+const RegionContinuationApi continuation{sizeof(continuation),1,SubscribeEnd};
+
+void DeliverTerminals(Service& s, const HIGGS_InputRoutesInterface& routes) {
+    std::vector<std::shared_ptr<Candidate>> tracked;
+    {
+        std::lock_guard lock(s.mutex);
+        tracked = s.held;
+    }
+    for (const auto& c : tracked) {
+        const auto& input = c->context.input;
+        auto b = c->binding;
+        HIGGS_InputSequence sequence{};
+        sequence.structSize = sizeof(sequence);
+        const auto status = routes.CopySequence(b->spec.higgsClient, input.inputId, &sequence);
+        const bool same = status == HIGGS_HAND_OK && sequence.structSize == sizeof(sequence) &&
+                          sequence.epoch == input.epoch && sequence.pressInputId == input.inputId &&
+                          sequence.requestId == c->requestId && sequence.executor == b->executor &&
+                          sequence.correlation == c->correlation && sequence.actionId == c->proposal.actionId &&
+                          sequence.physicalHand == input.physicalHand && sequence.button == input.button;
+        RegionInputTerminal terminal{sizeof(terminal),
+                                     static_cast<std::uint32_t>(RegionInputEnd::ObservationLost),
+                                     input.physicalHand,
+                                     input.button,
+                                     b->id,
+                                     input.epoch,
+                                     input.inputId,
+                                     0,
+                                     c->requestId,
+                                     c->proposal.actionId,
+                                     c->correlation,
+                                     0,
+                                     0};
+        {
+            std::lock_guard lock(s.mutex);
+            const auto found = std::find(s.held.begin(), s.held.end(), c);
+            if (found == s.held.end())
+                continue;
+            const bool live =
+                s.barredEpoch < input.epoch && s.epoch == input.epoch && s.save == CurrentSaveGeneration();
+            if (live && same && sequence.phase == HIGGS_SEQUENCE_HELD)
+                continue;
+            if (same && ((sequence.phase == HIGGS_SEQUENCE_RELEASED && sequence.terminalInputId) ||
+                         (sequence.phase == HIGGS_SEQUENCE_CANCELLED && !sequence.terminalInputId))) {
+                terminal.end = static_cast<std::uint32_t>(sequence.phase == HIGGS_SEQUENCE_RELEASED
+                                                              ? RegionInputEnd::Released
+                                                              : RegionInputEnd::Cancelled);
+                terminal.terminalInput = sequence.terminalInputId;
+                terminal.providerReason = sequence.reason;
+            }
+            s.held.erase(found);
+            if (!Owned(*b))
+                continue;
+            ++b->inFlight;
+        }
+        Lease lease(b);
+        try {
+            b->onInputEnd(b->spec.context, &terminal);
+        } catch (...) {
+        }
+    }
+}
 } // namespace
 const RegionActionsApi& GetRegionActionsApi() noexcept {return api;}
+const RegionContinuationApi& GetRegionContinuationApi() noexcept {return continuation;}
+const RegionSourcesApi& GetRegionSourcesApi() noexcept {return sourcesApi;}
+void SetOwnedPlanckReader(ReadOwnedAnchor read) noexcept {
+    auto& s = State();
+    std::lock_guard lock(s.mutex);
+    s.readPlanck = read;
+}
+void SetPpbDigestReader(ReadPpbDigest read) noexcept {
+    auto& s = State();
+    std::lock_guard lock(s.mutex);
+    s.readPpb = read;
+}
 Status DrainRegionActionsClient(std::uint64_t writer) noexcept {
     return Guard([&] {
         auto& s=State();std::vector<std::shared_ptr<Binding>> bindings;
@@ -385,35 +652,47 @@ Status DrainRegionActionsClient(std::uint64_t writer) noexcept {
     });
 }
 Status ConnectRegionActions(const HIGGS_HandInterface& hands,const HIGGS_HandRoutingInterface& routing,
-    const HIGGS_AuthorizedDispatchInterface& dispatch) noexcept {
+    const HIGGS_AuthorizedDispatchInterface& dispatch,const HIGGS_InputRoutesInterface* routes) noexcept {
     return Guard([&] {
         constexpr auto required=HIGGS_HAND_CAP_SNAPSHOT|HIGGS_HAND_CAP_INPUT_BROKER|HIGGS_HAND_CAP_OWNED_GRANTS|HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
-        if(hands.structSize!=sizeof(hands) || hands.abiVersion!=1 || (hands.capabilities&required)!=required || !hands.RegisterClient || !hands.UnregisterClient || !hands.CopySnapshot ||
+        if(!routes || routes->structSize!=sizeof(*routes) || routes->abiVersion!=1 || !routes->CopyClientLabel ||
+           hands.structSize!=sizeof(hands) || hands.abiVersion!=HIGGS_HAND_ABI_VERSION || (hands.capabilities&required)!=required || !hands.RegisterClient || !hands.UnregisterClient || !hands.CopySnapshot ||
            !hands.SubscribeRecognizer || !hands.RegisterExecutor || !hands.RemoveRegistration || !hands.SubmitCandidate || !hands.CopyActionResult ||
-           routing.structSize!=sizeof(routing) || routing.abiVersion!=1 || !routing.AuthorizeRecognizer || !routing.RevokeRecognizer ||
-           !routing.CancelRecognizedAction || dispatch.structSize!=sizeof(dispatch) || dispatch.abiVersion!=1 || !dispatch.Invoke)return Status::Unavailable;
+           routing.structSize!=sizeof(routing) || routing.abiVersion!=HIGGS_HAND_ROUTING_ABI_VERSION || !routing.AuthorizeRecognizer || !routing.RevokeRecognizer ||
+           !routing.CancelRecognizedAction || dispatch.structSize!=sizeof(dispatch) || dispatch.abiVersion!=HIGGS_AUTHORIZED_DISPATCH_ABI_VERSION || !dispatch.Invoke)return Status::Unavailable;
         auto& s=State();{
             std::lock_guard lock(s.mutex);if(s.recognizer)return Status::Ok;if(s.connecting)return Status::Unavailable;s.connecting=true;
         }
         HIGGS_HandClientInfo info{};info.structSize=sizeof(info);std::strcpy(info.name,"BodySlots.RegionActions");
         HIGGS_HandClient client{};HIGGS_HandRegistration registration{};auto result=hands.RegisterClient(&info,&client);
+        std::uint64_t label{};
+        if(result==HIGGS_HAND_OK)result=routes->CopyClientLabel(client,&label);
+        if(result==HIGGS_HAND_OK && (!label || label==client))result=HIGGS_HAND_UNSUPPORTED;
         if(result==HIGGS_HAND_OK)result=hands.SubscribeRecognizer(client,Recognize,nullptr,&registration);
         if(result!=HIGGS_HAND_OK && client)hands.UnregisterClient(client);
         std::lock_guard lock(s.mutex);s.connecting=false;
         if(result!=HIGGS_HAND_OK)return Convert(result);
-        s.hands=hands;s.routing=routing;s.dispatch=dispatch;s.recognizer=client;s.registration=registration;return Status::Ok;
+        s.routes={};
+        if(routes && routes->structSize==sizeof(*routes) && routes->abiVersion==1) {
+            if((routes->capabilities&HIGGS_ROUTE_TERMINALS) && routes->CopySequence && routes->CheckSelectedAction) {
+                s.routes.CopySequence=routes->CopySequence;s.routes.CheckSelectedAction=routes->CheckSelectedAction;
+            }
+            if(routes->capabilities&HIGGS_ROUTE_ORDERED_CANDIDATES)s.routes.SubmitOrderedCandidate=routes->SubmitOrderedCandidate;
+        }
+        s.hands=hands;s.routing=routing;s.dispatch=dispatch;s.recognizer=client;s.recognizerLabel=label;s.registration=registration;return Status::Ok;
     });
 }
 void TickRegionActions() noexcept {
     try {
         auto& s=State();HIGGS_HandInterface hands{};HIGGS_HandRoutingInterface routing{};
-        HIGGS_AuthorizedDispatchInterface dispatch{};HIGGS_HandClient recognizer{};
+        HIGGS_AuthorizedDispatchInterface dispatch{};HIGGS_InputRoutesInterface routes{};HIGGS_HandClient recognizer{};
         {
             std::lock_guard lock(s.mutex);if(!s.recognizer || s.ticking)return;s.ticking=true;
-            hands=s.hands;routing=s.routing;dispatch=s.dispatch;recognizer=s.recognizer;
+            hands=s.hands;routing=s.routing;dispatch=s.dispatch;routes=s.routes;recognizer=s.recognizer;
         }
         struct TickExit {Service& s;~TickExit(){std::lock_guard lock(s.mutex);s.ticking=false;}} exit{s};
         HIGGS_HandSnapshot snap{};snap.structSize=sizeof(snap);const auto copied=hands.CopySnapshot(recognizer,&snap);
+        if(copied==HIGGS_HAND_OK && snap.worldReady && Fresh(snap.sampledAtNs,Now()))RefreshSources(s,snap);
         std::vector<std::shared_ptr<Candidate>> pending,cancelled;
         {
             std::lock_guard lock(s.mutex);
@@ -440,12 +719,19 @@ void TickRegionActions() noexcept {
             if(copiedResult==HIGGS_HAND_OK && result.stage==HIGGS_ACTION_ACCEPTED && result.executor==c->binding->executor &&
                result.epoch==c->selected.epoch && result.inputId==c->selected.inputId) {
                 const HIGGS_AuthorizedDispatchRequest request{sizeof(request),0,c->selected.requestId,c->selected.executor,c->selected.epoch,c->selected.grant};
-                invoked=dispatch.Invoke(c->binding->spec.higgsClient,&request,ExecuteAuthorized,c.get());
+                if(!routes.CheckSelectedAction || routes.CheckSelectedAction(recognizer,request.requestId,request.epoch,
+                        c->proposal.physicalHands,&c->correlation)==HIGGS_HAND_OK)
+                    invoked=dispatch.Invoke(c->binding->spec.higgsClient,&request,ExecuteAuthorized,c.get());
             }
-            bool entered=false;{std::lock_guard lock(s.mutex);entered=c->dispatchEntered;}
+            bool entered=false;{
+                std::lock_guard lock(s.mutex);entered=c->dispatchEntered;
+                if(entered && c->correlation && c->context.input.edge==1 && c->binding->active && c->binding->onInputEnd)
+                    s.held.push_back(c);
+            }
             if(!entered && invoked!=HIGGS_HAND_OK && copiedResult==HIGGS_HAND_OK && result.stage==HIGGS_ACTION_ACCEPTED)
                 routing.CancelRecognizedAction(recognizer,c->selected.requestId,c->selected.epoch,1);
         }
+        if(routes.CopySequence)DeliverTerminals(s,routes);
         // Bounded losing candidates are observations, not unsettled effects.
         // Selected dispatched records are never replayed and are not auto-settled.
         std::vector<std::shared_ptr<Candidate>> inspect;
@@ -478,8 +764,8 @@ Status DisconnectRegionActions() noexcept {
         if(!recognizer)return Status::Ok;
         for(auto& b:bindings){auto result=Remove(b->writer,b->id);if(result!=Status::Ok && result!=Status::NotFound)return result;}
         const auto result=hands.UnregisterClient(recognizer);if(result!=HIGGS_HAND_OK)return Convert(result);
-        std::lock_guard lock(s.mutex);s.recognizer=0;s.registration=0;s.snapshot={};s.epoch=s.save=s.barredEpoch=0;
-        s.observationHighWater=s.timeHighWater=s.generationHighWater=0;s.candidates.clear();return Status::Ok;
+        std::lock_guard lock(s.mutex);s.recognizer=0;s.recognizerLabel=0;s.registration=0;s.snapshot={};s.epoch=s.save=s.barredEpoch=0;
+        s.observationHighWater=s.timeHighWater=s.generationHighWater=0;s.candidates.clear();s.held.clear();s.routes={};return Status::Ok;
     });
 }
 } // namespace body_slots::detail
@@ -489,6 +775,14 @@ Status DisconnectRegionActions() noexcept {
 #else
 #define BS_REGION_EXPORT
 #endif
+extern "C" BS_REGION_EXPORT const body_slots::RegionContinuationApi* BS_CALL BodySlots_QueryRegionContinuationInterface(
+    std::uint32_t version,std::uint32_t size) noexcept {
+    return version==1 && size==sizeof(body_slots::RegionContinuationApi) ? &body_slots::detail::GetRegionContinuationApi() : nullptr;
+}
+extern "C" BS_REGION_EXPORT const body_slots::RegionSourcesApi* BS_CALL BodySlots_QueryRegionSourcesInterface(
+    std::uint32_t version,std::uint32_t size) noexcept {
+    return version==1 && size==sizeof(body_slots::RegionSourcesApi) ? &body_slots::detail::GetRegionSourcesApi() : nullptr;
+}
 extern "C" BS_REGION_EXPORT const body_slots::RegionActionsApi* BS_CALL BodySlots_QueryRegionActionsInterface(
     std::uint32_t version,std::uint32_t size) noexcept {
     return version==body_slots::kRegionActionsApiVersion && size==sizeof(body_slots::RegionActionsApi)

@@ -66,9 +66,11 @@ struct ActionOffer {
     ActionContext context;
     ActionProposal proposal;
     std::uint64_t offerId, behavior, policyRevision;
-    std::uint64_t higgsClient, higgsExecutor; // provider-owned explicitly authorized route
+    std::uint64_t higgsClient, higgsExecutor; // public HIGGS owner label and delegated executor registration
 };
 struct ActionGrant {
+    // grantId correlates the slot request to the public HIGGS selection. Only
+    // HIGGS's executor callback provides the bearer used by mutation services.
     std::uint64_t epoch, requestId, grantId;
     std::uint64_t contextId, contextGeneration; // offerId, policyRevision echoed by HIGGS
     std::uint64_t inputSequence;

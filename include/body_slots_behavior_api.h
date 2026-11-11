@@ -28,7 +28,7 @@ struct SourceBehaviorSpec {
     void* context;
     SourceOfferCallback offers;
     SourceExecuteCallback execute;
-    std::uint64_t higgsClient,higgsExecutor;
+    std::uint64_t higgsClient,higgsExecutor; // public HIGGS owner label and executor registration
 };
 struct BehaviorApi {
     std::uint32_t structSize,version;

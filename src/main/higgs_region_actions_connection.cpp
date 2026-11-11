@@ -34,7 +34,10 @@ void ConnectHiggsRegionActions(void* handle) noexcept {
         const auto* messaging = SKSE::GetMessagingInterface();
         if (!messaging || !messaging->Dispatch(0xF9279A57, &phase, sizeof(phase), "HIGGS")) return;
         auto* phases = phase.getInterface ? static_cast<HiggsPluginAPI::IHiggsInterface001*>(phase.getInterface(1)) : nullptr;
-        if (!phases || detail::ConnectRegionActions(hands, routing, dispatch) != Status::Ok) return;
+        HIGGS_InputRoutesInterface routes{};
+        const auto queryRoutes = reinterpret_cast<HIGGS_QueryInputRoutesInterfaceFn>(GetProcAddress(module, "HIGGS_QueryInputRoutesInterface"));
+        const bool hasRoutes = queryRoutes && queryRoutes(1, sizeof(routes), &routes) == HIGGS_HAND_OK;
+        if (!phases || detail::ConnectRegionActions(hands, routing, dispatch, hasRoutes ? &routes : nullptr) != Status::Ok) return;
         phases->AddPostVrikPostHiggsCallback(&OnRegionActionsFrame);
         connected = true;
     } catch (...) {}

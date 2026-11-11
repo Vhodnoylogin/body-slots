@@ -2,6 +2,7 @@
 // Only native observations and consumer effects are scripted; no copied service.
 #include "main/region_actions.h"
 #include "main/interaction_regions.h"
+#include "main/owned_region_sources.h"
 #include "instances.h"
 #include "hand_broker.h"
 #include <array>
@@ -32,7 +33,8 @@ struct Provider {
     RegionActionRegistration registration{sizeof(registration),0,0,0,0};
     std::int32_t priority{};
     std::uint32_t resources=Left;
-    unsigned effects{},offers{},mode{};
+    unsigned effects{},offers{},mode{},terminals{};
+    RegionInputTerminal terminal{};
     bool enabled=true;
     RegionActionExecution execution{};
     std::mutex blockMutex;
@@ -53,9 +55,10 @@ struct Fixture {
     HIGGS_HandSnapshot snapshot{};
     unsigned fallback{},beforeMode{},invokeCalls{};
     HIGGS_HandStatus invokeStatus=999;
-    explicit Fixture(std::int32_t providerPriorityB=1,std::uint32_t edgeMask=1,bool sharedOwner=false) {
+    explicit Fixture(std::int32_t providerPriorityB=1,std::uint32_t edgeMask=1,bool sharedOwner=false,bool sequences=false,
+        RegionAnchorKind kind=RegionAnchorKind::World) {
         CHECK(DisconnectRegionActions()==Status::Ok);active=this;
-        hands.structSize=sizeof(hands);hands.abiVersion=1;
+        hands.structSize=sizeof(hands);hands.abiVersion=HIGGS_HAND_ABI_VERSION;
         hands.capabilities=HIGGS_HAND_CAP_SNAPSHOT|HIGGS_HAND_CAP_INPUT_BROKER|HIGGS_HAND_CAP_OWNED_GRANTS|HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
         hands.RegisterClient=+[](const HIGGS_HandClientInfo* i,std::uint64_t* o){return active->broker.Register(*i,*o);};
         hands.UnregisterClient=+[](std::uint64_t c){return active->broker.Unregister(c);};
@@ -66,12 +69,12 @@ struct Fixture {
         hands.SubmitCandidate=+[](std::uint64_t c,const HIGGS_ActionCandidate* v,std::uint64_t* o){
             active->submittedActions.push_back(v->actionId);return active->broker.Submit(c,*v,*o,HiggsHands::Now());};
         hands.CopyActionResult=+[](std::uint64_t c,std::uint64_t r,HIGGS_ActionResult* o){return active->broker.Result(c,r,*o);};
-        routing={sizeof(routing),1,1,
-            +[](std::uint64_t c,std::uint64_t e,std::uint64_t r,std::uint32_t h){return active->broker.Authorize(c,e,r,h);},
-            +[](std::uint64_t c,std::uint64_t e,std::uint64_t r){return active->broker.Revoke(c,e,r);},
+        routing={sizeof(routing),HIGGS_HAND_ROUTING_ABI_VERSION,1,
+            +[](std::uint64_t c,std::uint64_t e,std::uint64_t r,std::uint32_t h){return active->broker.Authorize(c,e,active->broker.ClientForLabel(r),h);},
+            +[](std::uint64_t c,std::uint64_t e,std::uint64_t r){return active->broker.Revoke(c,e,active->broker.ClientForLabel(r));},
             +[](std::uint64_t c,std::uint64_t e,std::uint32_t h){return active->broker.CanRoute(c,e,h);},
             +[](std::uint64_t c,std::uint64_t r,std::uint64_t e,std::uint32_t why){return active->broker.CancelRecognized(c,r,e,why);}};
-        dispatch={sizeof(dispatch),1,+[](std::uint64_t owner,const HIGGS_AuthorizedDispatchRequest* r,HIGGS_AuthorizedDispatchCallback cb,void* ctx){
+        dispatch={sizeof(dispatch),HIGGS_AUTHORIZED_DISPATCH_ABI_VERSION,+[](std::uint64_t owner,const HIGGS_AuthorizedDispatchRequest* r,HIGGS_AuthorizedDispatchCallback cb,void* ctx){
             auto& f=*active;++f.invokeCalls;auto* p=f.ProviderFor(r->executor);
             if(f.beforeMode==1){p->anchor.world.position[0]=100;f.Publish(*p);}
             if(f.beforeMode==2){++p->anchor.source.generation;f.Publish(*p);}
@@ -85,7 +88,15 @@ struct Fixture {
             if(f.beforeMode==10){f.observations[0].equippedFormId=0xfa;f.Frame(false);}
             f.invokeStatus=f.broker.InvokeAuthorized(owner,*r,cb,ctx);return f.invokeStatus;
         }};
-        CHECK(ConnectRegionActions(hands,routing,dispatch)==Status::Ok);
+        const HIGGS_InputRoutesInterface routes{sizeof(routes),1,sequences?HIGGS_ROUTE_TERMINALS:0u,nullptr,
+            +[](std::uint64_t c,std::uint64_t press,HIGGS_InputSequence* result){return active->broker.CopySequence(c,press,*result);},
+            +[](std::uint64_t c,std::uint64_t id,std::uint64_t epoch,std::uint32_t mask,std::uint64_t* corr) {
+                return active->broker.CheckSelectedAction(c,id,epoch,mask,*corr,HiggsHands::Now());
+            },
+            +[](std::uint64_t c,std::uint64_t* label)->HIGGS_HandStatus{
+                *label=active->broker.ClientLabel(c);return *label?HIGGS_HAND_OK:HIGGS_HAND_INVALID_CLIENT;
+            }};
+        CHECK(ConnectRegionActions(hands,routing,dispatch,&routes)==Status::Ok);
         for(auto& h:observations)h.observationMask=HIGGS_OBS_HELD_KNOWN|HIGGS_OBS_EQUIPMENT_KNOWN|HIGGS_OBS_PALM_VALID|HIGGS_OBS_TRACKING_VALID;
         broker.MarkMainThread();broker.ObserveWorld(1,false,HiggsHands::Now());Frame(false);
         for(unsigned i=0;i<2;++i) {
@@ -95,7 +106,7 @@ struct Fixture {
             HIGGS_HandClientInfo info{};info.structSize=sizeof(info);std::strcpy(info.name,name);info.userPriority=i?providerPriorityB:0;
             if(i && sharedOwner)p->client=providers[0]->client;
             else CHECK(broker.Register(info,p->client)==HIGGS_HAND_OK);
-            InteractionRegionSpec spec{};spec.structSize=sizeof(spec);spec.anchorKind=static_cast<std::uint32_t>(RegionAnchorKind::World);
+            InteractionRegionSpec spec{};spec.structSize=sizeof(spec);spec.anchorKind=static_cast<std::uint32_t>(kind);
             std::strcpy(spec.provider,name);std::strcpy(spec.key,"arbitrary-zone");spec.shape.structSize=sizeof(spec.shape);spec.shape.kind=1;spec.shape.radius=5;
             spec.maxSampleAgeSeconds=.1;spec.maxSampleSkewSeconds=.1;spec.maxContinuityGapSeconds=.1;
             CHECK(GetRegionsApi().UpsertRegion(p->writer,&spec,0,&p->region)==Status::Ok);
@@ -163,10 +174,12 @@ Fixture* Fixture::active=nullptr;
 void ArbitrationAndFallback() {
     Fixture f(0,1,true);auto& a=*f.providers[0];auto& b=*f.providers[1];
     CHECK(f.Input());CHECK(!f.Effects());CHECK(f.submittedActions.size()==2);CHECK(f.submittedActions[0]==b.region.regionId);
-    TickRegionActions();if(!b.effects)std::fprintf(stderr,"dispatch diagnostics: invokes=%u status=%u a=%u b=%u\n",f.invokeCalls,f.invokeStatus,a.effects,b.effects);
-    CHECK(b.effects==1 && a.effects==0);TickRegionActions();CHECK(f.Effects()==1);f.Settle(b);
-    CHECK(f.Input(false));TickRegionActions();CHECK(f.Effects()==1); // matching Up stays consumed, no second action
-    b.priority=-10;f.Frame();CHECK(f.Input());TickRegionActions();CHECK(a.effects==1);f.Settle(a);CHECK(f.Input(false));
+    // Equal provider priorities are resolved by HIGGS's stable action key.
+    // Changing local offer order cannot change the configured HIGGS winner.
+    TickRegionActions();CHECK(a.effects==1 && b.effects==0);
+    TickRegionActions();CHECK(f.Effects()==1);f.Settle(a);
+    CHECK(f.Input(false));TickRegionActions();CHECK(f.Effects()==1);
+    b.priority=-10;f.Frame();CHECK(f.Input());TickRegionActions();CHECK(a.effects==2);f.Settle(a);CHECK(f.Input(false));
     a.enabled=b.enabled=false;f.Frame();CHECK(!f.Input());TickRegionActions();CHECK(f.fallback==1);CHECK(f.Effects()==2);
     CHECK(!f.Input(false));CHECK(!f.Input(true,1));CHECK(f.Effects()==2);
 }
@@ -226,6 +239,8 @@ void ConsumerFailureAndDrain() {
 }
 void ScopeAndEvidence() {
     Fixture f;auto& b=*f.providers[1];RegionActionsIntegration i{sizeof(i),1};CHECK(f.api.CopyIntegration(b.writer,&i)==Status::Ok);CHECK(i.connected&&i.epoch);
+    CHECK(i.recognizerClient==b.registration.recognizerClient);
+    CHECK(f.broker.Unregister(i.recognizerClient)==HIGGS_HAND_INVALID_CLIENT);
     auto forged=b.anchor;forged.reserved=1;
     CHECK(f.api.PublishAnchor(b.writer,b.registration.bindingId,b.anchorRevision,&forged,&b.anchorRevision)==Status::InvalidArgument);
     f.providers[0]->enabled=false;CHECK(!f.Input());CHECK(!f.Effects());f.Input(false);f.Publish(b);
@@ -247,7 +262,7 @@ void DwellAndOrdering() {
 }
 void RequiredResourcesAndAge() {
     {Fixture f;auto& b=*f.providers[1];b.resources=Both;CHECK(f.Input());TickRegionActions();CHECK(b.effects==1);
-        CHECK(b.execution.request.physicalHands==Both);CHECK(b.execution.currentSnapshot.hands[1].grant==b.execution.request.grant);}
+        CHECK(b.execution.request.physicalHands==Both);CHECK(b.execution.currentSnapshot.hands[1].grant!=0 && b.execution.currentSnapshot.hands[1].grant!=b.execution.request.grant);}
     {Fixture f;f.providers[0]->enabled=false;f.providers[1]->resources=Both;
         f.observations[1].observationMask&=~HIGGS_OBS_PALM_VALID;f.Frame();CHECK(!f.Input());TickRegionActions();CHECK(!f.Effects());}
     {Fixture f;f.providers[0]->enabled=false;f.providers[1]->resources=Both;
@@ -266,7 +281,131 @@ void RequiredResourcesAndAge() {
     }
 }
 } // namespace
+void BS_CALL Ended(void* context, const RegionInputTerminal* terminal) {
+    auto& p = *static_cast<Provider*>(context);
+    ++p.terminals;
+    p.terminal = *terminal;
+}
+void ConsumedRelease() {
+    const auto& continuation = GetRegionContinuationApi();
+    {
+        Fixture legacy;
+        auto& b = *legacy.providers[1];
+        CHECK(continuation.Subscribe(b.writer, b.registration.bindingId, Ended) == Status::UnsupportedVersion);
+    }
+    {
+        Fixture f(1, 3, false, true);
+        auto& a = *f.providers[0];
+        auto& b = *f.providers[1];
+        CHECK(continuation.Subscribe(a.writer, b.registration.bindingId, Ended) == Status::Unauthorized);
+        CHECK(continuation.Subscribe(a.writer, a.registration.bindingId, Ended) == Status::Ok);
+        CHECK(continuation.Subscribe(b.writer, b.registration.bindingId, Ended) == Status::Ok);
+        CHECK(f.Input());
+        TickRegionActions();
+        CHECK(b.effects == 1 && !b.terminals);
+        f.Settle(b);
+        const auto press = b.execution.request.inputId;
+        const auto request = b.execution.request.requestId;
+        b.anchor.world.position[0] = 100;
+        f.Frame();
+        CHECK(f.Input(false));
+        TickRegionActions();
+        TickRegionActions();
+        CHECK(a.effects == 0 && a.terminals == 0 && b.effects == 1 && b.terminals == 1);
+        CHECK(b.terminal.end == static_cast<std::uint32_t>(RegionInputEnd::Released) &&
+              b.terminal.pressInput == press && b.terminal.request == request && b.terminal.terminalInput > press);
+        CHECK(b.terminal.correlation && b.terminal.correlation != b.execution.request.grant);
+    }
+    {
+        Fixture f(1, 1, false, true);
+        auto& b = *f.providers[1];
+        CHECK(continuation.Subscribe(b.writer, b.registration.bindingId, Ended) == Status::Ok);
+        CHECK(f.Input());
+        TickRegionActions();
+        CHECK(b.effects == 1);
+        CHECK(f.api.RemoveBinding(b.writer, b.registration.bindingId) == Status::Ok);
+        f.Input(false);
+        TickRegionActions();
+        CHECK(b.terminals == 0);
+    }
+}
+std::uint64_t ownedSample{};
+Status Sample(const OwnedRegionSource& source, RegionAnchorSnapshot& out) noexcept {
+    if (!ownedSample)
+        return Status::Unavailable;
+    out = {sizeof(out), static_cast<std::uint32_t>(RegionAnchorKind::Npc), 1, 0};
+    out.source = {"PLANCK",
+                  "actor-body",
+                  1,
+                  source.body.bodyGeneration,
+                  ownedSample,
+                  source.higgsEpoch,
+                  source.saveGeneration,
+                  ownedSample,
+                  double(HiggsHands::Now()) / 1e9,
+                  static_cast<std::uint32_t>(RegionUnits::SkyrimWorld),
+                  0};
+    out.world.scale = 1;
+    out.world.rotation[0] = out.world.rotation[4] = out.world.rotation[8] = 1;
+    return Status::Ok;
+}
+void SourceOwnership() {
+    Fixture f(1, 1, false, false, RegionAnchorKind::Npc);
+    auto& b = *f.providers[1];
+    const auto& sources = GetRegionSourcesApi();
+    const RegionPlanckBody target{sizeof(target), 5, 2, 0, 90, 8, 7};
+    CHECK(sources.BindPlanckBody(b.writer, b.registration.bindingId, &target) == Status::UnsupportedVersion);
+    SetOwnedPlanckReader(Sample);
+    CHECK(sources.BindPlanckBody(f.providers[0]->writer, b.registration.bindingId, &target) ==
+          Status::Unauthorized);
+    CHECK(sources.BindPlanckBody(b.writer, b.registration.bindingId, &target) == Status::Ok);
+    CHECK(f.api.PublishAnchor(b.writer, b.registration.bindingId, b.anchorRevision, &b.anchor, &b.anchorRevision) ==
+          Status::Conflict);
+    ownedSample = 1;
+    f.Frame(false);
+    RegionObservation observed{};
+    CHECK(f.api.CopyObservation(b.writer, b.registration.bindingId, Left, &observed) == Status::Ok);
+    CHECK(observed.state == static_cast<std::uint32_t>(RegionSpatialState::Ready) &&
+          !std::strcmp(observed.anchor.source.provider, "PLANCK"));
+    ownedSample = 0;
+    f.Frame(false);
+    CHECK(f.api.CopyObservation(b.writer, b.registration.bindingId, Left, &observed) == Status::Ok);
+    CHECK(observed.state == static_cast<std::uint32_t>(RegionSpatialState::Unavailable));
+    CHECK(sources.UnbindSource(b.writer, b.registration.bindingId) == Status::Ok);
+    CHECK(sources.UnbindSource(b.writer, b.registration.bindingId) == Status::NotFound);
+    SetOwnedPlanckReader(nullptr);
+}
+std::uint64_t digestAgeMs{};
+Status Digest(const PpbRegionQuery&, PpbRegionEvidence& result) noexcept {
+    result.ppbEpoch = 15;
+    result.ppbSequence = 17;
+    result.ppbAgeMs = digestAgeMs;
+    result.reported = 1;
+    return Status::Ok;
+}
+
+void AnatomicalEvidenceScope() {
+    Fixture f;
+    auto& b = *f.providers[1];
+    const auto& sources = GetRegionSourcesApi();
+    const PpbRegionQuery query{sizeof(query), 53, Left, 2, 0, 1};
+    PpbRegionEvidence result{sizeof(result)};
+    const auto read = [&] { return sources.CopyPpbDigestEvidence(b.writer,b.registration.bindingId,&query,&result); };
+    CHECK(read() == Status::UnsupportedVersion);
+    SetPpbDigestReader(Digest);
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    digestAgeMs = 0;
+    CHECK(read() == Status::Ok);
+    CHECK(result.reported && result.ppbEpoch == 15 && result.logicalEpoch == f.snapshot.epoch);
+    digestAgeMs = 500;
+    CHECK(read() == Status::Unavailable);
+    ResetRegionActions();
+    digestAgeMs = 0;
+    CHECK(read() == Status::Unavailable);
+    SetPpbDigestReader(nullptr);
+}
 int main(){try {
+    ConsumedRelease();SourceOwnership();AnatomicalEvidenceScope();
     ArbitrationAndFallback();ProviderPriorityAndUp();TargetRefreshAndHeld();CancelBeforeEffect();ConsumerFailureAndDrain();ScopeAndEvidence();DwellAndOrdering();RequiredResourcesAndAge();
     std::printf("Body Slots/HIGGS production region actions: %u checks passed; zero game starts\n",checks);return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}}

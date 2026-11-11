@@ -1,4 +1,5 @@
 #pragma once
+#include "higgsinputroutes.h"
 // Mod-author SDK helper. Only copied public Body Slots/HIGGS contracts.
 #include "body_slots_behavior_api.h"
 #include "body_slots_game_api.h"
@@ -19,6 +20,7 @@ struct InventoryProviderTables {
     const BehaviorApi* behaviors=nullptr;
     const GameApi* game=nullptr;
     HIGGS_HandInterface hands{};
+    HIGGS_InputRoutesInterface routes{};
     HIGGS_HandRoutingInterface routing{};
     HIGGS_InventoryInterface inventory{};
     HIGGS_TransactionsInterface transactions{};
@@ -81,6 +83,7 @@ private:
     Status Mirror(const Work&,CommitStage,const ContentProjection&,std::uint64_t);
     bool Finish(Work&,InventoryProviderProgress&,bool success);
     mutable std::mutex mutex_;
+    std::uint64_t executorLabel_{};
     InventoryProviderTables tables_;
     InventoryProviderConfig config_;
     std::uint64_t actionExecutor_=0,behavior_=0,recognizer_=0,nextOffer_=1;
