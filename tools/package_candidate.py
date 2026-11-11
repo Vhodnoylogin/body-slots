@@ -10,12 +10,14 @@ sys.dont_write_bytecode = True
 from package_draft import archive_bytes, digest, encoded
 
 ROOT = Path(__file__).resolve().parents[1]
-LABEL = "0.2.0-rc.1"
-PRODUCTION = "16c33f8b5f838a7802aa4c54d207715bbc83c4d7"
-HIGGS = "64b334f287e8c55d37ad8530a4f7c1ec1eb03cfa"
-PLANCK = "d824997163e9a458be95f76b4fcb010a42afd475"
-DLL = "09685e7270896dea315d66996937115b0b459f9bd5788228dd729ae4e1fe6980"
-MANIFEST = "4b549c7424c4f82d3232b5562ddc55a5f59a77687238f525380fab8f73043351"
+LABEL = "0.2.0-rc.2"
+PRODUCTION = "9e3273938725cb35edca04b9283dc9bd45363c5a"
+HIGGS_COMPACT = "d217eb6c23d996757eac3e8a7d5a32595892c29a"
+PLANCK_COMPACT = "a86a2eb5f7a06c7fbc9e423bedd5fc023c13ee8e"
+HIGGS_EXTENDED = "b388d2ea77a075168ddfc1940ecf066721fb4787"
+PLANCK_EXTENDED = "ab6291e949d1b00fcb3ebac8ce7d17d983445e1e"
+DLL = "47fdf24f21dbdff30b291064f61d0c961167155413b2ddc7ae818c2ae34518ae"
+MANIFEST = "ab4776997cec387d1c4e2b01833ce0cf424e7665e77cf98870d819333384e80e"
 DEPENDENCIES = {
     "commonlibsse": "c4ab853d095e81e3390b282d7ba01ab2f24ebf25",
     "fmt": "0c9fce2ffefecfdce794e1859584e25877b7b592",
@@ -25,7 +27,8 @@ DEPENDENCIES = {
 HIGGS_HEADERS = ("higgshandapi.h", "higgshandrouting.h", "higgsinventory.h", "higgstransactions.h")
 DOCS = ("configuration", "content-observation", "game-adapter", "higgs-native-regions", "instance-activation",
         "instance-configuration", "instances", "interaction-regions", "native-placement", "native-policy",
-        "ordinary-inventory-provider", "region-actions", "runtime", "runtime-extensions", "planck-region-anchor")
+        "ordinary-inventory-provider", "region-actions", "runtime", "runtime-extensions", "planck-region-anchor",
+        "grip-region-action", "planck-pose-region-anchor")
 
 
 def git(root, *args):
@@ -56,18 +59,21 @@ def main():
 
     candidate = git(ROOT, "rev-parse", "HEAD").decode().strip()
     # The DLL predates the packaging/SDK changes. Do not pair it with different runtime code.
-    if git(ROOT, "diff", "--name-only", PRODUCTION, candidate, "--", "src", "include", ":(exclude)src/test"):
+    if git(ROOT, "diff", "--name-only", PRODUCTION, candidate, "--", "src", "include", "CMakeLists.txt", ":(exclude)src/test"):
         raise ValueError("Candidate runtime sources or headers differ from the native build.")
     if git(ROOT, "status", "--porcelain", "--", "tools/package_candidate.py", "tools/package_draft.py"):
         raise ValueError("Commit the packaging recipe before preparing the archives.")
     source = lambda path: blob(ROOT, candidate, path)
-    native_manifest = json.loads(checked(args.native_build / "manifest.json", MANIFEST))
-    binary = checked(args.native_build / "native/Release/BodySlots.dll", DLL)
-    if native_manifest["dll"]["sha256"] != DLL or native_manifest["dll"]["bytes"] != len(binary):
-        raise ValueError("Frozen manifest and runtime binary disagree.")
+    verification = json.loads(checked(args.native_build / "compact-integration-verified.json", MANIFEST))
+    binary = checked(args.native_build / "body-slots-planck-anchor/cmake/Release/BodySlots.dll", DLL)
+    expected = dict(bodySlots=PRODUCTION, higgsReview=HIGGS_COMPACT, planckReview=PLANCK_COMPACT,
+                    higgsComplete=HIGGS_EXTENDED, planckComplete=PLANCK_EXTENDED,
+                    sha256=DLL, bytes=len(binary))
+    if any(verification.get(key) != value for key, value in expected.items()):
+        raise ValueError("Verified source revisions or native binary differ from this candidate.")
 
     notices = {"LICENSE.txt": source("LICENSE"),
-               "licenses/HIGGS-GPL-3.0.txt": blob(args.higgs_root, HIGGS, "LICENSE")}
+               "licenses/HIGGS-GPL-3.0.txt": blob(args.higgs_root, HIGGS_EXTENDED, "LICENSE")}
     for name, sha in DEPENDENCIES.items():
         notices[f"licenses/{name}.txt"] = blob(args.dependency_sources / (name + "-src"), sha, "LICENSE")
     notices["licenses/SKSE-common.txt"] = checked(args.skse_root / "common/common_license.txt",
@@ -76,23 +82,26 @@ def main():
     runtime = {runtime_dir + path: data for path, data in notices.items()}
     runtime["SKSE/Plugins/BodySlots.dll"] = binary
     runtime[runtime_dir + "README.txt"] = (
-        "Body Slots 0.2.0-rc.1 for Skyrim VR 1.4.15 and SKSE VR 2.0.12.\n"
+        f"Body Slots {LABEL} for Skyrim VR 1.4.15 and SKSE VR 2.0.12.\n"
         "Install the runtime archive with your mod manager in a development profile.\n"
         "This candidate supplies services for mod authors. A consumer supplies the slot content and interaction.\n"
-        "Interactive actions require the extended HIGGS provider. Player body-node placement requires VRIK.\n"
+        "Released HIGGS 001 provides updates for generic regions. One-shot grip actions need the proposed HIGGS grip API.\n"
+        "Inventory operations use the extended HIGGS provider. Player body-node placement uses VRIK.\n"
         "Consumer examples and their provider requirements are in the separate SDK archive.\n"
         "Offline verified. The game integration test is pending.\n"
         "Body Slots source: https://github.com/Vhodnoylogin/body-slots/tree/" + candidate + "\n"
         "See LICENSE.txt, licenses/ and PROVENANCE.json for components and source revisions.\n"
     ).encode()
     sdk = dict(notices)
-    sdk["licenses/PLANCK-GPL-3.0.txt"] = blob(args.planck_root, PLANCK, "LICENSE")
+    sdk["licenses/PLANCK-GPL-3.0.txt"] = blob(args.planck_root, PLANCK_EXTENDED, "LICENSE")
     sdk["README.md"] = source("docs/release-candidate.md")
     for path in git(ROOT, "ls-tree", "-r", "--name-only", candidate, "include").decode().splitlines():
         if path.endswith(".h"):
             sdk[path] = source(path)
     for name in ("observe_definitions.cpp", "ordinary_inventory_provider.cpp", "ordinary_inventory_provider.h",
-                 "planck_region_anchor.cpp", "planck_region_anchor.h", "potion-belt.json"):
+                 "planck_region_anchor.cpp", "planck_region_anchor.h", "planck_anchor_transform.h",
+                 "grip_region_action.cpp", "grip_region_action.h", "planck_pose_region_anchor.cpp",
+                 "planck_pose_region_anchor.h", "potion-belt.json"):
         sdk["examples/" + name] = source("examples/" + name)
     sdk["tools/author.py"] = source("tools/author.py")
     test_source = f"](https://github.com/Vhodnoylogin/body-slots/blob/{candidate}/src/test/".encode()
@@ -100,12 +109,15 @@ def main():
         path = f"docs/{doc}.md"
         sdk[path] = source(path).replace(b"](../src/test/", test_source)
     for name in HIGGS_HEADERS:
-        sdk["third_party/higgs/" + name] = blob(args.higgs_root, HIGGS, "include/" + name)
-    sdk["third_party/planck/planck_synergy.h"] = blob(args.planck_root, PLANCK, "include/planck_synergy.h")
+        sdk["third_party/higgs/" + name] = blob(args.higgs_root, HIGGS_EXTENDED, "include/" + name)
+    sdk["third_party/planck/planck_synergy.h"] = blob(args.planck_root, PLANCK_EXTENDED, "include/planck_synergy.h")
+    sdk["third_party/compact/higgs/higgsgripactions.h"] = blob(args.higgs_root, HIGGS_COMPACT, "include/higgsgripactions.h")
+    sdk["third_party/compact/planck/planck_actor_pose.h"] = blob(args.planck_root, PLANCK_COMPACT, "include/planck_actor_pose.h")
     common = dict(candidate=LABEL, packageSource=candidate, productionSource=PRODUCTION,
                   runtimeSha256=DLL, nativeBuildManifestSha256=MANIFEST, legacyPluginInfoVersion=3,
-                  nativeHiggsSource="cf1cf3ecddeaa5750b6e470eaf4972f2619344c2",
-                  sdkHiggsSource=HIGGS, sdkPlanckSource=PLANCK, buildDependencies=DEPENDENCIES,
+                  nativeHiggsSource=HIGGS_EXTENDED, sdkHiggsSource=HIGGS_EXTENDED, sdkPlanckSource=PLANCK_EXTENDED,
+                  sdkCompactHiggsSource=HIGGS_COMPACT, sdkCompactPlanckSource=PLANCK_COMPACT,
+                  buildDependencies=DEPENDENCIES,
                   qualification="Offline build and contract checks. In-game qualification pending.")
     artifacts = {}
     for kind, entries, location in (("runtime", runtime, runtime_dir), ("sdk", sdk, "")):
