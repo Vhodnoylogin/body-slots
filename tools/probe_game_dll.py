@@ -58,6 +58,17 @@ def main():
             table.contents.size, table.contents.version, table.contents.capabilities
         ) != (size, 1, capabilities):
             raise RuntimeError(f'{symbol} negotiation/layout differs')
+    for symbol, slots in (('BodySlots_QueryRegionSourcesInterface', 3), ('BodySlots_QueryRegionContinuationInterface', 1)):
+        extension = getattr(dll, symbol)
+        extension.argtypes = [C.c_uint32, C.c_uint32]
+        extension.restype = C.c_void_p
+        size = 8 + slots * C.sizeof(C.c_void_p)
+        address = extension(1, size)
+        if not address or extension(2, size) or extension(1, size - 1):
+            raise RuntimeError(f'{symbol} discovery failed')
+        methods = (C.c_void_p * slots).from_address(address + 8)
+        if not all(methods):
+            raise RuntimeError(f'{symbol} lacks a required method')
     query = dll.BodySlots_QueryGameInterface
     query.argtypes = [C.c_uint32, C.c_uint32]
     query.restype = C.POINTER(GameAPI)
