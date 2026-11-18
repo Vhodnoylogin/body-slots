@@ -29,7 +29,7 @@ def make_plan():
         add(name, "world.read", {"observation": "vr_interaction_framework.state"}, assertions, poll=True, **kwargs)
 
     def fixture_action(name, action, sequence, **values):
-        add(name, "object.perform", {"action": action, "actionSequence": sequence, **values}, role="fixture")
+        add(name, "object.perform", {"action": action, "actionSequence": sequence, **values}, role="fixture", timeout=5)
 
     def applied(sequence):
         # This scenario uses a fresh process and exactly seven accepted commands.
@@ -37,40 +37,42 @@ def make_plan():
         return [("processedCommand", "equals", sequence), (f"commandResults.{sequence-1}.id", "equals", sequence),
                 (f"commandResults.{sequence-1}.status", "equals", 0)]
 
-    def pose(name, x, grip, seconds):
+    def pose(name, x, grip, seconds, timeout=20):
         add(name, "controller.perform", {"action": "pose_and_grip", "hand": "right", "grip": grip,
             "durationSeconds": seconds, "trackingPosition": {"units": "metres", "xyz": [x, 0.3, -0.55]},
             "trackingOrientation": {"quaternionXYZW": [0, 0, 0, 1]},
             "otherHandPosition": {"units": "metres", "xyz": [-0.3, 0.3, -0.55]},
             "referenceHeadPosition": {"units": "metres", "xyz": [0, 0, 0]}},
-            [("inputIssued", "equals", True)], role="fixture")
+            [("inputIssued", "equals", True)], role="fixture", timeout=timeout)
 
     add("world fixture ready", "state.read", assertions=[("world.ready", "equals", True)], role="fixture", timeout=60, poll=True)
     state("public provider APIs connected", [("state", "equals", "ready"), ("frameworkConnected", "equals", 1),
         ("planckConnected", "equals", True), ("phaseRegistered", "equals", True),
-        ("integrationStatus", "equals", 0), ("snapshotStatus", "equals", 0), ("higgsWorldReady", "equals", True),
+        ("integrationStatus", "equals", 0), ("snapshotStatus", "equals", 0), ("higgsWorldReady", "equals", 1),
         ("epoch", "min", 1), ("saveGeneration", "min", 1), ("input.executed", "equals", 0),
         ("input.terminals", "equals", 0), ("highestCommand", "equals", 0)])
     pose("open right hand at reference pose", 0, "open", 0.3)
     fixture_action("arm fixed region from observed palm", "interaction-region.arm", 1, region="world-test", physicalHand=2)
     state("real palm enters the fixed region", applied(1) + [("world.observation.status", "equals", 0),
         ("world.observation.state", "min", 2), ("world.observation.anchorValid", "equals", 1),
-        ("world.observation.probeValid", "equals", 1), ("world.capturedPalmPose", "min", 1)])
-    pose("press grip inside the region", 0, "closed", 0.3)
+        ("world.observation.probeValid", "equals", 1), ("world.capturedPalmPose", "min", 1),
+        ("input.armed", "equals", True)], timeout=2)
+    pose("press grip inside the region", 0, "closed", 0.3, timeout=2)
     state("one authorized logical effect", [("input.executed", "equals", 1), ("input.reportedCompleted", "equals", 1),
         ("input.actualResultStage", "equals", 3), ("input.decisionConsumed", "equals", 1),
         ("input.lastPressInput", "min", 1), ("input.lastRequest", "min", 1),
-        ("input.reportFailures", "equals", 0), ("input.callbackOverflow", "equals", 0)])
-    pose("withdraw while maintaining the original grip", 1, "closed", 1.0)
+        ("input.reportFailures", "equals", 0), ("input.callbackOverflow", "equals", 0)], timeout=2)
+    pose("withdraw while maintaining the original grip", 0.65, "closed", 0.5, timeout=8)
     state("left region without a second action", [("world.observation.status", "equals", 0),
-        ("world.observation.state", "equals", 1), ("input.executed", "equals", 1), ("input.terminals", "equals", 0)])
+        ("world.observation.state", "equals", 1), ("input.executed", "equals", 1),
+        ("input.terminals", "equals", 0), ("input.armed", "equals", True)], timeout=2)
     add("release the original grip outside the region", "controller.perform",
-        {"action": "release_hand", "hand": "right", "settleSeconds": 0.5}, role="fixture")
+        {"action": "release_hand", "hand": "right", "settleSeconds": 0.5}, role="fixture", timeout=3)
     state("one matching terminal from the original press", [("input.executed", "equals", 1),
         ("input.terminals", "equals", 1), ("input.matchedReleases", "equals", 1),
         ("input.lastCorrelation", "min", 1), ("input.lastTerminalInput", "min", 1),
         ("input.mismatches", "equals", 0), ("input.cancelled", "equals", 0),
-        ("input.observationLost", "equals", 0), ("input.callbackOverflow", "equals", 0)])
+        ("input.observationLost", "equals", 0), ("input.callbackOverflow", "equals", 0)], timeout=2)
     fixture_action("set saved placement A", "interaction-placement.set", 2, position=[11, 22, 33])
     state("placement A committed by configuration API", applied(2) + [("customization.status", "equals", 0),
         ("customization.mask", "equals", 1), ("customization.position.0", "equals", 11),
