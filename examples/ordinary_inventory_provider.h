@@ -24,6 +24,10 @@ struct InventoryProviderTables {
     HIGGS_HandRoutingInterface routing{};
     HIGGS_InventoryInterface inventory{};
     HIGGS_TransactionsInterface transactions{};
+    const BehaviorApi2* behaviorOptions=nullptr;
+    const GameApi2* gameServices=nullptr;
+    HIGGS_HeldReleaseInterface releases{};
+    HIGGS_AuthorizedDispatchInterface dispatch{};
 };
 struct InventoryProviderConfig {
     std::uint64_t writer=0,instance=0,higgsClient=0;
@@ -34,9 +38,11 @@ struct InventoryProviderConfig {
     // Withdrawal always uses Down. Up storage requires a fresh, unconsumed
     // release; it cannot reuse the Up owned by an earlier consumed Down.
     std::uint32_t storeEdge=HIGGS_INPUT_DOWN;
+    bool storeOnHeldRelease=false; // semantic pre-drop intent, never ordinary Up
+    bool withdrawOnExit=false; // arm on Down, withdraw after the same held press exits
 };
 enum class InventoryProviderStage : std::uint32_t {
-    Detached,Ready,Queued,Selecting,Transferring,Reporting,Completed,Cancelled,RecoveryRequired
+    Detached,Ready,Queued,Selecting,Transferring,Reporting,Completed,Cancelled,RecoveryRequired,WaitingForExit
 };
 struct InventoryProviderProgress {
     InventoryProviderStage stage=InventoryProviderStage::Detached;
@@ -70,14 +76,19 @@ private:
         HIGGS_ActionRequest authority{};
         HIGGS_TransferRequest transferRequest{};
         std::uint64_t ticket=0,transfer=0;
+        std::uint64_t drawFrame=0,drawFrameAt=0,drawGeneration=0;
+        bool drawExited=false,releaseFollowed=false;
         bool cancel=false,mirror=false,completed=false;
     };
+    struct DrawDispatch { OrdinaryInventoryProvider* provider; Work* work; InventoryProviderProgress* progress; };
     static Status BS_CALL Offers(void*,const SourceActionContext*,SourceActionProposal*,std::uint32_t,std::uint32_t*);
     static Status BS_CALL Execute(void*,const SourceActionRequest*);
     static void HIGGS_HAND_CALL Selected(const HIGGS_ActionRequest*,void*);
+    static HIGGS_HandStatus HIGGS_HAND_CALL AdmitDraw(const HIGGS_ActionRequest*,const HIGGS_HandSnapshot*,void*);
     Status Offer(const SourceActionContext&,SourceActionProposal*,std::uint32_t,std::uint32_t*);
     Status Queue(const SourceActionRequest&);
     void Advance(Work&,InventoryProviderProgress&);
+    bool DrawReady(Work&,const HIGGS_HandSnapshot&,InventoryProviderProgress&);
     bool OriginalResult(const Work&,HIGGS_ActionResult&,InventoryProviderProgress&);
     bool ReportOriginal(const Work&,std::uint32_t,std::uint32_t,InventoryProviderProgress&);
     Status Mirror(const Work&,CommitStage,const ContentProjection&,std::uint64_t);

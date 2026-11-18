@@ -41,6 +41,8 @@ struct Callback {
     std::uint64_t id=0, owner=0;
     BehaviorSpec behavior{}; RuntimeEventCallback event=nullptr; void* context=nullptr;
     SourceOfferCallback offers2=nullptr;SourceExecuteCallback execute2=nullptr;
+    std::uint32_t grantDurationMs=2000;
+    std::uint32_t inputFlags=0;
 };
 thread_local std::vector<const Callback*> callbackStack;
 class CallLease {
@@ -200,13 +202,13 @@ Status BS_CALL SetBinding(std::uint64_t writer,std::uint64_t handle,const Runtim
         if(!spec)return Status::InvalidArgument;auto status=SetSavedRuntimeCustomization(writer,handle,spec,nullptr);if(status!=Status::Ok)return status;return SyncConfiguration();
     });
 }
-Status RegisterBehaviorRecord(std::uint64_t writer,const BehaviorSpec* spec,std::uint64_t* registration,SourceOfferCallback offers2=nullptr,SourceExecuteCallback execute2=nullptr) noexcept {
+Status RegisterBehaviorRecord(std::uint64_t writer,const BehaviorSpec* spec,std::uint64_t* registration,SourceOfferCallback offers2=nullptr,SourceExecuteCallback execute2=nullptr,std::uint32_t grantDurationMs=2000,std::uint32_t inputFlags=0) noexcept {
     return GuardRuntime([&] {
         SetRuntimeReleaseHook(DrainRuntimeClient);
         if(!spec||!registration||spec->structSize!=sizeof(*spec)||spec->reserved||(!offers2&&(!spec->offers||!spec->execute))||(offers2&&!execute2)||!spec->higgsClient||!spec->higgsExecutor)return Status::InvalidArgument;
         auto status=RuntimeOwnsInstance(writer,spec->instanceHandle);if(status!=Status::Ok)return status;
         status=SyncConfiguration();if(status!=Status::Ok)return status;
-        auto callback=std::make_shared<Callback>();callback->owner=writer;callback->behavior=*spec;callback->offers2=offers2;callback->execute2=execute2;
+        auto callback=std::make_shared<Callback>();callback->owner=writer;callback->behavior=*spec;callback->offers2=offers2;callback->execute2=execute2;callback->grantDurationMs=grantDurationMs;callback->inputFlags=inputFlags;
         auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
         if(!Own(writer,spec->instanceHandle))return Status::Unauthorized;
         SweepRetired(s);if(s.behaviors.size()+s.retired.size()>=kMaxBehaviors)return Status::LimitExceeded;
@@ -219,6 +221,13 @@ Status BS_CALL RegisterBehavior(std::uint64_t writer,const BehaviorSpec* spec,st
 Status BS_CALL RegisterSourceBehavior(std::uint64_t writer,const SourceBehaviorSpec* source,std::uint64_t* registration) noexcept {
     if(!source||source->structSize!=sizeof(*source)||source->reserved||!source->offers||!source->execute)return Status::InvalidArgument;
     BehaviorSpec base{sizeof(BehaviorSpec),0,source->instanceHandle,source->context,nullptr,nullptr,source->higgsClient,source->higgsExecutor};return RegisterBehaviorRecord(writer,&base,registration,source->offers,source->execute);
+}
+Status BS_CALL RegisterSourceBehaviorWithOptions(std::uint64_t writer,const SourceBehaviorSpec* source,const SourceBehaviorOptions* options,std::uint64_t* registration) noexcept {
+    if(!source||source->structSize!=sizeof(*source)||source->reserved||!source->offers||!source->execute||
+       !options||options->structSize!=sizeof(*options)||!options->grantDurationMs||options->grantDurationMs>60000||
+       options->reserved||(options->inputFlags&~(kBehaviorHeldReleaseInput|kBehaviorDeferredExit)))return Status::InvalidArgument;
+    BehaviorSpec base{sizeof(BehaviorSpec),0,source->instanceHandle,source->context,nullptr,nullptr,source->higgsClient,source->higgsExecutor};
+    return RegisterBehaviorRecord(writer,&base,registration,source->offers,source->execute,options->grantDurationMs,options->inputFlags);
 }
 Status RemoveCallback(std::uint64_t owner,std::uint64_t id,bool behavior) {
     if(!callbackStack.empty())return Status::Conflict;
@@ -370,6 +379,29 @@ Status BS_CALL CopyEligibility(std::uint64_t reader,std::uint64_t handle,std::ui
 }
 const ContentPolicyApi contentPolicyApi{sizeof(ContentPolicyApi),kContentPolicyApiVersion,3,SetContentPolicy,ClearContentPolicy,CopySavedContentPolicies,CopyEligibility};
 const BehaviorApi behaviorApi{sizeof(BehaviorApi),kBehaviorApiVersion,1,RegisterSourceBehavior};
+Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,RuntimeRecord* output) noexcept {
+    return GuardRuntime([&]{
+        if(!output||!requestId)return Status::InvalidArgument;
+        const auto client=RuntimeClientIdentity(writer,true,nullptr);if(client!=Status::Ok)return client;
+        const auto synced=SyncConfiguration();if(synced!=Status::Ok)return synced;
+        auto& s=Runtime();std::lock_guard lock(s.mutex);
+        for(const auto& p:s.pending)if(p.request.requestId==requestId){
+            if(p.owner!=writer)return Status::Unauthorized;
+            const auto& original=p.request.offer.context.slot;
+            if(p.stage!=CommitStage::Accepted||p.committed||p.handCommitted||p.authoritySettled||
+               p.request.grant.epoch!=s.epoch||p.request.offer.policyRevision!=s.policy)return Status::Conflict;
+            const auto hand=p.request.grant.physicalHand;
+            if(!HandValid(hand)||!s.hands[hand==Left?0:1].valid||!s.hands[hand==Left?0:1].sampleId)return Status::Conflict;
+            bool behavior=false;for(const auto& c:s.behaviors)if(c->id==p.request.offer.behavior&&c->owner==writer)behavior=true;
+            const auto* row=Find(s,original.configured.instance.instanceHandle);
+            if(!behavior||!row||row->availability||row->bodyGeneration!=original.bodyGeneration||
+               row->anchorGeneration!=original.anchorGeneration||row->contentVersion!=original.contentVersion)return Status::Conflict;
+            *output=*row;return Status::Ok;
+        }
+        return Status::NotFound;
+    });
+}
+const BehaviorApi2 behaviorApi2{{sizeof(BehaviorApi2),2,7,RegisterSourceBehavior},RegisterSourceBehaviorWithOptions,CopyDeferredSource};
 } // namespace
 
 bool ComposeSlotTransform(const Definition& d,const RuntimeTransform& anchor,RuntimeTransform& out,float center[3],float& radius) noexcept {
@@ -438,7 +470,7 @@ Status CollectOffers(const RuntimeInput& input,ActionOffer* output,std::uint32_t
         {auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
             if(input.epoch!=s.epoch||input.frame!=s.frame||s.hands[input.physicalHand==Left?0:1].sampleId!=input.poseSample)return Status::Conflict;
             if(!input.available){*count=0;return Status::Ok;}policy=s.policy;
-            for(const auto& c:s.behaviors){auto* row=Find(s,c->behavior.instanceHandle);if(!row||row->availability||!(row->insideHands&input.physicalHand)||!(row->configured.instance.effective.handMask&input.physicalHand)||(!c->offers2&&input.contentCategory&&!(row->configured.instance.effective.contentMask&input.contentCategory)))continue;
+            for(const auto& c:s.behaviors){if(input.edge==3&&!(c->inputFlags&kBehaviorHeldReleaseInput))continue;auto* row=Find(s,c->behavior.instanceHandle);if(!row||row->availability||!(row->insideHands&input.physicalHand)||!(row->configured.instance.effective.handMask&input.physicalHand)||(!c->offers2&&input.contentCategory&&!(row->configured.instance.effective.contentMask&input.contentCategory)))continue;
                 if(!c->offers2&&!LegacyPolicyAllows(s,c->behavior.instanceHandle,input))continue;
                 bool reserved=s.dragSlot==c->behavior.instanceHandle;for(const auto& p:s.pending)if(Reserved(p)&&p.request.offer.context.slot.configured.instance.instanceHandle==c->behavior.instanceHandle)reserved=true;
                 if(!reserved){SourceActionContext context{{*row,input},{IncomingItem(s,c->behavior.instanceHandle,input,1),IncomingItem(s,c->behavior.instanceHandle,input,2)}};work.push_back({c,context});}
@@ -475,13 +507,16 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
             auto cached=std::find_if(s.offers.begin(),s.offers.end(),[&](const ActionOffer& o){return o.offerId==offer.offerId;});
             if(cached==s.offers.end()||std::memcmp(&*cached,&offer,sizeof(offer)))return Status::Conflict;
             if(grant.epoch!=s.epoch||grant.epoch!=offer.context.input.epoch||grant.contextId!=offer.offerId||grant.contextGeneration!=s.policy||offer.policyRevision!=s.policy||grant.inputSequence!=offer.context.input.inputSequence||grant.physicalHand!=offer.context.input.physicalHand)return Status::Conflict;
+            for(const auto& c:s.behaviors)if(c->id==offer.behavior)callback=c;
+            if(!callback)return Status::NotFound;
+            const auto& input=offer.context.input;
+            const bool deferredExit=(callback->inputFlags&kBehaviorDeferredExit)&&input.edge==1&&
+                !input.heldRefId&&!input.equippedFormId&&input.handOccupancy==0;
             auto* row=Find(s,offer.context.slot.configured.instance.instanceHandle);
-            if(!row||row->availability||!(row->insideHands&grant.physicalHand)||row->bodyGeneration!=offer.context.slot.bodyGeneration||row->anchorGeneration!=offer.context.slot.anchorGeneration||row->contentVersion!=offer.context.slot.contentVersion)return Status::Conflict;
+            if(!row||row->availability||(!(row->insideHands&grant.physicalHand)&&!deferredExit)||row->bodyGeneration!=offer.context.slot.bodyGeneration||row->anchorGeneration!=offer.context.slot.anchorGeneration||row->contentVersion!=offer.context.slot.contentVersion)return Status::Conflict;
             for(const auto& used:s.used)if(used.epoch==grant.epoch&&used.sequence==grant.inputSequence&&used.hand==grant.physicalHand)return Status::Conflict;
             if(s.dragSlot==row->configured.instance.instanceHandle)return Status::Conflict;
             for(const auto& p:s.pending)if(Reserved(p)&&p.request.offer.context.slot.configured.instance.instanceHandle==row->configured.instance.instanceHandle)return Status::Conflict;
-            for(const auto& c:s.behaviors)if(c->id==offer.behavior)callback=c;
-            if(!callback)return Status::NotFound;
             for(const auto& source:s.offerSources)if(source.offerId==offer.offerId)incoming=source.incoming;
             if(s.pending.size()==kMaxPendingActions){auto old=std::find_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return !Reserved(p);});if(old==s.pending.end())return Status::LimitExceeded;s.pending.erase(old);}
             request={offer,grant,Allocate(s)};if(!request.requestId)return Status::LimitExceeded;
@@ -572,6 +607,12 @@ const RuntimeApi& GetRuntimeApi() noexcept {return api;}
 const ZoneApi& GetZoneApi() noexcept {return zoneApi;}
 const ContentPolicyApi& GetContentPolicyApi() noexcept{return contentPolicyApi;}
 const BehaviorApi& GetBehaviorApi() noexcept{return behaviorApi;}
+const BehaviorApi2& GetBehaviorApi2() noexcept{return behaviorApi2;}
+std::uint32_t BehaviorGrantDuration(const ActionOffer& offer) noexcept {
+    try{auto& s=Runtime();std::lock_guard lock(s.mutex);if(offer.policyRevision!=s.policy)return 0;
+        for(const auto& c:s.behaviors)if(c->id==offer.behavior)return c->grantDurationMs;
+    }catch(...){}return 0;
+}
 const ContentObservationApi& GetContentObservationApi() noexcept {
     static const ContentObservationApi table{sizeof(ContentObservationApi),kContentObservationApiVersion,1,
                                               PublishContentObservation};
@@ -592,6 +633,7 @@ extern "C" __declspec(dllexport) const body_slots::ContentPolicyApi* BS_CALL Bod
     return version==body_slots::kContentPolicyApiVersion&&size==sizeof(body_slots::ContentPolicyApi)?&body_slots::detail::GetContentPolicyApi():nullptr;
 }
 extern "C" __declspec(dllexport) const body_slots::BehaviorApi* BS_CALL BodySlots_QueryBehaviorInterface(std::uint32_t version,std::uint32_t size) noexcept {
+    if(version==2&&size==sizeof(body_slots::BehaviorApi2))return &body_slots::detail::GetBehaviorApi2().base;
     return version==body_slots::kBehaviorApiVersion&&size==sizeof(body_slots::BehaviorApi)?&body_slots::detail::GetBehaviorApi():nullptr;
 }
 extern "C" __declspec(dllexport) const body_slots::ContentObservationApi* BS_CALL BodySlots_QueryContentObservationInterface(std::uint32_t version,std::uint32_t size) noexcept {

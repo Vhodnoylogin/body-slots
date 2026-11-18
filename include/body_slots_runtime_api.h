@@ -50,7 +50,7 @@ struct RuntimeView {
 // The internal adapter supplies availability from HIGGS. No local hand classifier.
 struct RuntimeInput {
     std::uint32_t structSize, physicalHand, contentCategory, available; // category0: no incoming item; withdrawal may still be offered
-    std::uint32_t button, edge; // HIGGS button/edge numeric values, opaque to this core
+    std::uint32_t button, edge; // HIGGS button/edge numeric values; edge3 is a semantic held release, never hardware Up
     std::uint32_t handOccupancy, handObservationMask, heldRefId, equippedFormId;
     std::uint64_t epoch, frame, inputSequence, poseSample, itemIdentity;
     std::uint64_t handStateRevision; // HIGGS observation revision, opaque to this service

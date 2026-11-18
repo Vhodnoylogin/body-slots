@@ -18,6 +18,8 @@ The additive [content-observation API](docs/content-observation.md) lets an inst
 
 The optional [ordinary inventory provider SDK helper](docs/ordinary-inventory-provider.md) composes those public slot contracts with HIGGS's shared native inventory executor. A consumer supplies selection/acceptance policy and content projection; it reuses asynchronous selection, transactions and actual grip/release receipts without implementing its own pickup or inventory mutation machinery.
 
+The current source adds opt-in pre-drop storage and deferred pull-out withdrawal for consumers such as Body Pouches2. HIGGS supplies a separate held-release intent and factual inventory-grip continuation; Framework owns spatial eligibility and deferred-source validation. Old behavior/game tables remain exact. These additions have not been tested or qualified in game.
+
 Build the native adapter with `python tools/build_game.py --sdk-root <public-SKSE-source> --higgs-root <synergy-HIGGS-checkout> --output <external-directory>`. `tools/build.py` remains the headless foundation/SDK fixture. See the adapter page for dependency pins, provider registration, phases and remaining limits.
 
 The historical [0.1.0 Nexus draft packaging](docs/release-draft.md) separates the unchanged runtime DLL from a mod-author SDK/example archive. Its label `0.1.0-alpha.1` does not change the existing plugin/ABI versions. VR Interaction Framework code, SDK and examples are available under the [MIT License](LICENSE). Third-party dependencies and assets retain their respective licenses.

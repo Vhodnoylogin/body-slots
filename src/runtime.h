@@ -27,6 +27,8 @@ Status UpdateRuntime(const RuntimeFrame&) noexcept;
 Status CollectOffers(const RuntimeInput&, ActionOffer*, std::uint32_t capacity, std::uint32_t* count) noexcept;
 bool RevalidateOfferContent(const ActionOffer&,std::uint64_t currentHandObservationId) noexcept;
 const BehaviorApi& GetBehaviorApi() noexcept;
+const BehaviorApi2& GetBehaviorApi2() noexcept;
+std::uint32_t BehaviorGrantDuration(const ActionOffer&) noexcept;
 const ContentObservationApi& GetContentObservationApi() noexcept;
 Status DispatchSelected(const ActionOffer&, const ActionGrant&, std::uint64_t* requestId) noexcept;
 Status CopyActionProgress(ActionProgress*, std::uint32_t capacity, std::uint32_t* count) noexcept;

@@ -81,6 +81,11 @@ public:
         *out = {sizeof(*out), kGameApiVersion, connected_ ? 1u : 0u, 0, recognizerLabel_, cache_.epoch, cache_.frame, bodyGeneration_};
         return Status::Ok;
     }
+    Status CopyInputServices(std::uint64_t* out) {
+        if(!out)return Status::InvalidArgument;
+        std::lock_guard lock(mutex_);*out=connected_&&releaseRecognizer_?kGameHeldReleaseInput:0;
+        return Status::Ok;
+    }
 private:
     static void OnFrame() noexcept;
     static void OnStandaloneFrame() noexcept;
@@ -108,6 +113,7 @@ private:
     void UpdateDrag(const HIGGS_HandSnapshot&,const detail::RuntimeFrame&,const RuntimeTransform handWorld[2],const RuntimeView&);
     void CancelDrag();
     void UpdatePolicies(const HIGGS_HandSnapshot&);
+    void ConnectReleaseInput();
     std::mutex mutex_;
     HIGGS_HandInterface api_{};
     HIGGS_InputRoutesInterface routes_{};
@@ -117,6 +123,9 @@ private:
     HIGGS_HandClient client_{};
     std::uint64_t recognizerLabel_{};
     HIGGS_HandRegistration recognizer_{};
+    HIGGS_HandRegistration releaseRecognizer_{};
+    HIGGS_HeldReleaseInterface releases_{};
+    HIGGS_SharedHandUseProposalsInterface rounds_{};
     HIGGS_HandExecutor dragExecutor_{};
     bool connected_{}, resetRequested_{}, standaloneConnected_{};
     detail::StandaloneRegionScope standaloneScope_;
@@ -281,9 +290,21 @@ void Adapter::Connect() {
         if (reader) RegistryApi()->ReleaseClient(reader);
         api.UnregisterClient(client); return;
     }
+    // Optional semantic pre-drop input uses HIGGS's existing shared admission
+    // and the same provider routing. It is distinct from the hardware Up.
+    const auto queryRelease=reinterpret_cast<HIGGS_QueryHeldReleaseInterfaceFn>(GetProcAddress(module,"HIGGS_QueryHeldReleaseInterface"));
+    const auto queryRounds=reinterpret_cast<HIGGS_QueryHandUseProposalsInterfaceFn>(GetProcAddress(module,"HIGGS_QueryHandUseProposalsInterface"));
+    HIGGS_HeldReleaseInterface releases{};
+    HIGGS_SharedHandUseProposalsInterface rounds{};
+    if(!queryRelease||queryRelease(HIGGS_HELD_RELEASE_ABI_VERSION,sizeof(releases),&releases)!=HIGGS_HAND_OK||
+       releases.structSize!=sizeof(releases)||releases.abiVersion!=HIGGS_HELD_RELEASE_ABI_VERSION||
+       !(releases.capabilities&1)||!releases.SubscribeRecognizer||!queryRounds||
+       queryRounds(2,sizeof(rounds),&rounds.proposals)!=HIGGS_HAND_OK||rounds.proposals.structSize!=sizeof(rounds)||
+       rounds.proposals.abiVersion!=2||!(rounds.proposals.capabilities&HIGGS_HAND_USE_PROPOSALS_CAP_SHARED_WINDOWS)||
+       !rounds.EnableSharedRounds){releases={};rounds={};}
     phases->AddPostVrikPostHiggsCallback(&OnFrame);
     std::lock_guard lock(mutex_);
-    api_ = api; routes_=routes; routing_ = routing; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
+    api_ = api; routes_=routes; routing_ = routing; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;releases_=releases;rounds_=rounds;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
     detail::SetContentCommitValidator(&ValidateContentCommit);
 }
 void Adapter::OnStandaloneFrame() noexcept {
@@ -294,6 +315,16 @@ void Adapter::OnStandaloneFrame() noexcept {
         std::lock_guard lock(adapter.mutex_);
         adapter.standaloneScope_.Observe({});
         detail::InvalidateInteractionRegions();
+    }
+}
+void Adapter::ConnectReleaseInput(){
+    {std::lock_guard lock(mutex_);if(releaseRecognizer_||!releases_.SubscribeRecognizer||!rounds_.EnableSharedRounds)return;}
+    // Enabling a shared client requires released controls. A held startup grip
+    // postpones the optional service instead of permanently disabling it.
+    if(rounds_.EnableSharedRounds(client_)!=HIGGS_HAND_OK)return;
+    HIGGS_HandRegistration registration{};
+    if(releases_.SubscribeRecognizer(client_,&OnInput,this,&registration)==HIGGS_HAND_OK){
+        std::lock_guard lock(mutex_);releaseRecognizer_=registration;
     }
 }
 void Adapter::TickStandalone() {
@@ -358,7 +389,7 @@ void Adapter::Input(const HIGGS_HandInput& input) {
     if (!cached.frame || cached.epoch != input.epoch || cached.observation != input.snapshot.observationId ||
         now < cached.sampledAt || now - cached.sampledAt > 100000000) return;
     const auto& hand = input.snapshot.hands[handIndex];
-    if(OfferDrag(input))return;
+    if(input.edge!=HIGGS_INPUT_HELD_RELEASE&&OfferDrag(input))return;
     RuntimeInput observation{}; observation.structSize = sizeof(observation);
     observation.physicalHand = input.physicalHand; observation.button = input.button; observation.edge = input.edge;
     observation.contentCategory = cached.categories[handIndex];
@@ -376,7 +407,9 @@ void Adapter::Input(const HIGGS_HandInput& input) {
         candidate.physicalHands = offer.proposal.requiredResources ? offer.proposal.requiredResources : input.physicalHand;
         candidate.inputId = input.inputId; candidate.epoch = input.epoch; candidate.handGeneration = input.handGeneration;
         candidate.executor = offer.higgsExecutor; candidate.actionId = offer.proposal.executorAction;
-        candidate.contextId = offer.offerId; candidate.contextGeneration = offer.policyRevision; candidate.grantDurationMs = 2000;
+        candidate.contextId = offer.offerId; candidate.contextGeneration = offer.policyRevision;
+        candidate.grantDurationMs = detail::BehaviorGrantDuration(offer);
+        if(!candidate.grantDurationMs)continue;
         if (routing_.CanRoute(client_, candidate.executor, candidate.physicalHands) != HIGGS_HAND_OK) continue;
         HIGGS_HandRequestId request{};
         std::lock_guard lock(mutex_);
@@ -573,6 +606,7 @@ void Adapter::Present(const RuntimeRecord& record, RE::NiNode* parent) {
 void Adapter::Tick() {
     bool reset{};
     { std::lock_guard lock(mutex_); if (!connected_) return; reset = resetRequested_; resetRequested_ = false; }
+    ConnectReleaseInput();
     const auto inputContext=inputContext_.load(std::memory_order_acquire);
     if(inputContext!=handledInputContext_){
         // UI open+close between main frames still invalidates old offers/drag.
@@ -665,6 +699,9 @@ void Adapter::Tick() {
 Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
     try { return State().CopyIntegration(output); } catch (...) { return Status::InternalError; }
 }
+Status BS_CALL CopyInputServices(std::uint64_t* output) noexcept {
+    try{return State().CopyInputServices(output);}catch(...){return Status::InternalError;}
+}
 }
 void Initialize(const void* skse) noexcept { try { State().Initialize(skse); } catch (...) {} }
 void Connect() noexcept { try { State().Connect(); } catch (...) {} }
@@ -677,5 +714,7 @@ const Api* RegistryApi() noexcept { return BodySlots_QueryInterface(kApiVersion,
 }
 extern "C" __declspec(dllexport) const body_slots::GameApi* BS_CALL BodySlots_QueryGameInterface(std::uint32_t version, std::uint32_t size) noexcept {
     static const body_slots::GameApi table{sizeof(table), body_slots::kGameApiVersion, &body_slots::game::CopyIntegration};
+    static const body_slots::GameApi2 table2{{sizeof(table2),2,&body_slots::game::CopyIntegration},&body_slots::game::CopyInputServices};
+    if(version==2&&size==sizeof(table2))return &table2.base;
     return version == table.version && size == sizeof(table) ? &table : nullptr;
 }
