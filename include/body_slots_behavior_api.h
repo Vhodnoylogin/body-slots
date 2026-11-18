@@ -58,7 +58,8 @@ struct SourceBehaviorOptions2 {
     // InventoryReceiptsOnly: content changes require positive HIGGS inventory
     // evidence through the shared HIGGS executor. A physical release alone never
     // represents content commitment. Failed/Cancelled reports need positive
-    // closed nonmutation or confirmed compensation; absence of a flag is not proof.
+    // closed nonmutation or aggregate restoration evidence; a generic COMPENSATED
+    // flag or absence of an inventory flag alone is not proof.
     std::uint32_t contentContract;
     // SemanticAction uses proposal.action for HIGGS priority/stable identity,
     // leaving executorAction as an opaque per-offer executor correlation.
