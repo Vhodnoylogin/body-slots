@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Body Slots with installed x64 Visual Studio tools; no CMake/downloads."""
+"""Build VR Interaction Framework with installed x64 Visual Studio tools; no CMake/downloads."""
 import argparse
 import hashlib
 import json
@@ -53,7 +53,7 @@ def main():
     compiler = shutil.which("cl.exe", path=env.get("Path", env.get("PATH")))
     if not compiler:
         raise RuntimeError("x64 compiler not found after environment setup")
-    log.write_text("Body Slots standalone authored definitions and saved configuration build\n", encoding="utf-8")
+    log.write_text("VR Interaction Framework standalone authored definitions and saved configuration build\n", encoding="utf-8")
     commands = []
     activation_results = []
     source_paths = list((ROOT / "src").rglob("*.cpp")) + list((ROOT / "src").rglob("*.h")) + list((ROOT / "include").glob("*.h"))

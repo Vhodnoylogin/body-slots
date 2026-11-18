@@ -172,9 +172,11 @@ bool ObserveFresh(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned 
 bool Ready(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned hand) {
     return ObserveFresh(s,b,snap,hand) && b.observations[hand-1].state==static_cast<std::uint32_t>(RegionSpatialState::Ready);
 }
+void RefreshOwnedSource(Service&,Binding&,const HIGGS_HandSnapshot&);
 bool ReadDwell(void* cookie,const HIGGS_HandSnapshot& snapshot,DwellEvidence& evidence) {
     auto& b=*static_cast<Binding*>(cookie);
-    auto& s=State();std::lock_guard lock(s.mutex);
+    auto& s=State();RefreshOwnedSource(s,b,snapshot);
+    std::lock_guard lock(s.mutex);
     if(!b.dwell || !snapshot.worldReady || b.sourceRevision==0 || !ObserveFresh(s,b,snapshot,b.activationHand))return false;
     auto& out=evidence.context;
     out.structSize=sizeof(out);out.binding=b.id;out.actionKey=b.dwellKey;out.activationHand=b.activationHand;
@@ -298,6 +300,7 @@ HIGGS_HandStatus HIGGS_HAND_CALL ExecuteAuthorized(const HIGGS_ActionRequest* re
     try {
         if(!request || !snapshot || !context)return HIGGS_HAND_INVALID_ARGUMENT;
         auto& c=*static_cast<Candidate*>(context);auto& s=State();auto b=c.binding;
+        RefreshOwnedSource(s,*b,*snapshot);
         RegionActionExecution execution{};
         {
             std::lock_guard lock(s.mutex);
@@ -554,6 +557,38 @@ Status BS_CALL CopyPpbEvidence(std::uint64_t writer, std::uint64_t id, const Ppb
 }
 const RegionSourcesApi sourcesApi{sizeof(sourcesApi),1,BindPlanck,Unbind,CopyPpbEvidence};
 
+void RefreshSource(Service& s,Binding& b,const std::shared_ptr<const OwnedRegionSource>& source,
+                   ReadOwnedAnchor read,const HIGGS_HandSnapshot& snapshot) {
+    // Provider copies never run under the region service mutex. A later final
+    // check still names this exact binding/source lifetime, not a recycled body.
+    RegionAnchorSnapshot anchor{};
+    const bool same=source->higgsEpoch==snapshot.epoch && source->saveGeneration==CurrentSaveGeneration();
+    const bool available=same && read && read(*source,anchor)==Status::Ok;
+    std::lock_guard lock(s.mutex);
+    if(!b.active || b.source!=source)return;
+    const double now=double(Now())/1e9;
+    if(!available || s.readPlanck!=read || !ValidAnchor(anchor,b,s) || anchor.source.timeSeconds>now ||
+       now-anchor.source.timeSeconds>b.region.spec.maxSampleAgeSeconds || s.epoch<=s.barredEpoch ||
+       source->saveGeneration!=CurrentSaveGeneration()) {
+        b.InvalidateAnchor();return;
+    }
+    const auto& old=b.anchor.source;const auto& next=anchor.source;
+    if(old.sampleId==next.sampleId && old.frame==next.frame && old.timeSeconds==next.timeSeconds)return;
+    if(!AdvancesSample(old,next) || next.timeSeconds<old.timeSeconds || b.anchorRevision==kMax) {
+        b.InvalidateAnchor();return;
+    }
+    b.SetAnchor(anchor);
+}
+void RefreshOwnedSource(Service& s,Binding& b,const HIGGS_HandSnapshot& snapshot) {
+    std::shared_ptr<const OwnedRegionSource> source;
+    ReadOwnedAnchor read{};
+    {
+        std::lock_guard lock(s.mutex);
+        if(!b.active)return;
+        source=b.source;read=s.readPlanck;
+    }
+    if(source)RefreshSource(s,b,source,read,snapshot);
+}
 void RefreshSources(Service& s, const HIGGS_HandSnapshot& snapshot) {
     std::shared_ptr<const Service::Sources> sources;
     ReadOwnedAnchor read{};
@@ -562,31 +597,7 @@ void RefreshSources(Service& s, const HIGGS_HandSnapshot& snapshot) {
         sources = s.sources;
         read = s.readPlanck;
     }
-    for (const auto& [b, source] : *sources) {
-        RegionAnchorSnapshot anchor{};
-        const bool same = source->higgsEpoch == snapshot.epoch && source->saveGeneration == CurrentSaveGeneration();
-        const bool available = same && read && read(*source, anchor) == Status::Ok;
-        std::lock_guard lock(s.mutex);
-        if (!b->active || b->source != source)
-            continue;
-        const double now = double(Now()) / 1e9;
-        if (!available || !ValidAnchor(anchor, *b, s) || anchor.source.timeSeconds > now ||
-            now - anchor.source.timeSeconds > b->region.spec.maxSampleAgeSeconds || s.epoch <= s.barredEpoch ||
-            source->saveGeneration != CurrentSaveGeneration()) {
-            b->InvalidateAnchor();
-            continue;
-        }
-        const auto& old = b->anchor.source;
-        const auto& next = anchor.source;
-        if (old.sampleId == next.sampleId && old.frame == next.frame && old.timeSeconds == next.timeSeconds)
-            continue;
-        if (!AdvancesSample(old, next) || next.timeSeconds < old.timeSeconds ||
-            b->anchorRevision == kMax) {
-            b->InvalidateAnchor();
-            continue;
-        }
-        b->SetAnchor(anchor);
-    }
+    for(const auto& [b,source]:*sources)RefreshSource(s,*b,source,read,snapshot);
 }
 Status BS_CALL SubscribeEnd(std::uint64_t writer, std::uint64_t id, RegionInputEnded callback) noexcept {
     return Guard([&] {

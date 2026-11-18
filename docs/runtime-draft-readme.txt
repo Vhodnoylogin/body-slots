@@ -1,4 +1,4 @@
-Body Slots 0.1.0-alpha.1 -- UNPUBLISHED NEXUS DRAFT
+VR Interaction Framework 0.1.0-alpha.1 -- UNPUBLISHED NEXUS DRAFT
 
 This is a foundation for mod authors, not a playable new-slot mod. Released VRIK integration, generic slot interaction, rendering, item handling and an in-game configuration UI are not supplied. Installing this DLL alone creates no visible pouches or new gameplay.
 
@@ -10,4 +10,6 @@ BodySlots.log is appended in this folder after PostLoad when package status is r
 
 This snapshot has offline actual-DLL and synthetic-host evidence; Skyrim runtime acceptance is still pending. The archive retains the existing tested DLL unchanged: legacy SKSE PluginInfo version 2 remains distinct from this draft file label. PROVENANCE.json records its source commit and SHA256.
 
-Licensing is to be finalized before publication. No license grant is included or implied by this unpublished draft. No third-party SDK source or reconstructed VRIK source is included.
+The product was previously called Body Slots. BodySlots.dll, install paths, APIs, messaging recipients and saved provider keys retain their compatibility names. Existing archives keep their historical names and hashes.
+
+Independently authored framework code and SDK use the MIT License included as LICENSE.txt. Source: https://github.com/Vhodnoylogin/body-slots . No third-party SDK source or reconstructed VRIK source is included.

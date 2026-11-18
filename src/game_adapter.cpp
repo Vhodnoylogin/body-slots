@@ -244,7 +244,9 @@ void Adapter::Connect() {
     if (!GetModuleHandleW(L"vrik.dll"))return;
     const auto queryRoutes=reinterpret_cast<HIGGS_QueryInputRoutesInterfaceFn>(GetProcAddress(module,"HIGGS_QueryInputRoutesInterface"));
     HIGGS_InputRoutesInterface routes{};
-    if(!queryRoutes || queryRoutes(1,sizeof(routes),&routes)!=HIGGS_HAND_OK || !(routes.capabilities&HIGGS_ROUTE_TERMINALS) ||
+    constexpr auto routeCapabilities = HIGGS_ROUTE_TERMINALS | HIGGS_ROUTE_ORDERED_CANDIDATES;
+    if(!queryRoutes || queryRoutes(1,sizeof(routes),&routes)!=HIGGS_HAND_OK ||
+       (routes.capabilities & routeCapabilities) != routeCapabilities || !routes.SubmitOrderedCandidate ||
        !routes.CheckSelectedAction || !routes.CopySequence || !routes.CopyClientLabel)return;
     constexpr auto needed = HIGGS_HAND_CAP_SNAPSHOT | HIGGS_HAND_CAP_INPUT_BROKER | HIGGS_HAND_CAP_OWNED_GRANTS | HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
     if ((api.capabilities & needed) != needed) return;
@@ -378,7 +380,8 @@ void Adapter::Input(const HIGGS_HandInput& input) {
         if (routing_.CanRoute(client_, candidate.executor, candidate.physicalHands) != HIGGS_HAND_OK) continue;
         HIGGS_HandRequestId request{};
         std::lock_guard lock(mutex_);
-        if (candidates_.size() < kMaxActionOffers && api_.SubmitCandidate(client_, &candidate, &request) == HIGGS_HAND_OK)
+        if (candidates_.size() < kMaxActionOffers && routes_.SubmitOrderedCandidate(client_, &candidate,
+                detail::SlotTargetKey(offer.context.slot.configured.instance.key), &request) == HIGGS_HAND_OK)
             candidates_.push_back({request, offer, now, input.snapshot, candidate.physicalHands});
     }
 }
@@ -389,12 +392,12 @@ bool Adapter::OfferDrag(const HIGGS_HandInput& input){
     if(!detail::MayOfferSlotAction(hand)||hand.occupancy!=HIGGS_OCCUPANCY_EMPTY)return false;
     auto rows=std::make_unique<std::array<RuntimeRecord,kMaxInstances>>();RuntimeView view{sizeof(RuntimeView),kRuntimeApiVersion};
     if(detail::GetRuntimeApi().CopyRuntime(reader_,rows->data(),kMaxInstances,&view)!=Status::Ok)return false;
-    const RuntimeRecord* target=nullptr;
-    for(std::uint32_t i=0;i<view.count;++i){const auto& row=(*rows)[i];if(!row.availability&&(row.insideHands&input.physicalHand)&&(!target||row.configured.instance.instanceHandle<target->configured.instance.instanceHandle))target=&row;}
+    const auto* target = detail::SelectDragTarget(std::span<const RuntimeRecord>(rows->data(), view.count), input.physicalHand);
     if(!target)return false;
     HIGGS_ActionCandidate candidate{};candidate.structSize=sizeof(candidate);candidate.physicalHands=input.physicalHand;candidate.inputId=input.inputId;candidate.epoch=input.epoch;candidate.handGeneration=input.handGeneration;candidate.executor=dragExecutor_;candidate.actionId=UINT64_C(0x425344524147);candidate.contextId=target->configured.instance.instanceHandle;candidate.contextGeneration=editing.revision;candidate.grantDurationMs=60000;
     std::lock_guard lock(mutex_);if(dragCandidate_.request||activeDrag_.requestId)return true;
-    HIGGS_HandRequestId request{};if(api_.SubmitCandidate(client_,&candidate,&request)==HIGGS_HAND_OK){dragCandidate_={request,editing.revision,candidate.contextId,Now(),input};dragAuthority_={};}
+    HIGGS_HandRequestId request{};
+    if(routes_.SubmitOrderedCandidate(client_, &candidate, detail::SlotTargetKey(target->configured.instance.key), &request)==HIGGS_HAND_OK){dragCandidate_={request,editing.revision,candidate.contextId,Now(),input};dragAuthority_={};}
     return true;
 }
 void Adapter::CancelDrag(){
@@ -410,8 +413,13 @@ void Adapter::UpdateDrag(const HIGGS_HandSnapshot& snapshot,const detail::Runtim
     if(candidate.request){
         HIGGS_InputDecision decision{};decision.structSize=sizeof(decision);HIGGS_ActionResult result{};result.structSize=sizeof(result);
         const auto decided=api_.CopyInputDecision(client_,candidate.input.inputId,&decision);
-        if(decided!=HIGGS_HAND_OK){if(Now()-candidate.createdAt>100000000)CancelDrag();return;}
-        if(!decision.consumed||decision.requestId!=candidate.request||authority.requestId!=candidate.request || authority.inputId!=candidate.input.inputId){std::lock_guard lock(mutex_);dragCandidate_={};return;}
+        const auto admission = detail::ClassifySlotAdmission(decided, decision, candidate.input.epoch,
+            candidate.input.inputId, candidate.request, recognizerLabel_, candidate.createdAt, Now());
+        if(admission==detail::SlotAdmission::Waiting)return;
+        if(admission==detail::SlotAdmission::Discard){CancelDrag();return;}
+        // The selected executor notification can still be arriving on another
+        // thread. Retain the bounded candidate until its private authority arrives.
+        if(authority.requestId!=candidate.request || authority.inputId!=candidate.input.inputId)return;
         if(api_.CopyActionResult(client_,candidate.request,&result)!=HIGGS_HAND_OK||result.stage!=HIGGS_ACTION_ACCEPTED||result.executor!=dragExecutor_||!detail::GrantMatchesObservations(candidate.input.snapshot,snapshot,candidate.input.physicalHand,decision.owner,decision.grant)){CancelDrag();return;}
         const RuntimeRecord* row=nullptr;const detail::AnchorSample* anchor=nullptr;
         for(std::uint32_t i=0;i<current.count;++i)if((*records)[i].configured.instance.instanceHandle==candidate.instance)row=&(*records)[i];
@@ -448,11 +456,16 @@ void Adapter::FinishCandidates(const HIGGS_HandSnapshot& snapshot) {
         const auto& offer = candidate.offer;
         HIGGS_InputDecision decision{}; decision.structSize = sizeof(decision);
         const auto status = api_.CopyInputDecision(client_, offer.context.input.inputSequence, &decision);
-        if (status != HIGGS_HAND_OK) {
-            if (Now() - candidate.createdAt < 100000000) { std::lock_guard lock(mutex_); if (candidates_.size() < kMaxActionOffers) candidates_.push_back(candidate); }
+        const auto admission = detail::ClassifySlotAdmission(status, decision, offer.context.input.epoch,
+            offer.context.input.inputSequence, candidate.request, offer.higgsClient, candidate.createdAt, Now());
+        if (admission == detail::SlotAdmission::Waiting) {
+            std::lock_guard lock(mutex_);
+            if (candidates_.size() < kMaxActionOffers) { candidates_.push_back(candidate); continue; }
+        }
+        if (admission != detail::SlotAdmission::Selected) {
+            routing_.CancelRecognizedAction(client_, candidate.request, offer.context.input.epoch, 1);
             continue;
         }
-        if (!decision.consumed || decision.requestId != candidate.request || decision.owner!=offer.higgsClient) continue;
         HIGGS_ActionResult result{}; result.structSize = sizeof(result);
         if (api_.CopyActionResult(client_, candidate.request, &result) != HIGGS_HAND_OK || result.stage != HIGGS_ACTION_ACCEPTED || result.executor!=offer.higgsExecutor) continue;
         std::uint64_t checked{};

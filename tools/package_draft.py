@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create explicit-allowlist Nexus DRAFT archives; never rebuild or publish a DLL."""
+"""Create VR Interaction Framework Nexus DRAFT archives; never rebuild or publish a DLL."""
 import argparse
 import hashlib
 import importlib.util
@@ -11,12 +11,14 @@ import sys
 import zipfile
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
+PRODUCT_NAME = "VR Interaction Framework"
+ARCHIVE_PREFIX = "VRInteractionFramework"
 HEADERS = (
     "body_slots_api.h", "body_slots_configuration_api.h", "body_slots_instance_api.h",
     "body_slots_instance_configuration_api.h", "body_slots_instance_activation_api.h",
     "body_slots_native_placement_api.h", "body_slots_native_policy_api.h",
 )
-DOCS = ("configuration.md", "instances.md", "instance-configuration.md", "instance-activation.md", "native-placement.md", "native-policy.md")
+DOCS = ("configuration.md", "instances.md", "instance-configuration.md", "instance-activation.md", "native-placement.md", "native-policy.md", "naming.md")
 
 
 def digest(data):
@@ -52,8 +54,10 @@ def prepare(root, dll, expected_dll_sha256, source_commit, label):
     runtime = {
         "SKSE/Plugins/BodySlots.dll": binary,
         "SKSE/Plugins/BodySlots/README.txt": (root / "docs/runtime-draft-readme.txt").read_bytes(),
+        "SKSE/Plugins/BodySlots/LICENSE.txt": (root / "LICENSE").read_bytes(),
     }
-    sdk = {"README.md": (root / "docs/sdk-draft-readme.md").read_bytes()}
+    sdk = {"README.md": (root / "docs/sdk-draft-readme.md").read_bytes(),
+           "LICENSE.txt": (root / "LICENSE").read_bytes()}
     for name in HEADERS:
         sdk["include/" + name] = (root / "include" / name).read_bytes()
     for name in DOCS:
@@ -67,9 +71,9 @@ def prepare(root, dll, expected_dll_sha256, source_commit, label):
     archives = {}
     for kind, entries, manifest_name in (("runtime", runtime, "SKSE/Plugins/BodySlots/PROVENANCE.json"), ("sdk", sdk, "PROVENANCE.json")):
         provenance = {
-            "format": "body-slots-nexus-draft-v1", "draftLabel": label, "archiveKind": kind,
+            "format": "body-slots-nexus-draft-v1", "productName": PRODUCT_NAME, "draftLabel": label, "archiveKind": kind,
             "purpose": "Unpublished mod-author foundation snapshot; not gameplay or released VRIK integration",
-            "licensing": "Not finalized before publication; no license grant is included",
+            "licensing": "Independently authored framework code and SDK: MIT; see LICENSE.txt",
             "productionSourceCommit": source_commit,
             "productionDll": {"name": "BodySlots.dll", "sha256": expected_dll_sha256, "bytes": len(binary), "rebuiltForPackaging": False},
             "legacyPluginInfoVersion": 2,
@@ -79,7 +83,7 @@ def prepare(root, dll, expected_dll_sha256, source_commit, label):
             "qualification": "Offline actual-DLL and synthetic-host checks; no Skyrim runtime acceptance claimed",
         }
         entries[manifest_name] = encoded(provenance)
-        filename = "BodySlots-" + kind + "-" + label + ".zip"
+        filename = ARCHIVE_PREFIX + "-" + kind + "-" + label + ".zip"
         content = archive_bytes(entries)
         archives[filename] = {"bytes": content, "sha256": digest(content), "contents": sorted(entries)}
     return archives
@@ -102,7 +106,8 @@ def main():
         archives = prepare(ROOT, args.dll, args.expected_dll_sha256, args.source_commit, args.label)
         output.mkdir(parents=True, exist_ok=True)
         checksums = []
-        result = {"draftLabel": args.label, "productionSourceCommit": args.source_commit, "licensing": "not finalized; no grant included", "artifacts": {}}
+        result = {"productName": PRODUCT_NAME, "draftLabel": args.label, "productionSourceCommit": args.source_commit,
+                  "licensing": "Independently authored framework code and SDK: MIT; see LICENSE.txt", "artifacts": {}}
         for name, artifact in archives.items():
             with (output / name).open("xb") as stream:
                 stream.write(artifact["bytes"])

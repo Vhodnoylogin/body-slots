@@ -1,6 +1,6 @@
 # Native14 placement compatibility
 
-The additive `BodySlots_QueryNativePlacementInterface` export moves the mutable placement bank of VRIK's fourteen original holsters into Body Slots. It is a compatibility service, separate from authored slot definitions, generic eligibility and saved customization. A new slot continues to use the ordinary registry; a native slot number is never a registry slot ID.
+The additive `BodySlots_QueryNativePlacementInterface` export moves the mutable placement bank of VRIK's fourteen original holsters into VR Interaction Framework. It is a compatibility service, separate from authored slot definitions, generic eligibility and saved customization. A new slot continues to use the ordinary registry; a native slot number is never a registry slot ID.
 
 ## Ownership and data
 
@@ -14,7 +14,7 @@ Leases and revisions are process-local and monotonic. Release invalidates the ow
 
 ## Existing persistence and VRIK boundary
 
-The native bank has no cosave record and does not reset on load, revert or new game. VRIK retains its existing global `vrikslots.ini` serialization as a compatibility projection. Legacy raw placement and clamped INI settings can differ; Body Slots preserves the raw active bank rather than rebuilding it from the settings map. Direct legacy settings writes retain their existing meaning.
+The native bank has no cosave record and does not reset on load, revert or new game. VRIK retains its existing global `vrikslots.ini` serialization as a compatibility projection. Legacy raw placement and clamped INI settings can differ; VR Interaction Framework preserves the raw active bank rather than rebuilding it from the settings map. Direct legacy settings writes retain their existing meaning.
 
 The VRIK adapter acquires ownership after initial INI loading. If the optional export is absent, malformed or unavailable at acquisition, all fourteen slots retain the original path. An attached service failure never silently activates the fallback arrays as another owner. Position/rotation patches are converted into a complete revision-checked bank replacement. VRIK serializes the bank commitment and its INI projection together, and reads one whole placement snapshot before processing a native holster frame. Eligibility, weapon-dependent distance, rendering, input behavior and the existing equipment executor stay in VRIK at this stage.
 

@@ -1,13 +1,18 @@
-# Name for the spatial interaction service
+# VR Interaction Framework: name and compatibility
 
-The service now manages named logical regions on the player, NPCs, equipped items, world objects and temporary interaction frames. A region can offer actions and acquire optional storage, visuals and saved customization. A mouth, pocket and keyhole use this role. The current name Body Slots describes part of that scope.
+**VR Interaction Framework** is the product display name, replacing **Body Slots**. It identifies infrastructure that consumer mods use to offer spatial interactions. Installing the framework alone adds no standalone gameplay feature.
 
-| Candidate | Meaning and tradeoff |
-|---|---|
-| **Interaction Regions VR** | Names the managed entity directly and covers player, NPC and world targets. Recommended product name. |
-| Spatial Interactions VR | Readable as a broader interaction framework. It could imply ownership of physical interactions and input that belong to HIGGS and PLANCK. |
-| Interaction Spaces VR | Covers temporary and persistent regions, although “space” gives less information about a bounded queryable region. |
+The framework manages named logical regions on the player, NPCs, equipped items, world objects and temporary interaction frames. A consumer can attach actions, optional storage, visuals and saved customization to a region. HIGGS arbitrates hand use and input and owns physical execution, VRIK supplies the player pose, PPB supplies anatomical evidence, and PLANCK owns its NPC physics. The [maintained concept](https://github.com/Vhodnoylogin/body-pouches/blob/main/docs/trinity-synergy/concept-en.md#responsibilities) defines those boundaries.
 
-Interaction Regions VR is the current recommendation for owner review. HIGGS continues to arbitrate hand use and input, VRIK supplies the player pose, PPB supplies anatomy, and PLANCK owns its NPC physics. The name does not assign their responsibilities to this service. The [maintained concept](https://github.com/Vhodnoylogin/body-pouches/blob/main/docs/trinity-synergy/concept-en.md#responsibilities) defines those boundaries.
+The earlier candidate **Interaction Regions VR** was not selected because it did not make the service's role as infrastructure clear enough. **VR Interaction Framework** is the chosen name; it is no longer a pending proposal.
 
-A product rename can preserve `BodySlots.dll`, existing exported getters, registration recipients, persistent keys and SDK namespaces for compatibility. The display name can change independently. Any later technical rename needs an explicit migration for consumers and saves.
+## Compatibility identities
+
+This is a display rename. Existing consumers and saves continue to use:
+
+- `BodySlots.dll`, `BodySlots.log` and `Data/SKSE/Plugins/BodySlots/`.
+- `BodySlots_Query…` exports, `body_slots` namespaces, `body_slots_*.h` headers and existing SKSE messaging recipients.
+- Existing provider/action keys, package formats, serialization IDs and save records.
+- The existing [body-slots source repository](https://github.com/Vhodnoylogin/body-slots), build/test target identities and historical tags.
+
+Newly generated archive filenames use `VRInteractionFramework-runtime-<label>.zip` and `VRInteractionFramework-sdk-<label>.zip`. Internal runtime paths retain their compatibility names. Existing `BodySlots-…` archives, receipts, hashes and source revisions are historical evidence and are not renamed or requalified. Any future technical rename requires its own consumer and save migration.

@@ -1,11 +1,11 @@
 # One grip press inside a player region
 
-A pouch mod can open its own contents preview when the left hand is inside its registered rim and the player presses grip. [GripRegionAction](../examples/grip_region_action.h) connects this one-shot UI action to HIGGS's optional compact grip proposal. Body Slots evaluates the geometry. HIGGS selects one provider for the press. The pouch checks whether the preview can open and opens it on the game thread.
+A pouch mod can open its own contents preview when the left hand is inside its registered rim and the player presses grip. [GripRegionAction](../examples/grip_region_action.h) connects this one-shot UI action to HIGGS's optional compact grip proposal. VR Interaction Framework evaluates the geometry. HIGGS selects one provider for the press. The pouch checks whether the preview can open and opens it on the game thread.
 
 ## Connect
 
 1. Register the pouch's region with `RegionsApi::UpsertRegion`. Keep the returned region ID and revision. Bind a `GripRegionTarget` to that region, its epoch and save generation, the provider/source names, identities and generations of the pouch anchor and left-hand probe, and the maximum permitted sample age. Use the same monotonic clock for the region's timestamps and the helper. [Interaction regions](interaction-regions.md)
-2. At SKSE PostPostLoad, look up `HIGGS_GetGripActions001` in the loaded HIGGS DLL. Include the compact HIGGS SDK header when compiling this example. Pass the discovered table and a stable priority ID such as `pouch.inspect` to `Connect`. If this mechanic already uses the full Body Slots region-action route, pass `fullRouteActive=true` and keep that route. To switch modes later, remove and drain the old registration first. Missing compact support leaves the action unavailable through this helper. [Full region-action route](region-actions.md)
+2. At SKSE PostPostLoad, look up `HIGGS_GetGripActions001` in the loaded HIGGS DLL. Include the compact HIGGS SDK header when compiling this example. Pass the discovered table and a stable priority ID such as `pouch.inspect` to `Connect`. If this mechanic already uses the full VR Interaction Framework region-action route, pass `fullRouteActive=true` and keep that route. To switch modes later, remove and drain the old registration first. Missing compact support leaves the action unavailable through this helper. [Full region-action route](region-actions.md)
 3. Use a writer dedicated to this pouch/hand example. `Publish` replaces the writer's complete set of observations. A mod handling several regions on one writer publishes them together. Keep the scratch array of `kMaxRegionObservations` rows on the consumer instance. Evaluation runs synchronously on the main thread inside `Update`.
 
 ```cpp
@@ -38,7 +38,7 @@ bool EvaluatePouch(void* context, RegionObservation& out) noexcept {
 
 ```cpp
 // Called on the game thread. EvaluatePouch publishes fresh anchor and probe
-// samples, copies the matching Body Slots row, and checks this pouch's UI state.
+// samples, copies the matching VR Interaction Framework row, and checks this pouch's UI state.
 if (inspectPouch.Update(EvaluatePouch, &pouch)) {
     pouch.OpenContentsPreview();
 }

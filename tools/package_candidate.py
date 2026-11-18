@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package the verified Body Slots 0.2.0 candidate from committed source and its original native build."""
+"""Package VR Interaction Framework from committed source and its verified original native build."""
 import argparse
 import json
 import subprocess
@@ -7,10 +7,10 @@ import sys
 from pathlib import Path
 
 sys.dont_write_bytecode = True
-from package_draft import archive_bytes, digest, encoded
+from package_draft import ARCHIVE_PREFIX, PRODUCT_NAME, archive_bytes, digest, encoded
 
 ROOT = Path(__file__).resolve().parents[1]
-LABEL = "0.2.0-rc.3"
+LABEL = "0.2.0-rc.4"
 DEPENDENCIES = {
     "commonlibsse": "c4ab853d095e81e3390b282d7ba01ab2f24ebf25",
     "fmt": "0c9fce2ffefecfdce794e1859584e25877b7b592",
@@ -20,7 +20,7 @@ DEPENDENCIES = {
 HIGGS_HEADERS = ("higgsabitypes.h", "higgshandapi.h", "higgsinput.h", "higgsphysics.h", "higgsobservations.h", "higgstransactions.h", "higgsnativeinterop.h")
 DOCS = ("configuration", "content-observation", "game-adapter", "higgs-native-regions", "instance-activation",
         "instance-configuration", "instances", "interaction-regions", "native-placement", "native-policy",
-        "ordinary-inventory-provider", "region-actions", "runtime", "runtime-extensions", "planck-region-anchor", "naming")
+        "ordinary-inventory-provider", "region-actions", "runtime", "runtime-extensions", "planck-region-anchor", "naming", "release-readiness")
 
 
 def git(root, *args):
@@ -79,19 +79,23 @@ def main():
     runtime = {runtime_dir + path: data for path, data in notices.items()}
     runtime["SKSE/Plugins/BodySlots.dll"] = binary
     runtime[runtime_dir + "README.txt"] = (
-        f"Body Slots {LABEL} for Skyrim VR 1.4.15 and SKSE VR 2.0.12.\n"
+        f"{PRODUCT_NAME} {LABEL} for Skyrim VR 1.4.15 and SKSE VR 2.0.12.\n"
         "Install the runtime archive with your mod manager in a development profile.\n"
-        "This candidate supplies services for mod authors. A consumer supplies the slot content and interaction.\n"
+        "This framework supplies services for consumer mods; it adds no standalone gameplay feature.\n"
+        "A consumer supplies the slot content and interaction.\n"
         "Released HIGGS 001 provides updates for generic regions. Routed input needs the full HIGGS Hand 2 provider.\n"
+        "Shared button/dwell arbitration requires the HIGGS ordered proposal version 2 service.\n"
         "Inventory operations use the extended HIGGS provider. Player body-node placement uses VRIK.\n"
         "Consumer examples and their provider requirements are in the separate SDK archive.\n"
         "Offline verified. The game integration test is pending.\n"
-        "Body Slots source: https://github.com/Vhodnoylogin/body-slots/tree/" + candidate + "\n"
+        "Formerly Body Slots. DLL, APIs, install paths, messaging recipients and saved keys retain their compatibility names.\n"
+        "Framework source: https://github.com/Vhodnoylogin/body-slots/tree/" + candidate + "\n"
         "See LICENSE.txt, licenses/ and PROVENANCE.json for components and source revisions.\n"
     ).encode()
     sdk = dict(notices)
     sdk["README.md"] = source("docs/release-candidate.md").replace(b"](../examples/", b"](examples/").replace(
-        b"](region-actions.md)", b"](docs/region-actions.md)")
+        b"](region-actions.md)", b"](docs/region-actions.md)").replace(
+        b"](naming.md)", b"](docs/naming.md)").replace(b"](release-readiness.md)", b"](docs/release-readiness.md)")
     for path in git(ROOT, "ls-tree", "-r", "--name-only", candidate, "include").decode().splitlines():
         if path.endswith(".h"):
             sdk[path] = source(path)
@@ -107,7 +111,7 @@ def main():
     for name in HIGGS_HEADERS:
         sdk["third_party/higgs/" + name] = blob(args.higgs_root, revisions["higgs"], "include/" + name)
     sdk["third_party/planck/planck_synergy.h"] = blob(args.planck_root, revisions["planck"], "include/planck_synergy.h")
-    common = dict(candidate=LABEL, packageSource=candidate, productionSource=candidate,
+    common = dict(productName=PRODUCT_NAME, candidate=LABEL, packageSource=candidate, productionSource=candidate,
                   runtimeSha256=digest(binary), nativeBuildManifestSha256=manifest_hash, sourceRevisions=revisions,
                   buildDependencies=DEPENDENCIES,
                   qualification="Offline build and contract checks. In-game qualification pending.")
@@ -115,7 +119,7 @@ def main():
     for kind, entries, location in (("runtime", runtime, runtime_dir), ("sdk", sdk, "")):
         entries[location + "PROVENANCE.json"] = encoded(dict(common, archive=kind,
             sha256={name: digest(data) for name, data in sorted(entries.items())}))
-        artifacts[f"BodySlots-{kind}-{LABEL}.zip"] = archive_bytes(entries)
+        artifacts[f"{ARCHIVE_PREFIX}-{kind}-{LABEL}.zip"] = archive_bytes(entries)
     output.mkdir(parents=True, exist_ok=True)
     for name, data in artifacts.items():
         (output / name).write_bytes(data)

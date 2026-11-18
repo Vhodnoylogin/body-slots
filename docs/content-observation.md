@@ -35,7 +35,7 @@ After a change, publish `SlotVisualSpec` with the returned content version and t
 
 Content notifications run outside runtime locks. Callbacks may reenter copied reads or publish an exact current-value no-op. The existing removable-callback contract applies: removal from a callback returns conflict; remove after returning. `Unsubscribe` drains an already-running callback before it returns and suppresses future calls. Providers must avoid recursively publishing changed content from their own notification without a bounded domain policy.
 
-Observations belong to a live instance in the current save scope. Removing and recreating the same durable key produces a new handle with zero content/version. A save-scope reset also removes live instances and their content projections. Body Slots does not serialize logical assignments or stock. The provider restores its own domain state and republishes a fresh projection after recreating instances. An epoch transition rejects delayed observations from the prior epoch; it does not itself erase the existing instance's logical projection.
+Observations belong to a live instance in the current save scope. Removing and recreating the same durable key produces a new handle with zero content/version. A save-scope reset also removes live instances and their content projections. VR Interaction Framework does not serialize logical assignments or stock. The provider restores its own domain state and republishes a fresh projection after recreating instances. An epoch transition rejects delayed observations from the prior epoch; it does not itself erase the existing instance's logical projection.
 
 ## Results and offline checks
 

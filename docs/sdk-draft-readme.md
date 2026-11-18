@@ -1,10 +1,10 @@
-# Body Slots SDK — 0.1.0-alpha.1 unpublished draft
+# VR Interaction Framework SDK — 0.1.0-alpha.1 unpublished draft
 
-This snapshot is a foundation for mod authors and discussion with framework authors. It is not a playable new-slot mod, a released VRIK integration or an author-approved framework SDK. Generic presentation, hand detection, input, item assignment/transfer and an in-game editor are not delivered. Licensing will be finalized before publication; no license grant is included.
+This snapshot supplies infrastructure for mod authors and discussion with framework authors. Installing it alone adds no standalone gameplay feature. It is an unpublished foundation snapshot, not a released VRIK integration or an author-approved framework SDK. Generic presentation, hand detection, input, item assignment/transfer and an in-game editor are not delivered by this historical DLL. Independently authored framework source, SDK and examples use the MIT License included as `LICENSE.txt`.
 
 ## Contents and provider
 
-`include/` contains seven newly written copied-record C++ headers with separately queried version-1 tables. Consumers need x64 C++17 and the standard library; the simple Windows discovery example also uses Windows headers. They do not need private VRIK code, CommonLib or third-party SDK source. The runtime provider is the separate Body Slots archive. Its unchanged DLL targets Skyrim VR 1.4.15, is compiled against SKSE VR 2.0.12 and requires messaging/serialization plus the Microsoft x64 C++ runtime. Python is needed only for the optional offline authoring tool, not in Skyrim.
+`include/` contains seven newly written copied-record C++ headers with separately queried version-1 tables. Consumers need x64 C++17 and the standard library; the simple Windows discovery example also uses Windows headers. They do not need private VRIK code, CommonLib or third-party SDK source. The runtime provider is the separate VR Interaction Framework archive. Its unchanged DLL targets Skyrim VR 1.4.15, is compiled against SKSE VR 2.0.12 and requires messaging/serialization plus the Microsoft x64 C++ runtime. Python is needed only for the optional offline authoring tool, not in Skyrim.
 
 The available foundation includes definition ownership and snapshots, strict authored packages, saved definition/instance placement overrides, transient caller-keyed instances, atomic requested activation and independent native14 compatibility banks. A native bank can be Unavailable until an actual compatibility owner attaches. No released VRIK integration is bundled or required to use the generic service tables.
 
@@ -29,4 +29,6 @@ The compiler uses only Python's standard library and validates the explicit sche
 
 ## Snapshot and publication boundary
 
-`PROVENANCE.json` records the unchanged production DLL hash/source commit and each payload file hash. This file label does not change legacy PluginInfo version 2 or any ABI version. Offline actual-DLL, concurrency, save-host and source-boundary evidence exists; Skyrim behavior remains unqualified. Private reconstruction, third-party SDK sources, test executables and fake game hosts are excluded. Repository visibility and public source publication are separate owner decisions; this package is prepared only for an unpublished Nexus draft.
+`PROVENANCE.json` records the unchanged production DLL hash/source commit and each payload file hash. This file label does not change legacy PluginInfo version 2 or any ABI version. The product was previously called Body Slots; `BodySlots.dll`, SDK symbols, namespaces, headers, install paths and persistence keys remain compatible. Existing archives keep their historical names and hashes. See the included [naming policy](docs/naming.md).
+
+Offline actual-DLL, concurrency, save-host and source-boundary evidence exists; Skyrim behavior remains unqualified. Private reconstruction, third-party SDK sources, test executables and fake game hosts are excluded. Public source is available from the existing [body-slots repository](https://github.com/Vhodnoylogin/body-slots); generating this package does not publish a Nexus file.

@@ -36,7 +36,7 @@ extern "C" __declspec(dllexport) body_slots::Status BS_CALL BodySlots_LoadPackag
     } catch (...) { return body_slots::Status::InternalError; }
 }
 namespace {
-constexpr const char* kPluginName = "BodySlots";
+constexpr const char* kPluginName = "BodySlots"; // retained SKSE messaging/save compatibility identity
 constexpr UInt32 kSerializationId = 0x534C5342; // BSLS
 constexpr UInt32 kConfigurationRecord = 0x46435342; // BSCF
 constexpr UInt32 kInstanceConfigurationRecord = 0x49435342; // BSCI
@@ -62,7 +62,7 @@ bool Compatible(const SKSEInterface* skse) {
 }
 void Log(const std::filesystem::path& directory, const std::string& message) noexcept {
     try {
-        OutputDebugStringA(("BodySlots: " + message + "\n").c_str());
+        OutputDebugStringA(("VR Interaction Framework: " + message + "\n").c_str());
         // Do not create directories or touch Skyrim files before the PostLoad phase.
         std::ofstream stream(directory / "BodySlots.log", std::ios::app);
         if (stream) stream << message << '\n';
@@ -166,6 +166,7 @@ void OnMessage(SKSEMessagingInterface::Message* message) noexcept {
         auto& state = State(); std::lock_guard<std::mutex> lock(state.mutex);
         if (!state.loaded || state.packagesLoaded) return;
         state.packagesLoaded = true;
+        Log(state.packages, "VR Interaction Framework initialized (BodySlots compatibility identity)");
         const auto* api = BodySlots_QueryInterface(body_slots::kApiVersion, sizeof(body_slots::Api));
         if (!api) { Log(state.packages, "registry interface unavailable"); return; }
         std::error_code ec;

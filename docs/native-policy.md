@@ -1,6 +1,6 @@
 # Native14 policy compatibility
 
-The optional `BodySlots_QueryNativePolicyInterface` service owns the nine numeric configuration values for each original VRIK holster. Together with the [placement bank](native-placement.md), it transfers native14 per-slot configuration to Body Slots while retaining the old global INI persistence. Assigned/equipped items, suspension, actual rendered visibility, weapon-distance calculations, input and haptic execution remain with their existing runtime owners.
+The optional `BodySlots_QueryNativePolicyInterface` service owns the nine numeric configuration values for each original VRIK holster. Together with the [placement bank](native-placement.md), it transfers native14 per-slot configuration to VR Interaction Framework while retaining the old global INI persistence. Assigned/equipped items, suspension, actual rendered visibility, weapon-distance calculations, input and haptic execution remain with their existing runtime owners.
 
 ## Copied records
 

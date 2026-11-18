@@ -56,6 +56,8 @@ struct Fixture {
     HIGGS_HandSnapshot snapshot{};
     unsigned fallback{},beforeMode{},invokeCalls{};
     HIGGS_HandStatus invokeStatus=999;
+    void (*beforeDispatch)(){};
+    bool sequenceUnavailable=false;
     explicit Fixture(std::int32_t providerPriorityB=1,std::uint32_t edgeMask=1,bool sharedOwner=false,bool sequences=false,
         RegionAnchorKind kind=RegionAnchorKind::World,bool noButtonUses=false) {
         CHECK(DisconnectRegionActions()==Status::Ok);active=this;
@@ -87,10 +89,12 @@ struct Fixture {
             if(f.beforeMode==8)CHECK(f.registry.ReleaseClient(p->writer)==Status::Ok);
             if(f.beforeMode==9){++p->anchor.source.sampleId;CHECK(f.api.PublishAnchor(p->writer,p->registration.bindingId,p->anchorRevision,&p->anchor,&p->anchorRevision)==Status::Conflict);}
             if(f.beforeMode==10){f.observations[0].equippedFormId=0xfa;f.Frame(false);}
+            if(f.beforeDispatch)f.beforeDispatch();
             f.invokeStatus=f.broker.InvokeAuthorized(owner,*r,cb,ctx);return f.invokeStatus;
         }};
         const HIGGS_InputRoutesInterface routes{sizeof(routes),1,sequences?HIGGS_ROUTE_TERMINALS:0u,nullptr,
-            +[](std::uint64_t c,std::uint64_t press,HIGGS_InputSequence* result){return active->broker.CopySequence(c,press,*result);},
+            +[](std::uint64_t c,std::uint64_t press,HIGGS_InputSequence* result){
+                return active->sequenceUnavailable ? HIGGS_HAND_NOT_FOUND : active->broker.CopySequence(c,press,*result);},
             +[](std::uint64_t c,std::uint64_t id,std::uint64_t epoch,std::uint32_t mask,std::uint64_t* corr) {
                 return active->broker.CheckSelectedAction(c,id,epoch,mask,*corr,HiggsHands::Now());
             },
@@ -354,8 +358,26 @@ void ConsumedRelease() {
         TickRegionActions();
         CHECK(b.terminals == 0);
     }
+    for(unsigned loss=0;loss!=3;++loss) {
+        Fixture f(1,1,false,true);
+        auto& b=*f.providers[1];
+        CHECK(continuation.Subscribe(b.writer,b.registration.bindingId,Ended)==Status::Ok);
+        CHECK(f.Input());TickRegionActions();CHECK(b.effects==1);
+        f.Settle(b); // The original press survives its short-lived grant.
+        const auto press=b.execution.request.inputId;
+        if(loss==0)f.broker.SetInputContext(1,HiggsHands::Now());
+        if(loss==1)f.sequenceUnavailable=true; // Lost provider history is not a fabricated Up/Cancel.
+        if(loss==2)ResetRegionActions();
+        TickRegionActions();TickRegionActions();
+        CHECK(b.terminals==1 && b.terminal.pressInput==press && !b.terminal.terminalInput);
+        CHECK(b.terminal.end==static_cast<std::uint32_t>(loss==0?RegionInputEnd::Cancelled:RegionInputEnd::ObservationLost));
+        CHECK(b.terminal.providerReason==(loss==0?HIGGS_HAND_NOT_READY:0u));
+        f.sequenceUnavailable=false;f.broker.SetInputContext(0,HiggsHands::Now());
+        f.Input(false);TickRegionActions();CHECK(b.terminals==1 && b.effects==1);
+    }
 }
-std::uint64_t ownedSample{};
+std::uint64_t ownedSample{},ownedCaptured{};
+void CaptureOwned(std::uint64_t sample) {ownedSample=sample;ownedCaptured=HiggsHands::Now();}
 Status Sample(const OwnedRegionSource& source, RegionAnchorSnapshot& out) noexcept {
     if (!ownedSample)
         return Status::Unavailable;
@@ -368,7 +390,7 @@ Status Sample(const OwnedRegionSource& source, RegionAnchorSnapshot& out) noexce
                   source.higgsEpoch,
                   source.saveGeneration,
                   ownedSample,
-                  double(HiggsHands::Now()) / 1e9,
+                  double(ownedCaptured) / 1e9,
                   static_cast<std::uint32_t>(RegionUnits::SkyrimWorld),
                   0};
     out.world.scale = 1;
@@ -387,13 +409,13 @@ void SourceOwnership() {
     CHECK(sources.BindPlanckBody(b.writer, b.registration.bindingId, &target) == Status::Ok);
     CHECK(f.api.PublishAnchor(b.writer, b.registration.bindingId, b.anchorRevision, &b.anchor, &b.anchorRevision) ==
           Status::Conflict);
-    ownedSample = 1;
+    CaptureOwned(1);
     f.Frame(false);
     RegionObservation observed{};
     CHECK(f.api.CopyObservation(b.writer, b.registration.bindingId, Left, &observed) == Status::Ok);
     CHECK(observed.state == static_cast<std::uint32_t>(RegionSpatialState::Ready) &&
           !std::strcmp(observed.anchor.source.provider, "PLANCK"));
-    ownedSample = 0;
+    CaptureOwned(0);
     f.Frame(false);
     CHECK(f.api.CopyObservation(b.writer, b.registration.bindingId, Left, &observed) == Status::Ok);
     CHECK(observed.state == static_cast<std::uint32_t>(RegionSpatialState::Unavailable));
@@ -475,6 +497,47 @@ struct DwellConsumer {
         CHECK(fixture.broker.EndHandUse(owner.client,delivered.requestId,delivered.epoch)==HIGGS_HAND_OK);
     }
 };
+std::uint64_t ownedGeneration=7;
+float ownedPosition{};
+unsigned ownedChange{};
+Status LifetimeSample(const OwnedRegionSource& source,RegionAnchorSnapshot& out) noexcept {
+    if(source.body.bodyGeneration!=ownedGeneration)return Status::Unavailable;
+    const auto result=Sample(source,out);
+    out.world.position[0]=ownedPosition;
+    return result;
+}
+void ChangeOwnedBeforeDispatch() {
+    if(ownedChange==1)CaptureOwned(0);
+    if(ownedChange==2)++ownedGeneration;
+    if(ownedChange>=3) {CaptureOwned(ownedSample+1);ownedPosition=ownedChange==3?20.f:0.f;}
+}
+void OwnedDispatchLifetime() {
+    // The current reader boundary changes after frame refresh but before HIGGS
+    // enters its authorized callback. No replacement PLANCK registry is copied.
+    for(unsigned dwell=0;dwell!=2;++dwell)for(unsigned change=0;change!=5;++change) {
+        Fixture f(1,1,false,false,RegionAnchorKind::Npc,true);
+        auto& b=*f.providers[1];f.providers[0]->enabled=false;
+        DwellConsumer d(f,1);
+        if(dwell) {b.enabled=false;CHECK(d.Register()==Status::Ok);}
+        ownedGeneration=7;ownedPosition=0;ownedChange=change;
+        SetOwnedPlanckReader(LifetimeSample);
+        const RegionPlanckBody target{sizeof(target),5,2,0,90,8,ownedGeneration};
+        const auto binding=dwell?d.binding.bindingId:b.registration.bindingId;
+        CHECK(GetRegionSourcesApi().BindPlanckBody(b.writer,binding,&target)==Status::Ok);
+        CaptureOwned(1);f.Frame(false);
+        if(!dwell)CHECK(f.Input());
+        f.broker.DrainHandUses();
+        f.beforeDispatch=ChangeOwnedBeforeDispatch;
+        TickRegionActions();
+        CHECK(f.invokeCalls==1);
+        const bool execute=change==0 || change==4;
+        CHECK((dwell?d.effects:b.effects)==(execute?1u:0u));
+        if(execute) {if(dwell)d.Finish();else f.Settle(b);}
+        f.beforeDispatch=nullptr;TickRegionActions();
+        CHECK((dwell?d.effects:b.effects)==(execute?1u:0u));
+        SetOwnedPlanckReader(nullptr);
+    }
+}
 void DwellRounds() {
     {Fixture f;DwellConsumer d(f,0);CHECK(d.Register()==Status::UnsupportedVersion);}
     Fixture f(10,1,false,false,RegionAnchorKind::World,true);
@@ -554,6 +617,7 @@ void MixedAdmissionBoundaries() {
 }
 
 int main(){try {
+    OwnedDispatchLifetime();
     DwellRounds();DwellInvalidations();MixedAdmissionBoundaries();
     ConsumedRelease();SourceOwnership();AnatomicalEvidenceScope();
     ArbitrationAndFallback();ProviderPriorityAndUp();TargetRefreshAndHeld();CancelBeforeEffect();ConsumerFailureAndDrain();ScopeAndEvidence();DwellAndOrdering();RequiredResourcesAndAge();

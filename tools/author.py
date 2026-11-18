@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict offline Body Slots v1 JSON authoring validator and package compiler."""
+"""Strict offline VR Interaction Framework v1 JSON authoring validator and package compiler."""
 import argparse
 import json
 import math

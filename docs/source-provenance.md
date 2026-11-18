@@ -1,5 +1,7 @@
 # Source provenance and public development
 
+The product is now named **VR Interaction Framework**. The Body Slots name below identifies the historical review and licensing records; repository, ABI and persistence identities remain compatible. See [naming and compatibility](naming.md).
+
 Body Slots is independently implemented. The public source repository was reviewed on3November2026 before its visibility changed. The review covered all13then-reachable commits and158unique historical blobs through `909c0c328ae6781baece39690c3db8fb51519e88`, and compared source paths, exact blobs and bounded token overlaps with the separate private VRIK reconstruction history.
 
 No reconstructed VRIK implementation was identified. Seven exact matching headers were Body Slots API contracts copied into the optional VRIK integration. Partial matches were generic matrix arithmetic and key-validation expressions in newly authored adapters. Bounded credential-pattern and tracked binary-artifact scans reported no findings. Full raw audit evidence stays outside Git; this note does not reproduce private code.

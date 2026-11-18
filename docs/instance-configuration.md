@@ -30,7 +30,7 @@ Loading begins a fresh scope, clearing both override stores and runtime instance
 
 Both codecs validate into private candidates. The final joint Registry commit requires the exact scope/view captured by reset and preflights configuration/view limits before either store changes. A scope reset or legitimate concurrent edit during staging therefore prevents stale loaded data from overwriting the new state. Old provider/equipment keys remain dormant until their owner recreates a matching Current runtime instance. New game/revert clears both saved stores for the next scope; native global compatibility banks remain untouched.
 
-Older Body Slots versions do not understand BSCI records. The compatibility promise is unchanged BSCF bytes and support for old saves in this service, not support for new instance saves in an older DLL.
+Older VR Interaction Framework versions do not understand BSCI records. The compatibility promise is unchanged BSCF bytes and support for old saves in this service, not support for new instance saves in an older DLL.
 
 ## Verification boundary
 
