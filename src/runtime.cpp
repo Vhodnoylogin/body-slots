@@ -43,6 +43,7 @@ struct Callback {
     SourceOfferCallback offers2=nullptr;SourceExecuteCallback execute2=nullptr;
     std::uint32_t grantDurationMs=2000;
     std::uint32_t inputFlags=0;
+    bool inventoryReceiptsOnly=false,semanticActionIdentity=false;
 };
 thread_local std::vector<const Callback*> callbackStack;
 class CallLease {
@@ -60,6 +61,7 @@ struct Pending {
     CommitStage stage=CommitStage::Accepted;
     bool committed=false,handCommitted=false,handCompensated=false,authoritySettled=false,terminalReceipt=false;
     bool sourceInvalidated=false; // sticky for accepted deferred work; unrelated offers may change
+    bool inventoryReceiptsOnly=false,inventoryCommitted=false,inventoryUnchangedConfirmed=false;
     ContentCommit receipt{}, last{};
 };
 struct State {
@@ -225,13 +227,13 @@ Status BS_CALL SetBinding(std::uint64_t writer,std::uint64_t handle,const Runtim
         if(!spec)return Status::InvalidArgument;auto status=SetSavedRuntimeCustomization(writer,handle,spec,nullptr);if(status!=Status::Ok)return status;return SyncConfiguration();
     });
 }
-Status RegisterBehaviorRecord(std::uint64_t writer,const BehaviorSpec* spec,std::uint64_t* registration,SourceOfferCallback offers2=nullptr,SourceExecuteCallback execute2=nullptr,std::uint32_t grantDurationMs=2000,std::uint32_t inputFlags=0) noexcept {
+Status RegisterBehaviorRecord(std::uint64_t writer,const BehaviorSpec* spec,std::uint64_t* registration,SourceOfferCallback offers2=nullptr,SourceExecuteCallback execute2=nullptr,std::uint32_t grantDurationMs=2000,std::uint32_t inputFlags=0,bool inventoryReceiptsOnly=false,bool semanticActionIdentity=false) noexcept {
     return GuardRuntime([&] {
         SetRuntimeReleaseHook(DrainRuntimeClient);
         if(!spec||!registration||spec->structSize!=sizeof(*spec)||spec->reserved||(!offers2&&(!spec->offers||!spec->execute))||(offers2&&!execute2)||!spec->higgsClient||!spec->higgsExecutor)return Status::InvalidArgument;
         auto status=RuntimeOwnsInstance(writer,spec->instanceHandle);if(status!=Status::Ok)return status;
         status=SyncConfiguration();if(status!=Status::Ok)return status;
-        auto callback=std::make_shared<Callback>();callback->owner=writer;callback->behavior=*spec;callback->offers2=offers2;callback->execute2=execute2;callback->grantDurationMs=grantDurationMs;callback->inputFlags=inputFlags;
+        auto callback=std::make_shared<Callback>();callback->owner=writer;callback->behavior=*spec;callback->offers2=offers2;callback->execute2=execute2;callback->grantDurationMs=grantDurationMs;callback->inputFlags=inputFlags;callback->inventoryReceiptsOnly=inventoryReceiptsOnly;callback->semanticActionIdentity=semanticActionIdentity;
         auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
         if(!Own(writer,spec->instanceHandle))return Status::Unauthorized;
         SweepRetired(s);if(s.behaviors.size()+s.retired.size()>=kMaxBehaviors)return Status::LimitExceeded;
@@ -247,10 +249,18 @@ Status BS_CALL RegisterSourceBehavior(std::uint64_t writer,const SourceBehaviorS
 }
 Status BS_CALL RegisterSourceBehaviorWithOptions(std::uint64_t writer,const SourceBehaviorSpec* source,const SourceBehaviorOptions* options,std::uint64_t* registration) noexcept {
     if(!source||source->structSize!=sizeof(*source)||source->reserved||!source->offers||!source->execute||
-       !options||options->structSize!=sizeof(*options)||!options->grantDurationMs||options->grantDurationMs>60000||
+       !options||(options->structSize!=sizeof(*options)&&options->structSize!=sizeof(SourceBehaviorOptions2))||!options->grantDurationMs||options->grantDurationMs>60000||
        options->reserved||(options->inputFlags&~(kBehaviorHeldReleaseInput|kBehaviorDeferredExit)))return Status::InvalidArgument;
+    bool inventoryOnly=false,semanticIdentity=false;
+    if(options->structSize==sizeof(SourceBehaviorOptions2)){
+        const auto& extended=*reinterpret_cast<const SourceBehaviorOptions2*>(options);
+        if(extended.contentContract>static_cast<std::uint32_t>(ContentEffectContract::InventoryReceiptsOnly)||
+           extended.actionIdentity>static_cast<std::uint32_t>(ActionIdentity::SemanticAction))return Status::InvalidArgument;
+        inventoryOnly=extended.contentContract==static_cast<std::uint32_t>(ContentEffectContract::InventoryReceiptsOnly);
+        semanticIdentity=extended.actionIdentity==static_cast<std::uint32_t>(ActionIdentity::SemanticAction);
+    }
     BehaviorSpec base{sizeof(BehaviorSpec),0,source->instanceHandle,source->context,nullptr,nullptr,source->higgsClient,source->higgsExecutor};
-    return RegisterBehaviorRecord(writer,&base,registration,source->offers,source->execute,options->grantDurationMs,options->inputFlags);
+    return RegisterBehaviorRecord(writer,&base,registration,source->offers,source->execute,options->grantDurationMs,options->inputFlags,inventoryOnly,semanticIdentity);
 }
 Status RemoveCallback(std::uint64_t owner,std::uint64_t id,bool behavior) {
     if(!callbackStack.empty())return Status::Conflict;
@@ -308,6 +318,7 @@ Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* com
             const auto stage=static_cast<CommitStage>(commit->stage);
             if(stage==CommitStage::Accepted) {if(!row)return Status::NotFound;if(p.stage!=CommitStage::Accepted||p.authoritySettled)return Status::Conflict;}
             else if(stage==CommitStage::Committed) {
+                if(p.inventoryReceiptsOnly&&!p.inventoryCommitted)return Status::Conflict;
                 if(p.authoritySettled||p.committed||(row&&row->contentVersion!=commit->expectedContentVersion)||commit->contentVersion!=commit->expectedContentVersion+1||!commit->contentVersion||((commit->quantity==0)!=(commit->contentIdentity==0)))return Status::Conflict;
                 // Removed same-save instances retain facts only in their exact
                 // pending history; never project them into a replacement slot.
@@ -324,7 +335,11 @@ Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* com
                     if(commit->contentVersion!=unchanged.contentVersion||commit->contentIdentity!=unchanged.contentIdentity||commit->quantity!=unchanged.quantity)return Status::Conflict;
                 }
             }
-            if((stage==CommitStage::Failed||stage==CommitStage::Cancelled)&&p.handCommitted&&!p.committed&&!p.authoritySettled)return Status::Conflict;
+            if(stage==CommitStage::Failed||stage==CommitStage::Cancelled){
+                const bool unchanged=p.inventoryReceiptsOnly&&p.inventoryUnchangedConfirmed&&!p.inventoryCommitted;
+                if(p.handCommitted&&!p.committed&&!p.authoritySettled&&!unchanged)return Status::Conflict;
+                if(p.inventoryReceiptsOnly&&!p.committed&&(commit->contentVersion!=req.offer.context.slot.contentVersion||commit->contentIdentity!=req.offer.context.slot.contentIdentity||commit->quantity!=req.offer.context.slot.quantity))return Status::Conflict;
+            }
             if(Terminal(stage))p.authoritySettled=p.terminalReceipt=true;
             p.stage=stage;p.last=*commit;
         }
@@ -441,7 +456,7 @@ Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,R
         return Status::NotFound;
     });
 }
-const BehaviorApi2 behaviorApi2{{sizeof(BehaviorApi2),2,7,RegisterSourceBehavior},RegisterSourceBehaviorWithOptions,CopyDeferredSource};
+const BehaviorApi2 behaviorApi2{{sizeof(BehaviorApi2),2,7|kBehaviorExtendedOptions,RegisterSourceBehavior},RegisterSourceBehaviorWithOptions,CopyDeferredSource};
 } // namespace
 
 bool ComposeSlotTransform(const Definition& d,const RuntimeTransform& anchor,RuntimeTransform& out,float center[3],float& radius) noexcept {
@@ -566,7 +581,7 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
             if(s.pending.size()==kMaxPendingActions){auto old=std::find_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return !Reserved(p);});if(old==s.pending.end())return Status::LimitExceeded;s.pending.erase(old);}
             request={offer,grant,Allocate(s)};if(!request.requestId)return Status::LimitExceeded;
             if(s.used.size()==kMaxActionOffers)s.used.erase(s.used.begin());s.used.push_back({grant.epoch,grant.inputSequence,grant.physicalHand});
-            Pending pending{};pending.request=request;pending.owner=callback->owner;s.pending.push_back(pending);
+            Pending pending{};pending.request=request;pending.owner=callback->owner;pending.inventoryReceiptsOnly=callback->inventoryReceiptsOnly;s.pending.push_back(pending);
         }
         if(!Own(callback->owner,callback->behavior.instanceHandle))status=Status::Unauthorized;
         else {CallLease lease(callback);if(!lease)status=Status::Unavailable;else try {if(callback->execute2){const SourceActionRequest selected{request,incoming};status=callback->execute2(callback->behavior.context,&selected);}else status=callback->behavior.execute(callback->behavior.context,&request);}catch(...){status=Status::InternalError;}}
@@ -623,11 +638,14 @@ Status CopyPendingHandActions(PendingHandAction* output,std::uint32_t capacity,s
         return Status::Ok;
     });
 }
-Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage,bool compensated,bool noncommitConfirmed) noexcept {
+Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage,bool compensated,bool noncommitConfirmed,bool inventoryCommitted,bool inventoryUnchangedConfirmed) noexcept {
     return GuardRuntime([&]{
         if(!request||!epoch||(stage!=CommitStage::Failed&&stage!=CommitStage::Cancelled&&stage!=CommitStage::Committed&&stage!=CommitStage::Completed))return Status::InvalidArgument;
         auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
         for(auto& pending:s.pending)if(pending.request.grant.requestId==request&&pending.request.grant.epoch==epoch){
+            pending.inventoryCommitted=pending.inventoryCommitted||inventoryCommitted;
+            if(pending.inventoryCommitted)pending.inventoryUnchangedConfirmed=false;
+            else if(pending.inventoryReceiptsOnly&&inventoryUnchangedConfirmed)pending.inventoryUnchangedConfirmed=true;
             if(stage==CommitStage::Committed||stage==CommitStage::Completed){
                 pending.handCommitted=true; // An irreversible fact survives local cancellation.
                 if(!pending.committed&&!pending.terminalReceipt&&!pending.handCompensated)pending.authoritySettled=false;
@@ -653,10 +671,10 @@ const ZoneApi& GetZoneApi() noexcept {return zoneApi;}
 const ContentPolicyApi& GetContentPolicyApi() noexcept{return contentPolicyApi;}
 const BehaviorApi& GetBehaviorApi() noexcept{return behaviorApi;}
 const BehaviorApi2& GetBehaviorApi2() noexcept{return behaviorApi2;}
-std::uint32_t BehaviorGrantDuration(const ActionOffer& offer) noexcept {
-    try{auto& s=Runtime();std::lock_guard lock(s.mutex);if(offer.policyRevision!=s.policy)return 0;
-        for(const auto& c:s.behaviors)if(c->id==offer.behavior)return c->grantDurationMs;
-    }catch(...){}return 0;
+bool BehaviorExecutionPolicy(const ActionOffer& offer,std::uint32_t& duration,std::uint64_t& action) noexcept {
+    try{auto& s=Runtime();std::lock_guard lock(s.mutex);if(offer.policyRevision!=s.policy)return false;
+        for(const auto& c:s.behaviors)if(c->id==offer.behavior){duration=c->grantDurationMs;action=c->semanticActionIdentity?offer.proposal.action:offer.proposal.executorAction;return true;}
+    }catch(...){}return false;
 }
 const ContentObservationApi& GetContentObservationApi() noexcept {
     static const ContentObservationApi table{sizeof(ContentObservationApi),kContentObservationApiVersion,1,

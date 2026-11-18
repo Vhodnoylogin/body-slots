@@ -166,16 +166,17 @@ bool ObserveHandResult(const detail::PendingHandAction& action,const HIGGS_Actio
        result.epoch!=action.grant.epoch||result.inputId!=action.grant.inputSequence||
        result.executor!=action.executor||(result.receiptFlags&~7u))return false;
     const bool irreversible=(result.receiptFlags&(HIGGS_RECEIPT_INVENTORY_COMMITTED|HIGGS_RECEIPT_PHYSICAL_CONFIRMED))!=0;
+    const bool inventoryCommitted=(result.receiptFlags&HIGGS_RECEIPT_INVENTORY_COMMITTED)!=0;
     const bool compensated=(result.receiptFlags&HIGGS_RECEIPT_COMPENSATED)!=0;
     // Stage cancellation alone cannot erase an already observed side effect.
     if(irreversible||result.stage==HIGGS_ACTION_COMMITTED||result.stage==HIGGS_ACTION_COMPLETED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Committed);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Committed,false,false,inventoryCommitted);
     if(result.stage==HIGGS_ACTION_COMPLETED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Completed,compensated,false);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Completed,compensated,false,inventoryCommitted);
     else if(result.stage==HIGGS_ACTION_CANCELLED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Cancelled,compensated,false);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Cancelled,compensated,false,inventoryCommitted,!inventoryCommitted);
     else if(result.stage==HIGGS_ACTION_REJECTED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Failed,compensated,false);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Failed,compensated,false,inventoryCommitted,!inventoryCommitted);
     return true;
 }
 RuntimeTransform CopyTransform(const RE::NiTransform& t) {
@@ -413,10 +414,9 @@ void Adapter::Input(const HIGGS_HandInput& input) {
         HIGGS_ActionCandidate candidate{}; candidate.structSize = sizeof(candidate);
         candidate.physicalHands = offer.proposal.requiredResources ? offer.proposal.requiredResources : input.physicalHand;
         candidate.inputId = input.inputId; candidate.epoch = input.epoch; candidate.handGeneration = input.handGeneration;
-        candidate.executor = offer.higgsExecutor; candidate.actionId = offer.proposal.executorAction;
+        candidate.executor = offer.higgsExecutor;
         candidate.contextId = offer.offerId; candidate.contextGeneration = offer.policyRevision;
-        candidate.grantDurationMs = detail::BehaviorGrantDuration(offer);
-        if(!candidate.grantDurationMs)continue;
+        if(!detail::BehaviorExecutionPolicy(offer,candidate.grantDurationMs,candidate.actionId))continue;
         if (routing_.CanRoute(client_, candidate.executor, candidate.physicalHands) != HIGGS_HAND_OK) continue;
         HIGGS_HandRequestId request{};
         std::lock_guard lock(mutex_);

@@ -28,7 +28,7 @@ Status CollectOffers(const RuntimeInput&, ActionOffer*, std::uint32_t capacity, 
 bool RevalidateOfferContent(const ActionOffer&,std::uint64_t currentHandObservationId) noexcept;
 const BehaviorApi& GetBehaviorApi() noexcept;
 const BehaviorApi2& GetBehaviorApi2() noexcept;
-std::uint32_t BehaviorGrantDuration(const ActionOffer&) noexcept;
+bool BehaviorExecutionPolicy(const ActionOffer&,std::uint32_t& grantDurationMs,std::uint64_t& actionId) noexcept;
 const ContentObservationApi& GetContentObservationApi() noexcept;
 Status DispatchSelected(const ActionOffer&, const ActionGrant&, std::uint64_t* requestId) noexcept;
 Status CopyActionProgress(ActionProgress*, std::uint32_t capacity, std::uint32_t* count) noexcept;
@@ -43,8 +43,11 @@ using ContentCommitValidator=Status (*)(const ContentCommit&,const ActionRequest
 void SetContentCommitValidator(ContentCommitValidator) noexcept;
 // A terminal noncommit is factual HIGGS evidence, never a missing history row or
 // a local callback failure. Compensation must be explicitly confirmed upstream.
+// Inventory evidence is separate from physical effects; unchanged evidence only
+// relaxes the explicitly registered InventoryReceiptsOnly content contract.
 Status ApplyHandResult(std::uint64_t higgsRequestId,std::uint64_t epoch,CommitStage,
-                       bool compensated=false,bool noncommitConfirmed=true) noexcept;
+                       bool compensated=false,bool noncommitConfirmed=true,
+                       bool inventoryCommitted=false,bool inventoryUnchangedConfirmed=false) noexcept;
 void InvalidateRuntime() noexcept;
 // Trusted native-provider adapter only. Scope acceptance, publication and copy
 // share the runtime invalidation fence; callers cannot select a save generation.

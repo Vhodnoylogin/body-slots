@@ -127,6 +127,6 @@ private:
     std::array<HIGGS_ActionRequest,2> selected_{};
     Work work_;
     InventoryProviderProgress progress_;
-    bool attached_=false,stopping_=false;
+    bool attached_=false,stopping_=false,semanticActionIdentity_=false;
 };
 }

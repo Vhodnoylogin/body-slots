@@ -57,10 +57,10 @@ struct RuntimeInput {
 };
 struct ActionContext { RuntimeRecord slot; RuntimeInput input; };
 struct ActionProposal {
-    std::uint32_t action, requiredResources;
+    std::uint32_t action, requiredResources; // stable semantic action when explicitly selected in options2
     std::int32_t priority;
     std::uint32_t reserved;
-    std::uint64_t executorAction; // provider's stable action discriminator
+    std::uint64_t executorAction; // legacy stable identity; semantic-mode providers may use a per-offer cookie
 };
 struct ActionOffer {
     ActionContext context;
