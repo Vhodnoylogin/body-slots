@@ -28,6 +28,7 @@ struct InventoryProviderTables {
     const GameApi2* gameServices=nullptr;
     HIGGS_HeldReleaseInterface releases{};
     HIGGS_AuthorizedDispatchInterface dispatch{};
+    const GameApi3* frameObservations=nullptr;
 };
 struct InventoryProviderConfig {
     std::uint64_t writer=0,instance=0,higgsClient=0;
@@ -53,6 +54,11 @@ struct InventoryProviderProgress {
     // Optional original-grip continuation is separate from factual delivery.
     // A stale press/possession may prevent following an already completed draw.
     HIGGS_HandStatus releaseStatus=HIGGS_HAND_OK;
+    // Logical save captured with the source; independent of HIGGS world epoch.
+    std::uint64_t saveGeneration=0;
+    // The accepted save/epoch ended. A terminal factual result may be retired,
+    // but must never be projected into a recreated instance or another save.
+    bool sourceRetired=false;
 };
 class OrdinaryInventoryProvider final {
 public:
@@ -78,26 +84,28 @@ private:
         HIGGS_ItemIdentity held{};
         HIGGS_ActionRequest authority{};
         HIGGS_TransferRequest transferRequest{};
-        std::uint64_t ticket=0,transfer=0;
-        std::uint64_t drawFrame=0,drawFrameAt=0,drawGeneration=0;
+        std::uint64_t ticket=0,transfer=0,saveGeneration=0;
+        std::uint64_t drawGeneration=0;
         bool drawExited=false,releaseResolved=false;
-        bool cancel=false,mirror=false,completed=false;
+        bool cancel=false,mirror=false,completed=false,sourceRetired=false;
     };
-    struct DrawDispatch { OrdinaryInventoryProvider* provider; Work* work; InventoryProviderProgress* progress; };
+    struct TransferDispatch { OrdinaryInventoryProvider* provider; Work* work; InventoryProviderProgress* progress; };
     static Status BS_CALL Offers(void*,const SourceActionContext*,SourceActionProposal*,std::uint32_t,std::uint32_t*);
     static Status BS_CALL Execute(void*,const SourceActionRequest*);
     static void HIGGS_HAND_CALL Selected(const HIGGS_ActionRequest*,void*);
-    static HIGGS_HandStatus HIGGS_HAND_CALL AdmitDraw(const HIGGS_ActionRequest*,const HIGGS_HandSnapshot*,void*);
+    static HIGGS_HandStatus HIGGS_HAND_CALL AdmitTransfer(const HIGGS_ActionRequest*,const HIGGS_HandSnapshot*,void*);
     Status Offer(const SourceActionContext&,SourceActionProposal*,std::uint32_t,std::uint32_t*);
     Status Queue(const SourceActionRequest&);
     void Advance(Work&,InventoryProviderProgress&);
     bool DrawReady(Work&,const HIGGS_HandSnapshot&,InventoryProviderProgress&);
+    bool SourceReady(Work&,const HIGGS_HandSnapshot&,InventoryProviderProgress&,RuntimeRecord&);
     bool OriginalResult(const Work&,HIGGS_ActionResult&,InventoryProviderProgress&);
+    void ObserveScope(Work&,InventoryProviderProgress&);
     bool ReportOriginal(const Work&,std::uint32_t,std::uint32_t,InventoryProviderProgress&);
     Status Mirror(const Work&,CommitStage,const ContentProjection&,std::uint64_t);
     bool Finish(Work&,InventoryProviderProgress&,bool success);
     mutable std::mutex mutex_;
-    std::uint64_t executorLabel_{};
+    std::uint64_t executorLabel_{},saveGeneration_{};
     InventoryProviderTables tables_;
     InventoryProviderConfig config_;
     std::uint64_t actionExecutor_=0,behavior_=0,recognizer_=0,nextOffer_=1;

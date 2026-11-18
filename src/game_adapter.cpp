@@ -81,6 +81,13 @@ public:
         *out = {sizeof(*out), kGameApiVersion, connected_ ? 1u : 0u, 0, recognizerLabel_, cache_.epoch, cache_.frame, bodyGeneration_};
         return Status::Ok;
     }
+    Status CopyFrameObservation(GameFrameObservation* out) {
+        if(!out||out->structSize!=sizeof(*out)||out->reserved)return Status::InvalidArgument;
+        std::lock_guard lock(mutex_);
+        if(!connected_||!cache_.epoch||!cache_.frame||!cache_.sampledAt)return Status::Unavailable;
+        *out={sizeof(*out),0,cache_.epoch,cache_.frame,cache_.sampledAt};
+        return Status::Ok;
+    }
     Status CopyInputServices(std::uint64_t* out) {
         if(!out)return Status::InvalidArgument;
         std::lock_guard lock(mutex_);*out=connected_&&releaseRecognizer_?kGameHeldReleaseInput:0;
@@ -645,7 +652,8 @@ void Adapter::Tick() {
     if (runtime.CopyRuntime(reader_, records->data(), records->size(), &view) != Status::Ok) return;
     auto anchors = std::make_unique<std::array<detail::AnchorSample, kMaxInstances>>();
     detail::RuntimeFrame frame{}; frame.epoch = snapshot.epoch; frame.frame = ++frame_; frame.bodyGeneration = bodyGeneration_;
-    frame.timeSeconds = static_cast<double>(Now()) / 1e9;
+    const auto spatialSampledAt=Now();
+    frame.timeSeconds = static_cast<double>(spatialSampledAt) / 1e9;
     anchors_.erase(std::remove_if(anchors_.begin(), anchors_.end(), [&](const auto& identity) {
         for (std::uint32_t i = 0; i < view.count; ++i)
             if ((*records)[i].configured.instance.instanceHandle == identity.instance) return false;
@@ -686,7 +694,7 @@ void Adapter::Tick() {
             if (!exists) { if (it->wrapper && it->wrapper->parent) it->wrapper->parent->DetachChild(it->wrapper.get()); it = visuals_.erase(it); } else ++it;
         }
     }
-    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = Now();cached.inputContext=inputContext;
+    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = spatialSampledAt;cached.inputContext=inputContext;
     for (unsigned i = 0; i < 2; ++i) {
         cached.samples[i] = frame.hands[i].sampleId;
         const auto& hand = snapshot.hands[i];
@@ -698,6 +706,9 @@ void Adapter::Tick() {
 }
 Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
     try { return State().CopyIntegration(output); } catch (...) { return Status::InternalError; }
+}
+Status BS_CALL CopyFrameObservation(GameFrameObservation* output) noexcept {
+    try { return State().CopyFrameObservation(output); } catch (...) { return Status::InternalError; }
 }
 Status BS_CALL CopyInputServices(std::uint64_t* output) noexcept {
     try{return State().CopyInputServices(output);}catch(...){return Status::InternalError;}
@@ -715,6 +726,8 @@ const Api* RegistryApi() noexcept { return BodySlots_QueryInterface(kApiVersion,
 extern "C" __declspec(dllexport) const body_slots::GameApi* BS_CALL BodySlots_QueryGameInterface(std::uint32_t version, std::uint32_t size) noexcept {
     static const body_slots::GameApi table{sizeof(table), body_slots::kGameApiVersion, &body_slots::game::CopyIntegration};
     static const body_slots::GameApi2 table2{{sizeof(table2),2,&body_slots::game::CopyIntegration},&body_slots::game::CopyInputServices};
+    static const body_slots::GameApi3 table3{{sizeof(table3),3,&body_slots::game::CopyIntegration},&body_slots::game::CopyInputServices,&body_slots::game::CopyFrameObservation};
+    if(version==3&&size==sizeof(table3))return &table3.base;
     if(version==2&&size==sizeof(table2))return &table2.base;
     return version == table.version && size == sizeof(table) ? &table : nullptr;
 }

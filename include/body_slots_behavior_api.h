@@ -51,7 +51,7 @@ struct BehaviorApi2 {
     BehaviorApi base; // exact v1 prefix, with version=2 and structSize=sizeof(BehaviorApi2)
     Status (BS_CALL *RegisterSourceBehaviorWithOptions)(std::uint64_t writer,
         const SourceBehaviorSpec*,const SourceBehaviorOptions*,std::uint64_t* registration);
-    // Uncommitted deferred work only: same behavior/policy/save/content/body/anchor,
+    // Accepted uncommitted work only: same behavior/policy/save/content/body/anchor,
     // active equipment binding and available geometry. The hand may be outside.
     Status (BS_CALL *CopyDeferredSource)(std::uint64_t writer,std::uint64_t requestId,RuntimeRecord*);
 };

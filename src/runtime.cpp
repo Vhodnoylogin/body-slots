@@ -281,13 +281,13 @@ Status BS_CALL Unsubscribe(std::uint64_t reader,std::uint64_t id) noexcept {retu
 Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* commit) noexcept {
     return GuardRuntime([&] {
         if(!commit||commit->structSize!=sizeof(*commit)||commit->stage<1||commit->stage>5)return Status::InvalidArgument;
-        auto status=RuntimeOwnsInstance(writer,commit->instanceHandle);if(status!=Status::Ok)return status;
+        auto status=RuntimeClientIdentity(writer,true,nullptr);if(status!=Status::Ok)return status;
         status=SyncConfiguration();if(status!=Status::Ok)return status;
         ActionRequest authorityRequest{};
         {auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);auto it=std::find_if(s.pending.begin(),s.pending.end(),[&](const Pending& p){return p.request.requestId==commit->requestId;});if(it==s.pending.end())return Status::NotFound;if(it->owner!=writer)return Status::Unauthorized;authorityRequest=it->request;}
         const auto validator=contentValidator.load(std::memory_order_acquire);if(!validator)return Status::Unavailable;
         status=validator(*commit,authorityRequest);if(status!=Status::Ok)return status;
-        status=RuntimeOwnsInstance(writer,commit->instanceHandle);if(status!=Status::Ok)return status;
+        status=RuntimeClientIdentity(writer,true,nullptr);if(status!=Status::Ok)return status;
         status=SyncConfiguration();if(status!=Status::Ok)return status;
         std::vector<RuntimeEvent> events;
         {auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
@@ -296,17 +296,34 @@ Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* com
             const auto& req=p.request;
             if(p.owner!=writer)return Status::Unauthorized;
             if(commit->epoch!=s.epoch||commit->epoch!=req.grant.epoch||commit->higgsRequestId!=req.grant.requestId||commit->higgsGrantId!=req.grant.grantId||commit->instanceHandle!=req.offer.context.slot.configured.instance.instanceHandle||commit->expectedContentVersion!=req.offer.context.slot.contentVersion)return Status::Conflict;
+            auto* row=Find(s,commit->instanceHandle);
+            const auto ownership=RuntimeOwnsInstance(writer,commit->instanceHandle);
+            if(row){if(ownership!=Status::Ok)return ownership;}
+            else {
+                if(ownership!=Status::NotFound)return ownership==Status::Ok?Status::Conflict:ownership;
+                if(!p.sourceInvalidated)return Status::NotFound;
+            }
             if(!std::memcmp(&p.last,commit,sizeof(*commit))||(p.committed&&!std::memcmp(&p.receipt,commit,sizeof(*commit))))return Status::Ok;
             if(p.terminalReceipt)return Status::Conflict;
-            auto* row=Find(s,commit->instanceHandle);if(!row)return Status::NotFound;
             const auto stage=static_cast<CommitStage>(commit->stage);
-            if(stage==CommitStage::Accepted) {if(p.stage!=CommitStage::Accepted||p.authoritySettled)return Status::Conflict;}
+            if(stage==CommitStage::Accepted) {if(!row)return Status::NotFound;if(p.stage!=CommitStage::Accepted||p.authoritySettled)return Status::Conflict;}
             else if(stage==CommitStage::Committed) {
-                if(p.authoritySettled||p.committed||row->contentVersion!=commit->expectedContentVersion||commit->contentVersion!=row->contentVersion+1||!commit->contentVersion||((commit->quantity==0)!=(commit->contentIdentity==0)))return Status::Conflict;
-                row->contentVersion=commit->contentVersion;row->contentIdentity=commit->contentIdentity;row->quantity=commit->quantity;
-                row->runtimeRevision=++s.revision;row->presentationState=static_cast<std::uint32_t>(PresentationState::Pending);
-                p.committed=p.handCommitted=true;p.receipt=*commit;s.offers.clear();events.push_back(Event(s,*row,RuntimeEventKind::ContentChanged));
-            } else if(stage==CommitStage::Completed && !p.committed && commit->contentVersion!=row->contentVersion) return Status::Conflict;
+                if(p.authoritySettled||p.committed||(row&&row->contentVersion!=commit->expectedContentVersion)||commit->contentVersion!=commit->expectedContentVersion+1||!commit->contentVersion||((commit->quantity==0)!=(commit->contentIdentity==0)))return Status::Conflict;
+                // Removed same-save instances retain facts only in their exact
+                // pending history; never project them into a replacement slot.
+                p.committed=p.handCommitted=true;p.receipt=*commit;
+                if(row){
+                    row->contentVersion=commit->contentVersion;row->contentIdentity=commit->contentIdentity;row->quantity=commit->quantity;
+                    row->runtimeRevision=++s.revision;row->presentationState=static_cast<std::uint32_t>(PresentationState::Pending);
+                    s.offers.clear();events.push_back(Event(s,*row,RuntimeEventKind::ContentChanged));
+                }
+            } else if(stage==CommitStage::Completed) {
+                if(p.committed){if(commit->contentVersion!=p.receipt.contentVersion||commit->contentIdentity!=p.receipt.contentIdentity||commit->quantity!=p.receipt.quantity)return Status::Conflict;}
+                else {
+                    const auto& unchanged=row?*row:req.offer.context.slot;
+                    if(commit->contentVersion!=unchanged.contentVersion||commit->contentIdentity!=unchanged.contentIdentity||commit->quantity!=unchanged.quantity)return Status::Conflict;
+                }
+            }
             if((stage==CommitStage::Failed||stage==CommitStage::Cancelled)&&p.handCommitted&&!p.committed&&!p.authoritySettled)return Status::Conflict;
             if(Terminal(stage))p.authoritySettled=p.terminalReceipt=true;
             p.stage=stage;p.last=*commit;
