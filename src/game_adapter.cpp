@@ -17,6 +17,7 @@
 #include "main/higgs_native_regions.h"
 #include "main/interaction_regions.h"
 #include "main/standalone_region_scope.h"
+#include "main/equipment_history.h"
 #include "instances.h"
 #include <algorithm>
 #include <array>
@@ -36,7 +37,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 std::uint64_t Now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 struct CachedInput {
-    std::uint64_t epoch{}, frame{}, observation{}, sampledAt{}, inputContext{};
+    std::uint64_t epoch{}, frame{}, observation{}, sampledAt{}, inputContext{},equipmentObservation{};
     std::array<std::uint32_t, 2> categories{};
     std::array<std::uint64_t, 2> samples{};
 };
@@ -49,7 +50,7 @@ struct Visual {
     RE::NiPointer<RE::NiNode> parent, wrapper;
     bool failed{};
 };
-struct AnchorIdentity { std::uint64_t instance{}, generation{}; RE::NiPointer<RE::NiAVObject> node; };
+struct AnchorIdentity { std::uint64_t instance{}, generation{}; RE::NiPointer<RE::NiAVObject> node; std::uint64_t equipmentObservation{}; };
 struct DragCandidate {
     HIGGS_HandRequestId request{};
     std::uint64_t editingRevision{},instance{},createdAt{};
@@ -76,6 +77,7 @@ public:
     void Tick();
     void Input(const HIGGS_HandInput&);
     Status ValidateCommit(const ContentCommit&, const ActionRequest&) noexcept;
+    Status ValidateSource(const RuntimeRecord&);
     Status CopyIntegration(GameIntegration* out) {
         if (!out || out->structSize != sizeof(*out)) return Status::InvalidArgument;
         std::lock_guard lock(mutex_);
@@ -146,6 +148,8 @@ private:
     std::atomic<std::uint64_t> inputContext_{};
     std::uint64_t handledInputContext_{};
     CachedInput cache_{};
+    DWORD frameThread_{};
+    EquipmentHistory equipmentHistory_;
     std::vector<Candidate> candidates_;
     std::vector<Visual> visuals_;
     std::vector<AnchorIdentity> anchors_;
@@ -165,6 +169,9 @@ private:
 Adapter& State() { static Adapter state; return state; }
 Status ValidateContentCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     return State().ValidateCommit(commit, request);
+}
+Status ValidateDeferredSource(const RuntimeRecord& record) noexcept {
+    try{return State().ValidateSource(record);}catch(...){return Status::InternalError;}
 }
 bool ObserveHandResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result,
     bool inventoryUnchangedConfirmed=false,bool inventoryEvidence=false,bool inventoryRestored=false) noexcept {
@@ -228,7 +235,7 @@ RE::NiAVObject* FindPath(RE::NiAVObject* root, const char* path) {
 }
 RE::NiAVObject* Adapter::ResolveAnchor(const RuntimeRecord& record, RE::PlayerCharacter* player, RE::NiAVObject* root) {
     const auto& binding = record.binding;
-    if (binding.requiredEquipmentFormId && !player->GetWornArmor(binding.requiredEquipmentFormId)) return nullptr;
+    if (binding.requiredEquipmentFormId && !player->GetWornArmor(binding.requiredEquipmentFormId,true)) return nullptr;
     if (binding.kind == static_cast<std::uint32_t>(RuntimeBindingKind::BodyNode))
         return FindPath(root, binding.node[0] ? binding.node : record.configured.instance.effective.anchor);
     if (binding.kind != static_cast<std::uint32_t>(RuntimeBindingKind::EquipmentNode) || !binding.requiredEquipmentFormId) return nullptr;
@@ -324,8 +331,10 @@ void Adapter::Connect() {
        !rounds.EnableSharedRounds){releases={};rounds={};}
     phases->AddPostVrikPostHiggsCallback(&OnFrame);
     std::lock_guard lock(mutex_);
-    api_ = api; routes_=routes; routing_ = routing; inventoryEffects_=inventoryEffects; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;releases_=releases;rounds_=rounds;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
+    api_ = api; routes_=routes; routing_ = routing; inventoryEffects_=inventoryEffects; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;releases_=releases;rounds_=rounds;dragExecutor_=dragExecutor; reader_ = reader;
     detail::SetContentCommitValidator(&ValidateContentCommit);
+    detail::SetDeferredSourceValidator(&ValidateDeferredSource);
+    connected_=true;
 }
 void Adapter::OnStandaloneFrame() noexcept {
     auto& adapter = State();
@@ -365,6 +374,31 @@ void Adapter::TickStandalone() {
     standaloneBody_.reset(epoch ? body : nullptr);
     standaloneWorld_.reset(epoch ? world : nullptr);
     detail::SetInteractionRegionsScope(epoch, epoch ? save : 0);
+}
+Status Adapter::ValidateSource(const RuntimeRecord& record) {
+    std::uint64_t equipmentObservation{};
+    {std::lock_guard lock(mutex_);
+        if(!connected_||!frameThread_||frameThread_!=GetCurrentThreadId()||resetRequested_||
+           cache_.epoch!=record.epoch||cache_.frame!=record.frame)return Status::Unavailable;
+        equipmentObservation=cache_.equipmentObservation;
+    }
+    auto* player=RE::PlayerCharacter::GetSingleton();
+    auto* root=player?player->Get3D(false):nullptr;
+    auto* cell=player?player->GetParentCell():nullptr;
+    if(!root||!cell||!cell->IsAttached()||root!=lastBody_||cell!=lastCell_||
+       record.bodyGeneration!=bodyGeneration_.load())return Status::Conflict;
+    const auto identity=std::find_if(anchors_.begin(),anchors_.end(),[&](const auto& row){
+        return row.instance==record.configured.instance.instanceHandle;
+    });
+    if(identity==anchors_.end()||identity->generation!=record.anchorGeneration)return Status::Conflict;
+    auto* anchor=ResolveAnchor(record,player,root);
+    if(!anchor||identity->node.get()!=anchor)return Status::Conflict;
+    if(record.binding.requiredEquipmentFormId){
+        const auto changed=equipmentHistory_.Since(record.binding.requiredEquipmentFormId,equipmentObservation);
+        if(changed==EquipmentHistory::Change::Changed)return Status::Conflict;
+        if(changed==EquipmentHistory::Change::Unknown)return Status::Unavailable;
+    }
+    return Status::Ok;
 }
 bool Adapter::ObserveResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result) noexcept {
     bool unchanged=false,committed=false,restored=false;
@@ -644,6 +678,7 @@ void Adapter::Tick() {
     bool reset{};
     { std::lock_guard lock(mutex_); if (!connected_) return; reset = resetRequested_; resetRequested_ = false; }
     ConnectReleaseInput();
+    equipmentHistory_.Connect();
     const auto inputContext=inputContext_.load(std::memory_order_acquire);
     if(inputContext!=handledInputContext_){
         // UI open+close between main frames still invalidates old offers/drag.
@@ -683,6 +718,7 @@ void Adapter::Tick() {
     auto anchors = std::make_unique<std::array<detail::AnchorSample, kMaxInstances>>();
     detail::RuntimeFrame frame{}; frame.epoch = snapshot.epoch; frame.frame = ++frame_; frame.bodyGeneration = bodyGeneration_;
     const auto spatialSampledAt=Now();
+    const auto equipmentObservation=equipmentHistory_.Capture();
     frame.timeSeconds = static_cast<double>(spatialSampledAt) / 1e9;
     anchors_.erase(std::remove_if(anchors_.begin(), anchors_.end(), [&](const auto& identity) {
         for (std::uint32_t i = 0; i < view.count; ++i)
@@ -704,7 +740,12 @@ void Adapter::Tick() {
         auto* anchor = ResolveAnchor((*records)[i], player, root);
         auto identity = std::find_if(anchors_.begin(), anchors_.end(), [&](const auto& a) { return a.instance == sample.instanceHandle; });
         if (identity == anchors_.end()) { anchors_.push_back({sample.instanceHandle, ++nextAnchor_, {}}); identity = anchors_.end() - 1; identity->node.reset(anchor); }
-        else if (identity->node.get() != anchor) { identity->node.reset(anchor); identity->generation = ++nextAnchor_; }
+        else {
+            const auto gear=(*records)[i].binding.requiredEquipmentFormId;
+            const bool gearChanged=gear&&equipmentHistory_.Since(gear,identity->equipmentObservation)!=EquipmentHistory::Change::Unchanged;
+            if(identity->node.get()!=anchor||gearChanged){identity->node.reset(anchor);identity->generation=++nextAnchor_;}
+        }
+        identity->equipmentObservation=equipmentObservation;
         sample.anchorGeneration = identity->generation;
         if (anchor) { sample.valid = 1; sample.world = CopyTransform(anchor->world); }
     }
@@ -724,7 +765,7 @@ void Adapter::Tick() {
             if (!exists) { if (it->wrapper && it->wrapper->parent) it->wrapper->parent->DetachChild(it->wrapper.get()); it = visuals_.erase(it); } else ++it;
         }
     }
-    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = spatialSampledAt;cached.inputContext=inputContext;
+    CachedInput cached{}; cached.epoch = snapshot.epoch; cached.frame = frame.frame; cached.observation = snapshot.observationId; cached.sampledAt = spatialSampledAt;cached.inputContext=inputContext;cached.equipmentObservation=equipmentObservation;
     for (unsigned i = 0; i < 2; ++i) {
         cached.samples[i] = frame.hands[i].sampleId;
         const auto& hand = snapshot.hands[i];
@@ -732,7 +773,7 @@ void Adapter::Tick() {
             (hand.observationMask & (HIGGS_OBS_HELD_KNOWN | HIGGS_OBS_EQUIPMENT_KNOWN)) == (HIGGS_OBS_HELD_KNOWN | HIGGS_OBS_EQUIPMENT_KNOWN)
             ? 0 : Category(hand.heldRefId, hand.equippedFormId);
     }
-    std::lock_guard lock(mutex_); cache_ = cached;
+    std::lock_guard lock(mutex_); frameThread_=GetCurrentThreadId();cache_ = cached;
 }
 Status BS_CALL CopyIntegration(GameIntegration* output) noexcept {
     try { return State().CopyIntegration(output); } catch (...) { return Status::InternalError; }

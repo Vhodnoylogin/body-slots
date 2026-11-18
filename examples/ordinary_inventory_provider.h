@@ -77,6 +77,7 @@ struct InventoryProviderProgress {
     bool sourceRetired=false;
     Status settlementStatus=Status::Ok; // Consumer semantic acknowledgement, not physical uncertainty.
     std::shared_ptr<const void> semanticContext; // Pinned accepted-plan data for idempotent settlement.
+    Status sourceStatus=Status::Ok; // Source/freshness failure survives later successful receipt mirroring.
 };
 class OrdinaryInventoryProvider final {
 public:

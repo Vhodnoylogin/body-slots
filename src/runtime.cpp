@@ -19,6 +19,7 @@
 namespace body_slots::detail {
 namespace {
 std::atomic<ContentCommitValidator> contentValidator{nullptr};
+std::atomic<DeferredSourceValidator> deferredSourceValidator{nullptr};
 template<class F> Status GuardRuntime(F&& f) noexcept { try { return f(); } catch (...) { return Status::InternalError; } }
 bool HandValid(std::uint32_t h) { return h == Left || h == Right; }
 bool Finite3(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
@@ -63,6 +64,7 @@ struct Pending {
     bool sourceInvalidated=false; // sticky for accepted deferred work; unrelated offers may change
     bool inventoryReceiptsOnly=false,inventoryCommitted=false,inventoryUnchangedConfirmed=false;
     bool inventoryRestoredConfirmed=false,executorFailed=false;
+    bool nativeSourceValidation=false;
     ContentCommit receipt{}, last{};
 };
 struct State {
@@ -108,6 +110,10 @@ std::uint64_t Allocate(State& s) {
 }
 RuntimeRecord* Find(State& s,std::uint64_t handle) {
     for (auto& row:s.rows) if(row.configured.instance.instanceHandle==handle) return &row;
+    return nullptr;
+}
+const RuntimeRecord* Find(const State& s,std::uint64_t handle) {
+    for(const auto& row:s.rows)if(row.configured.instance.instanceHandle==handle)return &row;
     return nullptr;
 }
 const State::ShapeRow* FindShape(const State& s,std::uint64_t handle) {
@@ -251,7 +257,8 @@ Status BS_CALL RegisterSourceBehavior(std::uint64_t writer,const SourceBehaviorS
 Status BS_CALL RegisterSourceBehaviorWithOptions(std::uint64_t writer,const SourceBehaviorSpec* source,const SourceBehaviorOptions* options,std::uint64_t* registration) noexcept {
     if(!source||source->structSize!=sizeof(*source)||source->reserved||!source->offers||!source->execute||
        !options||(options->structSize!=sizeof(*options)&&options->structSize!=sizeof(SourceBehaviorOptions2))||!options->grantDurationMs||options->grantDurationMs>60000||
-       options->reserved||(options->inputFlags&~(kBehaviorHeldReleaseInput|kBehaviorDeferredExit)))return Status::InvalidArgument;
+       options->reserved||(options->inputFlags&~(kBehaviorHeldReleaseInput|kBehaviorDeferredExit|kBehaviorValidateNativeSource)))return Status::InvalidArgument;
+    if((options->inputFlags&kBehaviorValidateNativeSource)&&!deferredSourceValidator.load(std::memory_order_acquire))return Status::Unavailable;
     bool inventoryOnly=false,semanticIdentity=false;
     if(options->structSize==sizeof(SourceBehaviorOptions2)){
         const auto& extended=*reinterpret_cast<const SourceBehaviorOptions2*>(options);
@@ -437,12 +444,9 @@ Status BS_CALL CopyEligibility(std::uint64_t reader,std::uint64_t handle,std::ui
 }
 const ContentPolicyApi contentPolicyApi{sizeof(ContentPolicyApi),kContentPolicyApiVersion,3,SetContentPolicy,ClearContentPolicy,CopySavedContentPolicies,CopyEligibility};
 const BehaviorApi behaviorApi{sizeof(BehaviorApi),kBehaviorApiVersion,1,RegisterSourceBehavior};
-Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,RuntimeRecord* output) noexcept {
-    return GuardRuntime([&]{
-        if(!output||!requestId)return Status::InvalidArgument;
-        const auto client=RuntimeClientIdentity(writer,true,nullptr);if(client!=Status::Ok)return client;
-        const auto synced=SyncConfiguration();if(synced!=Status::Ok)return synced;
-        auto& s=Runtime();std::lock_guard lock(s.mutex);
+// Caller holds the runtime mutex; this read never invokes a provider.
+Status ReadDeferredSourceLocked(const State& s,std::uint64_t writer,std::uint64_t requestId,
+    RuntimeRecord& output,bool& native) {
         for(const auto& p:s.pending)if(p.request.requestId==requestId){
             if(p.owner!=writer)return Status::Unauthorized;
             const auto& original=p.request.offer.context.slot;
@@ -454,12 +458,43 @@ Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,R
             const auto* row=Find(s,original.configured.instance.instanceHandle);
             if(!behavior||!row||row->availability||row->bodyGeneration!=original.bodyGeneration||
                row->anchorGeneration!=original.anchorGeneration||row->contentVersion!=original.contentVersion)return Status::Conflict;
-            *output=*row;return Status::Ok;
+            output=*row;native=p.nativeSourceValidation;return Status::Ok;
         }
         return Status::NotFound;
+}
+Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,RuntimeRecord* output) noexcept {
+    return GuardRuntime([&]{
+        if(!output||!requestId)return Status::InvalidArgument;
+        auto status=RuntimeClientIdentity(writer,true,nullptr);if(status!=Status::Ok)return status;
+        status=SyncConfiguration();if(status!=Status::Ok)return status;
+        auto& s=Runtime();RuntimeRecord copied{};bool native=false;
+        {std::lock_guard lock(s.mutex);status=ReadDeferredSourceLocked(s,writer,requestId,copied,native);}
+        if(status!=Status::Ok)return status;
+        if(native){
+            const auto validate=deferredSourceValidator.load(std::memory_order_acquire);
+            if(!validate)return Status::Unavailable;
+            status=validate(copied);
+            if(status!=Status::Ok){
+                if(status==Status::Conflict){std::lock_guard lock(s.mutex);
+                    for(auto& p:s.pending)if(p.request.requestId==requestId&&p.owner==writer&&p.request.grant.epoch==copied.epoch)
+                        p.sourceInvalidated=true;
+                }
+                return status;
+            }
+            status=RuntimeClientIdentity(writer,true,nullptr);if(status!=Status::Ok)return status;
+            status=SyncConfiguration();if(status!=Status::Ok)return status;
+            RuntimeRecord current{};bool stillNative=false;
+            {std::lock_guard lock(s.mutex);status=ReadDeferredSourceLocked(s,writer,requestId,current,stillNative);}
+            if(status!=Status::Ok)return status;
+            if(!stillNative||current.epoch!=copied.epoch||current.frame!=copied.frame||
+               current.bodyGeneration!=copied.bodyGeneration||current.anchorGeneration!=copied.anchorGeneration||
+               current.contentVersion!=copied.contentVersion)return Status::Conflict;
+            copied=current;
+        }
+        *output=copied;return Status::Ok;
     });
 }
-const BehaviorApi2 behaviorApi2{{sizeof(BehaviorApi2),2,7|kBehaviorExtendedOptions,RegisterSourceBehavior},RegisterSourceBehaviorWithOptions,CopyDeferredSource};
+const BehaviorApi2 behaviorApi2{{sizeof(BehaviorApi2),2,7|kBehaviorExtendedOptions|kBehaviorNativeSourceValidation,RegisterSourceBehavior},RegisterSourceBehaviorWithOptions,CopyDeferredSource};
 } // namespace
 
 bool ComposeSlotTransform(const Definition& d,const RuntimeTransform& anchor,RuntimeTransform& out,float center[3],float& radius) noexcept {
@@ -584,7 +619,7 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
             if(s.pending.size()==kMaxPendingActions){auto old=std::find_if(s.pending.begin(),s.pending.end(),[](const Pending& p){return !Reserved(p);});if(old==s.pending.end())return Status::LimitExceeded;s.pending.erase(old);}
             request={offer,grant,Allocate(s)};if(!request.requestId)return Status::LimitExceeded;
             if(s.used.size()==kMaxActionOffers)s.used.erase(s.used.begin());s.used.push_back({grant.epoch,grant.inputSequence,grant.physicalHand});
-            Pending pending{};pending.request=request;pending.owner=callback->owner;pending.inventoryReceiptsOnly=callback->inventoryReceiptsOnly;s.pending.push_back(pending);
+            Pending pending{};pending.request=request;pending.owner=callback->owner;pending.inventoryReceiptsOnly=callback->inventoryReceiptsOnly;pending.nativeSourceValidation=(callback->inputFlags&kBehaviorValidateNativeSource)!=0;s.pending.push_back(pending);
         }
         if(!Own(callback->owner,callback->behavior.instanceHandle))status=Status::Unauthorized;
         else {CallLease lease(callback);if(!lease)status=Status::Unavailable;else try {if(callback->execute2){const SourceActionRequest selected{request,incoming};status=callback->execute2(callback->behavior.context,&selected);}else status=callback->behavior.execute(callback->behavior.context,&request);}catch(...){status=Status::InternalError;}}
@@ -637,6 +672,7 @@ Status CopyActionProgress(ActionProgress* output,std::uint32_t capacity,std::uin
     return GuardRuntime([&]{if(!count||capacity>kMaxPendingActions||(capacity&&!output))return Status::InvalidArgument;auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);*count=static_cast<std::uint32_t>(s.pending.size());if(capacity<s.pending.size())return Status::BufferTooSmall;for(std::size_t i=0;i<s.pending.size();++i)output[i]=Progress(s.pending[i]);return Status::Ok;});
 }
 void SetContentCommitValidator(ContentCommitValidator validator) noexcept {contentValidator.store(validator,std::memory_order_release);}
+void SetDeferredSourceValidator(DeferredSourceValidator validator) noexcept {deferredSourceValidator.store(validator,std::memory_order_release);}
 Status CopyPendingHandActions(PendingHandAction* output,std::uint32_t capacity,std::uint32_t* count) noexcept {
     return GuardRuntime([&]{
         if(!count||capacity>kMaxPendingActions||(capacity&&!output))return Status::InvalidArgument;

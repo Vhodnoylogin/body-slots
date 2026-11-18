@@ -41,6 +41,9 @@ using ContentCommitValidator=Status (*)(const ContentCommit&,const ActionRequest
 // The hook runs outside runtime/registry locks and must validate the assigned
 // HIGGS executor's matching confirmed result, or current grant for Accepted.
 void SetContentCommitValidator(ContentCommitValidator) noexcept;
+using DeferredSourceValidator=Status (*)(const RuntimeRecord&) noexcept;
+// Optional main-frame native identity/equipment read, outside all core locks.
+void SetDeferredSourceValidator(DeferredSourceValidator) noexcept;
 // A terminal noncommit is factual HIGGS evidence, never a missing history row or
 // a local callback failure. Compensation must be explicitly confirmed upstream.
 // Inventory evidence is separate from physical effects; unchanged evidence only

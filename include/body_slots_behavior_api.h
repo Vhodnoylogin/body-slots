@@ -42,11 +42,13 @@ struct BehaviorApi {
 // permission to keep a stale source. Consumers must still revalidate before work.
 constexpr std::uint32_t kBehaviorHeldReleaseInput=1;
 constexpr std::uint32_t kBehaviorDeferredExit=2;
+constexpr std::uint32_t kBehaviorValidateNativeSource=4;
+constexpr std::uint64_t kBehaviorNativeSourceValidation=16;
 struct SourceBehaviorOptions {
     std::uint32_t structSize,grantDurationMs; // 1..60000; v1 registrations use 2000
     // DeferredExit allows empty-hand Down dispatch just outside the original
     // source; executor must still validate the same held sequence before work.
-    std::uint32_t inputFlags,reserved; // kBehaviorHeldReleaseInput | kBehaviorDeferredExit
+    std::uint32_t inputFlags,reserved; // release/deferred/native-source flags
 };
 constexpr std::uint64_t kBehaviorExtendedOptions=8;
 enum class ContentEffectContract : std::uint32_t { Conservative=0,InventoryReceiptsOnly=1 };
@@ -72,6 +74,8 @@ struct BehaviorApi2 {
         const SourceBehaviorSpec*,const SourceBehaviorOptions*,std::uint64_t* registration);
     // Accepted uncommitted work only: same behavior/policy/save/content/body/anchor,
     // active equipment binding and available geometry. The hand may be outside.
+    // ValidateNativeSource additionally checks live body/equipment/anchor identity
+    // on the native frame thread; conflicts retire this accepted source permanently.
     Status (BS_CALL *CopyDeferredSource)(std::uint64_t writer,std::uint64_t requestId,RuntimeRecord*);
 };
 using QueryBehaviorInterface=const BehaviorApi* (BS_CALL *)(std::uint32_t,std::uint32_t);

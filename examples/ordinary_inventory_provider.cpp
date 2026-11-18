@@ -33,6 +33,7 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
         t.gameServices->CopyInputServices(&services)==Status::Ok && (services&kGameInventoryEffectEvidence);
     const bool typedContent=typedOptions&&inventoryEvidence;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&!typedOptions)return Status::UnsupportedVersion;
+    if((c.withdrawOnExit||c.storeOnHeldRelease)&&!(t.behaviorOptions->base.capabilities&kBehaviorNativeSourceValidation))return Status::UnsupportedVersion;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&!inventoryEvidence)return Status::Unavailable;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(t.releases.structSize!=sizeof(t.releases)||
        t.releases.abiVersion!=HIGGS_HELD_RELEASE_ABI_VERSION||!(t.releases.capabilities&1)||!t.releases.FollowInventoryGrip))return Status::UnsupportedVersion;
@@ -62,7 +63,8 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
     }
     executorLabel_=label;
     SourceBehaviorSpec spec{sizeof(spec),0,c.instance,this,Offers,Execute,label,actionExecutor_};
-    const auto inputFlags=(c.storeOnHeldRelease?kBehaviorHeldReleaseInput:0u)|(c.withdrawOnExit?kBehaviorDeferredExit:0u);
+    const auto inputFlags=(c.storeOnHeldRelease?kBehaviorHeldReleaseInput:0u)|(c.withdrawOnExit?kBehaviorDeferredExit:0u)|
+        ((c.storeOnHeldRelease||c.withdrawOnExit)?kBehaviorValidateNativeSource:0u);
     const SourceBehaviorOptions2 options{{sizeof(options),c.withdrawOnExit?60000u:2000u,inputFlags,0},static_cast<std::uint32_t>(ContentEffectContract::InventoryReceiptsOnly),static_cast<std::uint32_t>(ActionIdentity::SemanticAction)};
     const auto registered=typedContent?t.behaviorOptions->RegisterSourceBehaviorWithOptions(c.writer,&spec,&options.base,&behavior_):
         t.behaviors->RegisterSourceBehavior(c.writer,&spec,&behavior_);
@@ -186,14 +188,15 @@ bool OrdinaryInventoryProvider::DrawReady(Work& w,const HIGGS_HandSnapshot& snap
 }
 bool OrdinaryInventoryProvider::SourceReady(Work& w,const HIGGS_HandSnapshot& snapshot,InventoryProviderProgress& p,RuntimeRecord& current){
     const auto& action=w.selected.request;
-    p.slotStatus=tables_.behaviorOptions->CopyDeferredSource(config_.writer,action.requestId,&current);
+    p.sourceStatus=p.slotStatus=tables_.behaviorOptions->CopyDeferredSource(config_.writer,action.requestId,&current);
+    if(p.sourceStatus!=Status::Ok){w.cancel=true;return false;}
     GameFrameObservation frame{};frame.structSize=sizeof(frame);
     const auto copied=tables_.frameObservations->CopyFrameObservation(&frame);
     const auto now=Now();
-    if(p.slotStatus!=Status::Ok||copied!=Status::Ok||
-       frame.epoch!=snapshot.epoch||current.epoch!=snapshot.epoch||!current.frame||
+    if(copied!=Status::Ok){p.sourceStatus=copied;w.cancel=true;return false;}
+    if(frame.epoch!=snapshot.epoch||current.epoch!=snapshot.epoch||!current.frame||
        current.frame!=frame.frame||current.frame<action.offer.context.slot.frame||!frame.sampledAtNs||!snapshot.sampledAtNs||
-       frame.copiedAtNs<frame.sampledAtNs||frame.copiedAtNs-frame.sampledAtNs>100000000||now<snapshot.sampledAtNs||now-snapshot.sampledAtNs>100000000){w.cancel=true;return false;}
+       frame.copiedAtNs<frame.sampledAtNs||frame.copiedAtNs-frame.sampledAtNs>100000000||now<snapshot.sampledAtNs||now-snapshot.sampledAtNs>100000000){p.sourceStatus=Status::Conflict;w.cancel=true;return false;}
     return true;
 }
 HIGGS_HandStatus HIGGS_HAND_CALL OrdinaryInventoryProvider::AdmitTransfer(const HIGGS_ActionRequest* request,const HIGGS_HandSnapshot* snapshot,void* context){
