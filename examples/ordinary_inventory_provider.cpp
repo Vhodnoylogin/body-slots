@@ -107,8 +107,8 @@ Status OrdinaryInventoryProvider::Queue(const SourceActionRequest& r){
            tables_.hands.ReportResult(config_.higgsClient,&accepted)!=HIGGS_HAND_OK)return Status::Conflict;
     }
     // The successful opt-in is the last provider operation. Only the callback
-    // mutex and POD publication follow; retained work has an owner to drain it.
-    lock.lock();work_=next;progress_={};progress_.stage=InventoryProviderStage::Queued;progress_.slotRequest=action.requestId;progress_.higgsAction=action.grant.requestId;progress_.saveGeneration=scope.saveGeneration;return Status::Ok;
+    // mutex and nonthrowing copied-state publication follow; retained work has an owner to drain it.
+    lock.lock();work_=next;progress_={};progress_.stage=InventoryProviderStage::Queued;progress_.slotRequest=action.requestId;progress_.higgsAction=action.grant.requestId;progress_.saveGeneration=scope.saveGeneration;progress_.semanticContext=next.plan.semanticContext;return Status::Ok;
 }
 void OrdinaryInventoryProvider::ObserveScope(Work& w,InventoryProviderProgress& p){
     RuntimeView scope{};scope.structSize=sizeof(scope);scope.version=kRuntimeApiVersion;

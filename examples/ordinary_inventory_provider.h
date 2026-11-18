@@ -7,6 +7,7 @@
 #include "higgshandapi.h"
 #include <array>
 #include <mutex>
+#include <memory>
 namespace body_slots::examples {
 struct ContentProjection { std::uint64_t identity=0,quantity=0; };
 [[nodiscard]] constexpr bool TransferNeedsRecovery(const HIGGS_TransferState& state) noexcept {
@@ -16,6 +17,9 @@ struct ContentProjection { std::uint64_t identity=0,quantity=0; };
 struct OrdinaryItemPlan {
     std::uint32_t transferKind=0,baseFormId=0,stackOrdinal=0,quantity=1;
     ContentProjection after;
+    // SDK-only owned, immutable consumer data copied with this exact offer.
+    // Never interpreted by Framework/HIGGS or exposed across a DLL ABI.
+    std::shared_ptr<const void> semanticContext;
 };
 // Read-only, thread-safe policy. No inventory calls, mutation or implicit stock.
 using OrdinaryItemPolicy=bool (*)(void*,const SourceActionContext&,OrdinaryItemPlan&);
@@ -72,6 +76,7 @@ struct InventoryProviderProgress {
     // but must never be projected into a recreated instance or another save.
     bool sourceRetired=false;
     Status settlementStatus=Status::Ok; // Consumer semantic acknowledgement, not physical uncertainty.
+    std::shared_ptr<const void> semanticContext; // Pinned accepted-plan data for idempotent settlement.
 };
 class OrdinaryInventoryProvider final {
 public:

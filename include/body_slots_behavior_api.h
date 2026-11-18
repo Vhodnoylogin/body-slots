@@ -52,7 +52,7 @@ constexpr std::uint64_t kBehaviorExtendedOptions=8;
 enum class ContentEffectContract : std::uint32_t { Conservative=0,InventoryReceiptsOnly=1 };
 enum class ActionIdentity : std::uint32_t { LegacyExecutorAction=0,SemanticAction=1 };
 struct SourceBehaviorOptions2 {
-    SourceBehaviorOptions base; // exact16-byte prefix; structSize=sizeof(SourceBehaviorOptions2)
+    SourceBehaviorOptions base; // exact 16-byte prefix; structSize=sizeof(SourceBehaviorOptions2)
     // InventoryReceiptsOnly: content changes require positive HIGGS inventory
     // evidence. A physical release alone never represents content commitment.
     std::uint32_t contentContract;
