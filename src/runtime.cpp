@@ -62,6 +62,7 @@ struct Pending {
     bool committed=false,handCommitted=false,handCompensated=false,authoritySettled=false,terminalReceipt=false;
     bool sourceInvalidated=false; // sticky for accepted deferred work; unrelated offers may change
     bool inventoryReceiptsOnly=false,inventoryCommitted=false,inventoryUnchangedConfirmed=false;
+    bool inventoryRestoredConfirmed=false,executorFailed=false;
     ContentCommit receipt{}, last{};
 };
 struct State {
@@ -336,7 +337,9 @@ Status BS_CALL ReportContentCommit(std::uint64_t writer,const ContentCommit* com
                 }
             }
             if(stage==CommitStage::Failed||stage==CommitStage::Cancelled){
-                const bool unchanged=p.inventoryReceiptsOnly&&p.inventoryUnchangedConfirmed&&!p.inventoryCommitted;
+                const bool unchanged=p.inventoryReceiptsOnly&&
+                    ((p.inventoryUnchangedConfirmed&&!p.inventoryCommitted)||p.inventoryRestoredConfirmed);
+                if(p.inventoryReceiptsOnly&&!p.committed&&!p.authoritySettled&&!unchanged)return Status::Conflict;
                 if(p.handCommitted&&!p.committed&&!p.authoritySettled&&!unchanged)return Status::Conflict;
                 if(p.inventoryReceiptsOnly&&!p.committed&&(commit->contentVersion!=req.offer.context.slot.contentVersion||commit->contentIdentity!=req.offer.context.slot.contentIdentity||commit->quantity!=req.offer.context.slot.quantity))return Status::Conflict;
             }
@@ -585,7 +588,13 @@ Status DispatchSelected(const ActionOffer& offer,const ActionGrant& grant,std::u
         }
         if(!Own(callback->owner,callback->behavior.instanceHandle))status=Status::Unauthorized;
         else {CallLease lease(callback);if(!lease)status=Status::Unavailable;else try {if(callback->execute2){const SourceActionRequest selected{request,incoming};status=callback->execute2(callback->behavior.context,&selected);}else status=callback->behavior.execute(callback->behavior.context,&request);}catch(...){status=Status::InternalError;}}
-        if(status!=Status::Ok){auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);for(auto& p:s.pending)if(p.request.requestId==request.requestId&&!p.committed&&!Terminal(p.stage))p.stage=CommitStage::Failed;}
+        {auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);for(auto& p:s.pending)if(p.request.requestId==request.requestId){
+            p.executorFailed=status!=Status::Ok;
+            if(status!=Status::Ok&&!p.committed&&!Terminal(p.stage))p.stage=CommitStage::Failed;
+            if(p.executorFailed&&p.inventoryReceiptsOnly&&
+                ((p.inventoryUnchangedConfirmed&&!p.inventoryCommitted)||p.inventoryRestoredConfirmed))
+                p.authoritySettled=true;
+        }}
         *requestId=request.requestId;return status;
     });
 }
@@ -638,23 +647,27 @@ Status CopyPendingHandActions(PendingHandAction* output,std::uint32_t capacity,s
         return Status::Ok;
     });
 }
-Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage,bool compensated,bool noncommitConfirmed,bool inventoryCommitted,bool inventoryUnchangedConfirmed) noexcept {
+Status ApplyHandResult(std::uint64_t request,std::uint64_t epoch,CommitStage stage,bool compensated,bool noncommitConfirmed,bool inventoryCommitted,bool inventoryUnchangedConfirmed,bool inventoryRestoredConfirmed) noexcept {
     return GuardRuntime([&]{
         if(!request||!epoch||(stage!=CommitStage::Failed&&stage!=CommitStage::Cancelled&&stage!=CommitStage::Committed&&stage!=CommitStage::Completed))return Status::InvalidArgument;
         auto& s=Runtime();std::lock_guard<std::mutex> lock(s.mutex);
         for(auto& pending:s.pending)if(pending.request.grant.requestId==request&&pending.request.grant.epoch==epoch){
             pending.inventoryCommitted=pending.inventoryCommitted||inventoryCommitted;
+            if(pending.inventoryReceiptsOnly&&inventoryRestoredConfirmed)pending.inventoryRestoredConfirmed=true;
             if(pending.inventoryCommitted)pending.inventoryUnchangedConfirmed=false;
             else if(pending.inventoryReceiptsOnly&&inventoryUnchangedConfirmed)pending.inventoryUnchangedConfirmed=true;
             if(stage==CommitStage::Committed||stage==CommitStage::Completed){
                 pending.handCommitted=true; // An irreversible fact survives local cancellation.
                 if(!pending.committed&&!pending.terminalReceipt&&!pending.handCompensated)pending.authoritySettled=false;
             }
-            if(compensated&&Terminal(stage)){
+            if(compensated&&Terminal(stage)&&(!pending.inventoryReceiptsOnly||pending.inventoryRestoredConfirmed)){
                 pending.handCompensated=true;
-                pending.authoritySettled=true;
+                if(!pending.inventoryReceiptsOnly||pending.executorFailed)pending.authoritySettled=true;
                 if(!pending.terminalReceipt)pending.stage=CommitStage::Cancelled;
             }else if(stage==CommitStage::Failed||stage==CommitStage::Cancelled){
+                if(pending.inventoryReceiptsOnly&&pending.executorFailed&&
+                    ((pending.inventoryUnchangedConfirmed&&!pending.inventoryCommitted)||pending.inventoryRestoredConfirmed))
+                    pending.authoritySettled=true;
                 if(noncommitConfirmed&&(!pending.handCommitted||pending.committed))pending.authoritySettled=true;
                 if(!pending.terminalReceipt)pending.stage=stage;
             }

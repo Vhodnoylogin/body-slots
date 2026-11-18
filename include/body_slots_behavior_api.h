@@ -54,7 +54,9 @@ enum class ActionIdentity : std::uint32_t { LegacyExecutorAction=0,SemanticActio
 struct SourceBehaviorOptions2 {
     SourceBehaviorOptions base; // exact 16-byte prefix; structSize=sizeof(SourceBehaviorOptions2)
     // InventoryReceiptsOnly: content changes require positive HIGGS inventory
-    // evidence. A physical release alone never represents content commitment.
+    // evidence through the shared HIGGS executor. A physical release alone never
+    // represents content commitment. Failed/Cancelled reports need positive
+    // closed nonmutation or confirmed compensation; absence of a flag is not proof.
     std::uint32_t contentContract;
     // SemanticAction uses proposal.action for HIGGS priority/stable identity,
     // leaving executorAction as an opaque per-offer executor correlation.

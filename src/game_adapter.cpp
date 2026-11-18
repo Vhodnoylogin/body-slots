@@ -12,6 +12,7 @@
 #include "content_policy.h"
 #include "higgshandapi.h"
 #include "higgsinput.h"
+#include "higgstransactions.h"
 #include "higgsinterface001.h"
 #include "main/higgs_native_regions.h"
 #include "main/interaction_regions.h"
@@ -90,10 +91,13 @@ public:
     }
     Status CopyInputServices(std::uint64_t* out) {
         if(!out)return Status::InvalidArgument;
-        std::lock_guard lock(mutex_);*out=connected_&&releaseRecognizer_?kGameHeldReleaseInput:0;
+        std::lock_guard lock(mutex_);
+        *out=connected_?((releaseRecognizer_?kGameHeldReleaseInput:0)|
+            (inventoryEffects_.CopyForAction?kGameInventoryEffectEvidence:0)):0;
         return Status::Ok;
     }
 private:
+    bool ObserveResult(const detail::PendingHandAction&,const HIGGS_ActionResult&) noexcept;
     static void OnFrame() noexcept;
     static void OnStandaloneFrame() noexcept;
     void TickStandalone();
@@ -126,6 +130,7 @@ private:
     HIGGS_InputRoutesInterface routes_{};
     HIGGS_ActionRequest dragAuthority_{};
     HIGGS_HandRoutingInterface routing_{};
+    HIGGS_InventoryEffectsInterface inventoryEffects_{};
     HIGGS_GrantMutationInterface mutation_{};
     HIGGS_HandClient client_{};
     std::uint64_t recognizerLabel_{};
@@ -161,22 +166,23 @@ Adapter& State() { static Adapter state; return state; }
 Status ValidateContentCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     return State().ValidateCommit(commit, request);
 }
-bool ObserveHandResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result) noexcept {
+bool ObserveHandResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result,
+    bool inventoryUnchangedConfirmed=false,bool inventoryEvidence=false,bool inventoryRestored=false) noexcept {
     if(result.structSize!=sizeof(result)||result.requestId!=action.grant.requestId||
        result.epoch!=action.grant.epoch||result.inputId!=action.grant.inputSequence||
        result.executor!=action.executor||(result.receiptFlags&~7u))return false;
-    const bool irreversible=(result.receiptFlags&(HIGGS_RECEIPT_INVENTORY_COMMITTED|HIGGS_RECEIPT_PHYSICAL_CONFIRMED))!=0;
-    const bool inventoryCommitted=(result.receiptFlags&HIGGS_RECEIPT_INVENTORY_COMMITTED)!=0;
+    const bool inventoryCommitted=inventoryEvidence||(result.receiptFlags&HIGGS_RECEIPT_INVENTORY_COMMITTED)!=0;
+    const bool irreversible=inventoryCommitted||(result.receiptFlags&HIGGS_RECEIPT_PHYSICAL_CONFIRMED)!=0;
     const bool compensated=(result.receiptFlags&HIGGS_RECEIPT_COMPENSATED)!=0;
     // Stage cancellation alone cannot erase an already observed side effect.
     if(irreversible||result.stage==HIGGS_ACTION_COMMITTED||result.stage==HIGGS_ACTION_COMPLETED)
         detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Committed,false,false,inventoryCommitted);
     if(result.stage==HIGGS_ACTION_COMPLETED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Completed,compensated,false,inventoryCommitted);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Completed,compensated,false,inventoryCommitted,false,inventoryRestored);
     else if(result.stage==HIGGS_ACTION_CANCELLED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Cancelled,compensated,false,inventoryCommitted,!inventoryCommitted);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Cancelled,compensated,false,inventoryCommitted,inventoryUnchangedConfirmed,inventoryRestored);
     else if(result.stage==HIGGS_ACTION_REJECTED)
-        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Failed,compensated,false,inventoryCommitted,!inventoryCommitted);
+        detail::ApplyHandResult(action.grant.requestId,action.grant.epoch,CommitStage::Failed,compensated,false,inventoryCommitted,inventoryUnchangedConfirmed,inventoryRestored);
     return true;
 }
 RuntimeTransform CopyTransform(const RE::NiTransform& t) {
@@ -270,6 +276,12 @@ void Adapter::Connect() {
     const auto queryRouting = reinterpret_cast<HIGGS_QueryHandRoutingInterfaceFn>(GetProcAddress(module, "HIGGS_QueryHandRoutingInterface"));
     HIGGS_HandRoutingInterface routing{};
     if (!queryRouting || queryRouting(HIGGS_HAND_ROUTING_ABI_VERSION, sizeof(routing), &routing) != HIGGS_HAND_OK) return;
+    HIGGS_InventoryEffectsInterface inventoryEffects{};
+    const auto queryEffects=reinterpret_cast<HIGGS_QueryInventoryEffectsInterfaceFn>(
+        GetProcAddress(module,"HIGGS_QueryInventoryEffectsInterface"));
+    if(!queryEffects || queryEffects(HIGGS_INVENTORY_EFFECTS_ABI_VERSION,sizeof(inventoryEffects),&inventoryEffects)!=HIGGS_HAND_OK ||
+       inventoryEffects.structSize!=sizeof(inventoryEffects) || inventoryEffects.abiVersion!=HIGGS_INVENTORY_EFFECTS_ABI_VERSION ||
+       !(inventoryEffects.capabilities&1) || !inventoryEffects.CopyForAction) inventoryEffects={};
     HIGGS_GrantMutationInterface mutation{};
     const auto queryMutation=reinterpret_cast<HIGGS_QueryGrantMutationInterfaceFn>(GetProcAddress(module,"HIGGS_QueryGrantMutationInterface"));
     if(queryMutation&&queryMutation(HIGGS_GRANT_MUTATION_ABI_VERSION,sizeof(mutation),&mutation)!=HIGGS_HAND_OK)mutation={};
@@ -312,7 +324,7 @@ void Adapter::Connect() {
        !rounds.EnableSharedRounds){releases={};rounds={};}
     phases->AddPostVrikPostHiggsCallback(&OnFrame);
     std::lock_guard lock(mutex_);
-    api_ = api; routes_=routes; routing_ = routing; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;releases_=releases;rounds_=rounds;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
+    api_ = api; routes_=routes; routing_ = routing; inventoryEffects_=inventoryEffects; mutation_=mutation; client_ = client; recognizerLabel_=label; recognizer_ = recognizer;releases_=releases;rounds_=rounds;dragExecutor_=dragExecutor; reader_ = reader; connected_ = true;
     detail::SetContentCommitValidator(&ValidateContentCommit);
 }
 void Adapter::OnStandaloneFrame() noexcept {
@@ -354,10 +366,28 @@ void Adapter::TickStandalone() {
     standaloneWorld_.reset(epoch ? world : nullptr);
     detail::SetInteractionRegionsScope(epoch, epoch ? save : 0);
 }
+bool Adapter::ObserveResult(const detail::PendingHandAction& action,const HIGGS_ActionResult& result) noexcept {
+    bool unchanged=false,committed=false,restored=false;
+    if(inventoryEffects_.CopyForAction && (result.stage==HIGGS_ACTION_CANCELLED || result.stage==HIGGS_ACTION_REJECTED ||
+       (result.receiptFlags&HIGGS_RECEIPT_COMPENSATED))){
+        HIGGS_ActionInventoryEffect effect{};effect.structSize=sizeof(effect);
+        if(inventoryEffects_.CopyForAction(client_,result.requestId,&effect)==HIGGS_HAND_OK &&
+           effect.structSize==sizeof(effect) && !effect.reserved && !(effect.flags&~15u) &&
+           effect.parentRequestId==result.requestId && effect.epoch==result.epoch){
+            committed=(effect.flags&HIGGS_INVENTORY_EFFECT_COMMITTED)!=0;
+            unchanged=(effect.flags&HIGGS_INVENTORY_EFFECT_CLOSED) &&
+                !(effect.flags&(HIGGS_INVENTORY_EFFECT_COMMITTED|HIGGS_INVENTORY_EFFECT_UNCERTAIN));
+            restored=(effect.flags&(HIGGS_INVENTORY_EFFECT_CLOSED|HIGGS_INVENTORY_EFFECT_COMMITTED|HIGGS_INVENTORY_EFFECT_RESTORED))==
+                (HIGGS_INVENTORY_EFFECT_CLOSED|HIGGS_INVENTORY_EFFECT_COMMITTED|HIGGS_INVENTORY_EFFECT_RESTORED) &&
+                !(effect.flags&HIGGS_INVENTORY_EFFECT_UNCERTAIN);
+        }
+    }
+    return ObserveHandResult(action,result,unchanged,committed,restored);
+}
 Status Adapter::ValidateCommit(const ContentCommit& commit, const ActionRequest& request) noexcept {
     HIGGS_ActionResult result{}; result.structSize = sizeof(result);
     if (!client_ || api_.CopyActionResult(client_, request.grant.requestId, &result) != HIGGS_HAND_OK) return Status::Unavailable;
-    if (result.epoch != commit.epoch || !ObserveHandResult({request.grant,request.offer.higgsExecutor},result))
+    if (result.epoch != commit.epoch || !ObserveResult({request.grant,request.offer.higgsExecutor},result))
         return Status::Conflict;
     const auto stage = static_cast<CommitStage>(commit.stage);
     if (stage == CommitStage::Committed)
@@ -380,7 +410,7 @@ void Adapter::SynchronizeActions() {
         HIGGS_ActionResult result{}; result.structSize = sizeof(result);
         const auto status = api_.CopyActionResult(client_, action.grant.requestId, &result);
         // Missing/evicted HIGGS history is uncertainty, never a noncommit receipt.
-        if(status==HIGGS_HAND_OK)ObserveHandResult(action,result);
+        if(status==HIGGS_HAND_OK)ObserveResult(action,result);
     }
 }
 void Adapter::OnFrame() noexcept { try { State().Tick(); } catch (...) { State().Reset(); detail::InvalidateRuntime(); } }

@@ -1,8 +1,14 @@
 # VR Interaction Framework release readiness
 
-VR Interaction Framework is infrastructure for consumer mods and adds no standalone gameplay feature. The current candidate packaging label is `0.2.0-rc.4`. Existing RC3 archives and their qualification remain historical and unchanged.
+VR Interaction Framework is infrastructure for consumer mods and adds no standalone gameplay feature. The qualified offline packaging checkpoint is historical `0.2.0-rc.4`. Newer development uses the explicitly untested `0.2.0-pretest+<source>` build-only label. Existing RC3/RC4 archives and their qualification remain historical and unchanged.
 
-## Checked boundary
+## Current untested development
+
+Source after RC4 adds held-release storage, deferred pull-out withdrawal, logical-save receipt settlement, actual source-age observations, typed inventory-only projection, stable semantic action IDs and consumer-owned settlement context. Positive HIGGS inventory-effect observations distinguish known nonmutation from a cancelled action with unresolved inventory state. Old table layouts and technical identities remain compatible; enhanced consumer features negotiate the additional services explicitly. The owner requested no testing for this development. Production compilation/linking and package integrity do not extend RC4's offline or gameplay qualification. Current exact heads and build receipts are recorded in the canonical Body Pouches implementation ledger.
+
+The standard compiler and candidate packager have explicit `--build-only` modes for separate runtime/SDK artifacts. These modes do not build/run tests, load the DLL, install or launch Skyrim. Their metadata and labels cannot claim a verified RC4 run.
+
+## Historical RC4 checked boundary
 
 The source implements named player/NPC/equipment/world/transient regions, revision-checked placement and configuration, HIGGS-authorized actions, matching input release and optional RegionDwell1 offers in the same HIGGS shared ordered-proposal version 2 round. The repository contains offline production-core, provider-protocol and actual-DLL discovery checks. Passing those checks establishes only the cases and source/provider revisions recorded by their run; it does not establish a Skyrim session.
 

@@ -24,10 +24,16 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(!t.behaviorOptions||t.behaviorOptions->base.structSize!=sizeof(BehaviorApi2)||
        t.behaviorOptions->base.version!=2||!t.behaviorOptions->RegisterSourceBehaviorWithOptions||
        !t.behaviorOptions->CopyDeferredSource||!t.routes.CopySequence))return Status::UnsupportedVersion;
-    const bool typedContent=t.behaviorOptions&&t.behaviorOptions->base.structSize==sizeof(BehaviorApi2)&&
+    const bool typedOptions=t.behaviorOptions&&t.behaviorOptions->base.structSize==sizeof(BehaviorApi2)&&
         t.behaviorOptions->base.version==2&&(t.behaviorOptions->base.capabilities&kBehaviorExtendedOptions)&&
         t.behaviorOptions->RegisterSourceBehaviorWithOptions;
-    if((c.withdrawOnExit||c.storeOnHeldRelease)&&!typedContent)return Status::UnsupportedVersion;
+    std::uint64_t services{};
+    const bool inventoryEvidence=t.gameServices && t.gameServices->base.structSize==sizeof(GameApi2) &&
+        t.gameServices->base.version==2 && t.gameServices->CopyInputServices &&
+        t.gameServices->CopyInputServices(&services)==Status::Ok && (services&kGameInventoryEffectEvidence);
+    const bool typedContent=typedOptions&&inventoryEvidence;
+    if((c.withdrawOnExit||c.storeOnHeldRelease)&&!typedOptions)return Status::UnsupportedVersion;
+    if((c.withdrawOnExit||c.storeOnHeldRelease)&&!inventoryEvidence)return Status::Unavailable;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(t.releases.structSize!=sizeof(t.releases)||
        t.releases.abiVersion!=HIGGS_HELD_RELEASE_ABI_VERSION||!(t.releases.capabilities&1)||!t.releases.FollowInventoryGrip))return Status::UnsupportedVersion;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(t.dispatch.structSize!=sizeof(t.dispatch)||t.dispatch.abiVersion!=2||!t.dispatch.Invoke))return Status::UnsupportedVersion;
@@ -37,7 +43,6 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
     if(c.storeOnHeldRelease){
         if(!t.gameServices||t.gameServices->base.structSize!=sizeof(GameApi2)||t.gameServices->base.version!=2||
            !t.gameServices->CopyInputServices)return Status::UnsupportedVersion;
-        std::uint64_t services{};
         if(t.gameServices->CopyInputServices(&services)!=Status::Ok||!(services&kGameHeldReleaseInput))return Status::Unavailable;
     }
     GameIntegration game{};game.structSize=sizeof(game);if(t.game->CopyIntegration(&game)!=Status::Ok||!game.connected||!game.higgsRecognizerClient)return Status::Unavailable;

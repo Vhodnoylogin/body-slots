@@ -13,6 +13,7 @@ struct GameApi {
     Status (BS_CALL *CopyIntegration)(GameIntegration*);
 };
 constexpr std::uint64_t kGameHeldReleaseInput=1;
+constexpr std::uint64_t kGameInventoryEffectEvidence=2;
 struct GameApi2 {
     GameApi base; // exact v1 prefix; version=2, structSize=sizeof(GameApi2)
     // Actual connected optional services. Successful copy may report zero.

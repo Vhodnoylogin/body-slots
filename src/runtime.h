@@ -47,7 +47,8 @@ void SetContentCommitValidator(ContentCommitValidator) noexcept;
 // relaxes the explicitly registered InventoryReceiptsOnly content contract.
 Status ApplyHandResult(std::uint64_t higgsRequestId,std::uint64_t epoch,CommitStage,
                        bool compensated=false,bool noncommitConfirmed=true,
-                       bool inventoryCommitted=false,bool inventoryUnchangedConfirmed=false) noexcept;
+                       bool inventoryCommitted=false,bool inventoryUnchangedConfirmed=false,
+                       bool inventoryRestoredConfirmed=false) noexcept;
 void InvalidateRuntime() noexcept;
 // Trusted native-provider adapter only. Scope acceptance, publication and copy
 // share the runtime invalidation fence; callers cannot select a save generation.
