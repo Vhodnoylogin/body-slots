@@ -23,7 +23,13 @@ Supplying those exact fork dependencies resolves the service-availability requir
 ## Remaining release work
 
 1. Qualify SKSE loading and one consumer scenario in Skyrim VR: enter/leave, one button or dwell effect, matched release, save/load, and an NPC source disappearing or being replaced. Existing offline tests do not replace that check.
-2. Make the exact provider builds installable and document feature-scoped dependencies. Released HIGGS alone cannot activate the new action path. Unavailable semantic-command or unconventional-equipment backends must remain disabled; they do not prevent a release of the supported region services.
+2. Distribute the exact provider builds and document feature-scoped dependencies. Complete HIGGS `fd226f6` and PLANCK `bcfa8f8` test archives are now built and independently verified, and installed with RC4 in the development MO2 instance. Released HIGGS alone cannot activate the new action path. Unavailable semantic-command or unconventional-equipment backends must remain disabled; they do not prevent a release of the supported region services.
 3. Review and update the unpublished Nexus draft with the new product name, candidate files, dependency versions and measured qualification. Existing VRIK holsters remain independent; overlapping native holsters require explicit user configuration because they are not silently migrated into this broker.
 
 A developer preview can expose the supported SDK with these limits. A generally usable runtime release needs the game evidence above; it must not be described as completing every service in the target synergy concept.
+
+## Prepared one-shot game test
+
+The separate [game consumer](../src/test/game_fixture/README.md), [scene compiler](../src/test/autotest_fixture_generator.py) and [bounded subject plan](../src/test/autotest_subject.py) are maintained test source, excluded from the runtime candidate. Native build/export smoke checks and independent source review pass. The consumer observes actual HIGGS selection and matching release, SKSE saved customization and exact PLANCK body generations; its logical action is not an inventory or physics receipt.
+
+Order `vrif-rc4-provider-integration-20261118-01` contains 286 installed pins and 28 checkpoints. The bundle is independently installed/verified in `mo2 test vr` with stock VRIK 0.8.8, and handed to Polygon under one owner-authorized autotest release. Polygon verified every installed pin, then refused dispatch before any game/native session because the VR platform lacks actual qualification and the new semantic mappings. All gameplay checks remain not run. Tooling-recipient routing and further one-shot authority need review before continuation; the original order/release stays immutable. Preparing this fixture does not qualify the testing platform or authorize automatic retries.
