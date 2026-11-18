@@ -50,6 +50,9 @@ struct InventoryProviderProgress {
     HIGGS_HandStatus handStatus=HIGGS_HAND_OK;
     std::uint64_t slotRequest=0,higgsAction=0,selectionTicket=0,transfer=0;
     HIGGS_TransferState receipt{};
+    // Optional original-grip continuation is separate from factual delivery.
+    // A stale press/possession may prevent following an already completed draw.
+    HIGGS_HandStatus releaseStatus=HIGGS_HAND_OK;
 };
 class OrdinaryInventoryProvider final {
 public:
@@ -77,7 +80,7 @@ private:
         HIGGS_TransferRequest transferRequest{};
         std::uint64_t ticket=0,transfer=0;
         std::uint64_t drawFrame=0,drawFrameAt=0,drawGeneration=0;
-        bool drawExited=false,releaseFollowed=false;
+        bool drawExited=false,releaseResolved=false;
         bool cancel=false,mirror=false,completed=false;
     };
     struct DrawDispatch { OrdinaryInventoryProvider* provider; Work* work; InventoryProviderProgress* progress; };

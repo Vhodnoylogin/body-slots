@@ -1,5 +1,9 @@
 # Ordinary items through the shared inventory executor
 
+Accepted deferred work is validated against its own source. Changes to other slots, their content or their anchors do not cancel an armed draw. A change or loss of the original source, body, anchor or hand observation invalidates it permanently; restoration requires a new press. Presentation-only changes preserve geometry and do not synthesize exit/entry events. Before admission, offers still use the global invalidation fence.
+
+A completed transfer and following its original grip are separate outcomes. If the original press or possession is already stale, the helper records `InventoryProviderProgress.releaseStatus` and still settles the factual transfer; it never invents a replacement press or repeats delivery. Other continuation errors retain recovery handling. HIGGS preserves exact child receipts across natural grant expiry without renewing permission to mutate. Cancellation before factual completion remains subject to the existing recovery/compensation contract. These additions are source-reviewed and compiled only, with no tests or gameplay qualification.
+
 The compilable SDK helper in [`examples/ordinary_inventory_provider.h`](../examples/ordinary_inventory_provider.h) and its implementation compose the existing public VR Interaction Framework and HIGGS tables. It is not part of the VR Interaction Framework DLL or a new ABI. A mod owns one instance, its selection/acceptance policy and its content mirror. The helper supplies the asynchronous protocol for ordinary player-inventory withdrawal into an actual HIGGS grip and storage of an actual HIGGS-held item into player inventory. It contains no Skyrim/CommonLib calls, `RemoveItem`, object spawning, pickup implementation or replacement grab mechanic.
 
 ## Consumer responsibilities

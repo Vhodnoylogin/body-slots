@@ -185,10 +185,14 @@ void OrdinaryInventoryProvider::Advance(Work& w,InventoryProviderProgress& p){
         const std::uint32_t expected=w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND?HIGGS_DISPOSITION_HAND:HIGGS_DISPOSITION_INVENTORY;
         const bool success=!restored&&state.disposition==expected&&(state.receiptFlags&HIGGS_TX_DOMAIN_ATTESTED)&&(state.receiptFlags&nativeFlag);
         if(success&&w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND&&
-           (config_.withdrawOnExit||config_.storeOnHeldRelease)&&!w.releaseFollowed){
-            p.handStatus=tables_.releases.FollowInventoryGrip(config_.higgsClient,w.transfer);
-            if(p.handStatus!=HIGGS_HAND_OK){p.stage=InventoryProviderStage::RecoveryRequired;return;}
-            w.releaseFollowed=true;
+           (config_.withdrawOnExit||config_.storeOnHeldRelease)&&!w.releaseResolved){
+            p.releaseStatus=tables_.releases.FollowInventoryGrip(config_.higgsClient,w.transfer);
+            if(!Released(p.releaseStatus)&&p.releaseStatus!=HIGGS_HAND_WRONG_PHASE&&p.releaseStatus!=HIGGS_HAND_CONFLICT){
+                p.handStatus=p.releaseStatus;p.stage=InventoryProviderStage::RecoveryRequired;return;
+            }
+            // A lost original press/possession cannot undo factual inventory
+            // delivery. Settle it once, exposing unavailable continuation.
+            w.releaseResolved=true;
         }
         p.stage=InventoryProviderStage::Reporting;if(!Finish(w,p,success))p.stage=InventoryProviderStage::RecoveryRequired;return;
     }

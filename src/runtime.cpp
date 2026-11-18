@@ -59,6 +59,7 @@ struct Pending {
     ActionRequest request{}; std::uint64_t owner=0;
     CommitStage stage=CommitStage::Accepted;
     bool committed=false,handCommitted=false,handCompensated=false,authoritySettled=false,terminalReceipt=false;
+    bool sourceInvalidated=false; // sticky for accepted deferred work; unrelated offers may change
     ContentCommit receipt{}, last{};
 };
 struct State {
@@ -121,6 +122,11 @@ bool LegacyPolicyAllows(const State& s,std::uint64_t handle,const RuntimeInput& 
 }
 bool Terminal(CommitStage stage) { return stage==CommitStage::Completed || stage==CommitStage::Failed || stage==CommitStage::Cancelled; }
 bool Reserved(const Pending& pending) { return !Terminal(pending.stage)||!pending.authoritySettled; }
+void InvalidatePendingSource(State& s,std::uint64_t handle) {
+    for(auto& pending:s.pending)
+        if(!handle||pending.request.offer.context.slot.configured.instance.instanceHandle==handle)
+            pending.sourceInvalidated=true;
+}
 void InvalidateOffers(State& s) {
     ++s.policy; s.offers.clear();s.offerSources.clear();
     // A Pending exists only after DispatchSelected starts its assigned executor.
@@ -134,6 +140,7 @@ void SweepRetired(State& s) {
     s.retired.erase(std::remove_if(s.retired.begin(),s.retired.end(),[](const std::shared_ptr<Callback>& c){std::lock_guard<std::mutex> lock(c->mutex);return !c->inFlight;}),s.retired.end());
 }
 void Events(const std::vector<RuntimeEvent>& events);
+RuntimeEvent Event(State&,const RuntimeRecord&,RuntimeEventKind,std::uint32_t hand=0);
 Status SyncConfiguration() {
     auto copied=std::make_unique<Configuration>();
     auto status=CopyRuntimeConfigurationWithCustomizations(copied->rows.data(),kMaxInstances,&copied->view,&copied->customizations);
@@ -146,10 +153,6 @@ Status SyncConfiguration() {
     std::vector<RuntimeRecord> next; next.reserve(copied->view.count);
     std::vector<State::ShapeRow> shapes;shapes.reserve(copied->view.count);
     const bool sameSave=s.configuration.saveGeneration==copied->view.saveGeneration;
-    for(const auto& old:s.rows) {
-        events.push_back({static_cast<std::uint32_t>(RuntimeEventKind::Invalidated),0,old.configured.instance.instanceHandle,s.epoch,s.frame,s.revision+1});
-        for(auto hand:{Left,Right})if(old.insideHands&hand)events.push_back({static_cast<std::uint32_t>(RuntimeEventKind::Exit),hand,old.configured.instance.instanceHandle,s.epoch,s.frame,s.revision+1});
-    }
     for(std::uint32_t i=0;i<copied->view.count;++i) {
         RuntimeRecord row{}; auto* old=sameSave?Find(s,copied->rows[i].instance.instanceHandle):nullptr;
         if(old) row=*old;
@@ -159,10 +162,30 @@ Status SyncConfiguration() {
         State::ShapeRow shape{copied->rows[i].instance.instanceHandle,DefaultZoneShape(copied->rows[i].instance.effective),0};
         for(std::uint32_t j=0;j<copied->customizations.count;++j){const auto& saved=copied->customizations.entries[j];if(std::memcmp(&saved.key,&key,sizeof(key)))continue;if(saved.fieldMask&kSavedRuntimeBinding)row.binding=saved.binding;if(saved.fieldMask&kSavedRuntimeVisual)visual=saved.visual;if(saved.fieldMask&kSavedRuntimeShape){shape.shape=copied->customizations.shapes[j];shape.overridden=1;}if(saved.fieldMask&kSavedRuntimePolicy){shape.policy=copied->customizations.policies[j];shape.hasPolicy=true;}break;}
         if(std::memcmp(&row.visual,&visual,sizeof(visual))){row.visual=visual;++row.visualRevision;row.presentationState=static_cast<std::uint32_t>((visual.holderModel[0]||visual.previewModel[0])?PresentationState::Pending:PresentationState::None);row.displayedContentVersion=0;}
-        row.configured=copied->rows[i]; row.availability=static_cast<std::uint32_t>(RuntimeAvailability::ConfigurationChanged);
-        row.insideHands=0; row.runtimeRevision=s.revision+1; next.push_back(row);shapes.push_back(shape);
+        row.configured=copied->rows[i];
+        const auto* oldShape=old?FindShape(s,row.configured.instance.instanceHandle):nullptr;
+        const bool sourceChanged=!old||std::memcmp(&old->configured,&row.configured,sizeof(row.configured))||
+            std::memcmp(&old->binding,&row.binding,sizeof(row.binding))||!oldShape||
+            std::memcmp(&oldShape->shape,&shape.shape,sizeof(shape.shape))||oldShape->hasPolicy!=shape.hasPolicy||
+            (shape.hasPolicy&&std::memcmp(&oldShape->policy,&shape.policy,sizeof(shape.policy)));
+        // A visual update or another slot's edit must not synthesize an exit or
+        // invalidate this source. Preserve its current coherent geometry.
+        if(sourceChanged){
+            row.availability=static_cast<std::uint32_t>(RuntimeAvailability::ConfigurationChanged);
+            row.insideHands=0;
+            InvalidatePendingSource(s,row.configured.instance.instanceHandle);
+            if(old){events.push_back(Event(s,*old,RuntimeEventKind::Invalidated));
+                for(auto hand:{Left,Right})if(old->insideHands&hand)events.push_back(Event(s,*old,RuntimeEventKind::Exit,hand));}
+        }
+        row.runtimeRevision=s.revision+1; next.push_back(row);shapes.push_back(shape);
+    }
+    for(const auto& old:s.rows)if(std::none_of(next.begin(),next.end(),[&](const RuntimeRecord& row){return row.configured.instance.instanceHandle==old.configured.instance.instanceHandle;})){
+        InvalidatePendingSource(s,old.configured.instance.instanceHandle);
+        events.push_back(Event(s,old,RuntimeEventKind::Invalidated));
+        for(auto hand:{Left,Right})if(old.insideHands&hand)events.push_back(Event(s,old,RuntimeEventKind::Exit,hand));
     }
     s.rows.swap(next);s.shapes.swap(shapes);s.policySamples.clear(); s.configuration=copied->view; ++s.revision; InvalidateOffers(s);
+    for(auto& event:events)event.runtimeRevision=s.revision;
     if(!sameSave) {
         s.dragSlot=0;s.dragRequest=0;
         s.pending.clear(); s.used.clear();
@@ -182,7 +205,7 @@ void Events(const std::vector<RuntimeEvent>& events) {
         try { c->event(c->context,&event); } catch (...) { /* isolate observer failure */ }
     }
 }
-RuntimeEvent Event(State& s,const RuntimeRecord& r,RuntimeEventKind k,std::uint32_t hand=0) {
+RuntimeEvent Event(State& s,const RuntimeRecord& r,RuntimeEventKind k,std::uint32_t hand) {
     return {static_cast<std::uint32_t>(k),hand,r.configured.instance.instanceHandle,s.epoch,s.frame,s.revision};
 }
 Status BS_CALL CopyRuntime(std::uint64_t reader,RuntimeRecord* records,std::uint32_t capacity,RuntimeView* view) noexcept {
@@ -389,7 +412,7 @@ Status BS_CALL CopyDeferredSource(std::uint64_t writer,std::uint64_t requestId,R
             if(p.owner!=writer)return Status::Unauthorized;
             const auto& original=p.request.offer.context.slot;
             if(p.stage!=CommitStage::Accepted||p.committed||p.handCommitted||p.authoritySettled||
-               p.request.grant.epoch!=s.epoch||p.request.offer.policyRevision!=s.policy)return Status::Conflict;
+               p.sourceInvalidated||p.request.grant.epoch!=s.epoch)return Status::Conflict;
             const auto hand=p.request.grant.physicalHand;
             if(!HandValid(hand)||!s.hands[hand==Left?0:1].valid||!s.hands[hand==Left?0:1].sampleId)return Status::Conflict;
             bool behavior=false;for(const auto& c:s.behaviors)if(c->id==p.request.offer.behavior&&c->owner==writer)behavior=true;
@@ -434,6 +457,11 @@ Status UpdateRuntime(const RuntimeFrame& frame) noexcept {
             s.hands[0]={};s.hands[1]={};
             for(const auto& hand:frame.hands)if(HandValid(hand.physicalHand)&&hand.valid==1&&hand.sampleId&&Finite3(hand.world))s.hands[hand.physicalHand==Left?0:1]=hand;
             if(frame.hands[0].physicalHand==frame.hands[1].physicalHand){s.hands[0]={};s.hands[1]={};}
+            for(auto& pending:s.pending){
+                const auto hand=pending.request.grant.physicalHand;
+                if(!HandValid(hand)||!s.hands[hand==Left?0:1].valid||
+                   pending.request.offer.context.slot.bodyGeneration!=s.body)pending.sourceInvalidated=true;
+            }
             for(auto& row:s.rows) {
                 const auto oldInside=row.insideHands;const auto oldAvailability=row.availability;const auto oldAnchor=row.anchorGeneration;
                 const auto& instance=row.configured.instance;row.epoch=s.epoch;row.frame=s.frame;row.bodyGeneration=s.body;row.runtimeRevision=s.revision;row.insideHands=0;
@@ -448,7 +476,7 @@ Status UpdateRuntime(const RuntimeFrame& frame) noexcept {
                 const auto* shape=FindShape(s,instance.instanceHandle);
                 if(row.availability==0&&(!shape||ValidateZoneShape(shape->shape)!=Status::Ok))row.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);
                 if(row.availability==0)for(const auto& hand:s.hands)if(hand.valid&&ZoneContainsPoint(shape->shape,row.world,hand.world))row.insideHands|=hand.physicalHand;
-                if(row.availability!=oldAvailability||row.anchorGeneration!=oldAnchor){changed=true;events.push_back(Event(s,row,RuntimeEventKind::Invalidated));}
+                if(row.availability!=oldAvailability||row.anchorGeneration!=oldAnchor){changed=true;InvalidatePendingSource(s,instance.instanceHandle);events.push_back(Event(s,row,RuntimeEventKind::Invalidated));}
                 for(auto hand:{Left,Right}) {
                     if((oldInside&hand)&&!(row.insideHands&hand))events.push_back(Event(s,row,RuntimeEventKind::Exit,hand));
                     if(row.insideHands&hand)events.push_back(Event(s,row,(oldInside&hand)?RuntimeEventKind::Hover:RuntimeEventKind::Enter,hand));
@@ -544,7 +572,7 @@ Status PublishProviderRegions(std::uint64_t writer,const RegionEvaluationFrame& 
     });
 }
 void InvalidateRuntime() noexcept {
-    try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);InvalidateInteractionRegions();++s.revision;InvalidateOffers(s);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
+    try {std::vector<RuntimeEvent> events;auto& s=Runtime();std::unique_lock<std::mutex> lock(s.mutex);InvalidateInteractionRegions();++s.revision;InvalidateOffers(s);InvalidatePendingSource(s,0);s.dragSlot=0;s.dragRequest=0;s.hands[0]={};s.hands[1]={};for(auto& r:s.rows){for(auto hand:{Left,Right})if(r.insideHands&hand)events.push_back(Event(s,r,RuntimeEventKind::Exit,hand));events.push_back(Event(s,r,RuntimeEventKind::Invalidated));r.availability=static_cast<std::uint32_t>(RuntimeAvailability::InvalidObservation);r.insideHands=0;r.runtimeRevision=s.revision;}lock.unlock();Events(events);}catch(...){}
 }
 Status ReserveDragSlot(std::uint64_t handle,std::uint64_t request,std::uint64_t epoch,std::uint64_t revision) noexcept {
     return GuardRuntime([&]{auto& s=Runtime();std::lock_guard lock(s.mutex);const auto* row=Find(s,handle);if(!request||!row||s.epoch!=epoch||row->runtimeRevision!=revision||row->availability||s.dragSlot)return Status::Conflict;for(const auto& pending:s.pending)if(Reserved(pending)&&pending.request.offer.context.slot.configured.instance.instanceHandle==handle)return Status::Conflict;s.dragSlot=handle;s.dragRequest=request;InvalidateOffers(s);return Status::Ok;});
