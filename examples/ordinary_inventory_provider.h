@@ -9,12 +9,22 @@
 #include <mutex>
 namespace body_slots::examples {
 struct ContentProjection { std::uint64_t identity=0,quantity=0; };
+[[nodiscard]] constexpr bool TransferNeedsRecovery(const HIGGS_TransferState& state) noexcept {
+    return state.stage==HIGGS_TX_RECOVERY_REQUIRED||
+        ((state.receiptFlags&HIGGS_TX_MUTATION_UNCERTAIN)&&!(state.receiptFlags&HIGGS_TX_RECOVERY_RECONCILED));
+}
 struct OrdinaryItemPlan {
     std::uint32_t transferKind=0,baseFormId=0,stackOrdinal=0,quantity=1;
     ContentProjection after;
 };
 // Read-only, thread-safe policy. No inventory calls, mutation or implicit stock.
 using OrdinaryItemPolicy=bool (*)(void*,const SourceActionContext&,OrdinaryItemPlan&);
+struct InventoryProviderProgress;
+// Optional owner-thread semantic settlement after the factual content outcome.
+// Return Ok to acknowledge it. Other statuses retain work and retry only this
+// settlement; callback must be idempotent and must not repeat inventory work,
+// reenter helper commands or change helper registrations from the callback.
+using InventoryOutcomeCallback=Status (*)(void*,const InventoryProviderProgress&);
 struct InventoryProviderTables {
     const RuntimeApi* slots=nullptr;
     const BehaviorApi* behaviors=nullptr;
@@ -41,9 +51,11 @@ struct InventoryProviderConfig {
     std::uint32_t storeEdge=HIGGS_INPUT_DOWN;
     bool storeOnHeldRelease=false; // semantic pre-drop intent, never ordinary Up
     bool withdrawOnExit=false; // arm on Down, withdraw after the same held press exits
+    InventoryOutcomeCallback settle=nullptr;
+    void* settlementContext=nullptr;
 };
 enum class InventoryProviderStage : std::uint32_t {
-    Detached,Ready,Queued,Selecting,Transferring,Reporting,Completed,Cancelled,RecoveryRequired,WaitingForExit
+    Detached,Ready,Queued,Selecting,Transferring,Reporting,Completed,Cancelled,RecoveryRequired,WaitingForExit,Settling
 };
 struct InventoryProviderProgress {
     InventoryProviderStage stage=InventoryProviderStage::Detached;
@@ -59,6 +71,7 @@ struct InventoryProviderProgress {
     // The accepted save/epoch ended. A terminal factual result may be retired,
     // but must never be projected into a recreated instance or another save.
     bool sourceRetired=false;
+    Status settlementStatus=Status::Ok; // Consumer semantic acknowledgement, not physical uncertainty.
 };
 class OrdinaryInventoryProvider final {
 public:
@@ -87,7 +100,7 @@ private:
         std::uint64_t ticket=0,transfer=0,saveGeneration=0;
         std::uint64_t drawGeneration=0;
         bool drawExited=false,releaseResolved=false;
-        bool cancel=false,mirror=false,completed=false,sourceRetired=false;
+        bool cancel=false,mirror=false,completed=false,sourceRetired=false,grantReleased=false;
     };
     struct TransferDispatch { OrdinaryInventoryProvider* provider; Work* work; InventoryProviderProgress* progress; };
     static Status BS_CALL Offers(void*,const SourceActionContext*,SourceActionProposal*,std::uint32_t,std::uint32_t*);
@@ -104,6 +117,7 @@ private:
     bool ReportOriginal(const Work&,std::uint32_t,std::uint32_t,InventoryProviderProgress&);
     Status Mirror(const Work&,CommitStage,const ContentProjection&,std::uint64_t);
     bool Finish(Work&,InventoryProviderProgress&,bool success);
+    void Finalize(Work&,InventoryProviderProgress&,bool success);
     mutable std::mutex mutex_;
     std::uint64_t executorLabel_{},saveGeneration_{};
     InventoryProviderTables tables_;

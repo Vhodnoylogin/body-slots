@@ -85,7 +85,7 @@ public:
         if(!out||out->structSize!=sizeof(*out)||out->reserved)return Status::InvalidArgument;
         std::lock_guard lock(mutex_);
         if(!connected_||!cache_.epoch||!cache_.frame||!cache_.sampledAt)return Status::Unavailable;
-        *out={sizeof(*out),0,cache_.epoch,cache_.frame,cache_.sampledAt};
+        *out={sizeof(*out),0,cache_.epoch,cache_.frame,cache_.sampledAt,Now()};
         return Status::Ok;
     }
     Status CopyInputServices(std::uint64_t* out) {

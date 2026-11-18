@@ -21,8 +21,9 @@ struct GameApi2 {
 static_assert(sizeof(GameApi2)==24,"GameApi2 ABI changed (x64)");
 struct GameFrameObservation {
     std::uint32_t structSize,reserved;
-    // Provider steady-clock nanoseconds. Frame IDs alone do not establish age.
-    std::uint64_t epoch,frame,sampledAtNs;
+    // Both times use the provider steady clock; copiedAtNs-sampledAtNs is
+    // sample age even for consumers whose own clock has a different origin.
+    std::uint64_t epoch,frame,sampledAtNs,copiedAtNs;
 };
 struct GameApi3 {
     GameApi base; // exact v2 prefix; version=3, structSize=sizeof(GameApi3)
@@ -31,9 +32,10 @@ struct GameApi3 {
     // Unavailable before a frame or after reset; never fabricates a fresh time.
     Status (BS_CALL *CopyFrameObservation)(GameFrameObservation*);
 };
-static_assert(sizeof(GameFrameObservation)==32,"GameFrameObservation ABI changed (x64)");
+static_assert(sizeof(GameFrameObservation)==40,"GameFrameObservation ABI changed (x64)");
 static_assert(sizeof(GameApi3)==32,"GameApi3 ABI changed (x64)");
 static_assert(offsetof(GameApi3,CopyFrameObservation)==sizeof(GameApi2),"GameApi3 v2 prefix changed (x64)");
 using QueryGameInterface = const GameApi* (BS_CALL *)(std::uint32_t, std::uint32_t);
 }
-// Export: BodySlots_QueryGameInterface(1, sizeof(GameApi)). No mutation or input fallback.
+// Export: BodySlots_QueryGameInterface(version, exact table size), versions1/2/3.
+// Copied observations only; no mutation or input fallback.

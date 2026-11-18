@@ -29,6 +29,7 @@ Status OrdinaryInventoryProvider::Attach(const InventoryProviderTables& t,const 
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(t.dispatch.structSize!=sizeof(t.dispatch)||t.dispatch.abiVersion!=2||!t.dispatch.Invoke))return Status::UnsupportedVersion;
     if((c.withdrawOnExit||c.storeOnHeldRelease)&&(!t.frameObservations||t.frameObservations->base.structSize!=sizeof(GameApi3)||
        t.frameObservations->base.version!=3||!t.frameObservations->CopyFrameObservation))return Status::UnsupportedVersion;
+    if((c.withdrawOnExit||c.storeOnHeldRelease)&&!(t.hands.capabilities&HIGGS_HAND_CAP_ACCEPTED_RECEIPTS))return Status::Unavailable;
     if(c.storeOnHeldRelease){
         if(!t.gameServices||t.gameServices->base.structSize!=sizeof(GameApi2)||t.gameServices->base.version!=2||
            !t.gameServices->CopyInputServices)return Status::UnsupportedVersion;
@@ -79,7 +80,7 @@ Status OrdinaryInventoryProvider::Offer(const SourceActionContext& c,SourceActio
 }
 Status BS_CALL OrdinaryInventoryProvider::Execute(void* p,const SourceActionRequest* r){if(!p||!r)return Status::InvalidArgument;try{return static_cast<OrdinaryInventoryProvider*>(p)->Queue(*r);}catch(...){return Status::InternalError;}}
 Status OrdinaryInventoryProvider::Queue(const SourceActionRequest& r){
-    std::lock_guard lock(mutex_);const auto& action=r.request;const auto hand=action.grant.physicalHand;
+    std::unique_lock lock(mutex_);const auto& action=r.request;const auto hand=action.grant.physicalHand;
     if(!attached_||stopping_||work_.selected.request.requestId||hand<1||hand>2||action.offer.higgsClient!=executorLabel_||action.offer.higgsExecutor!=actionExecutor_||action.offer.context.slot.configured.instance.instanceHandle!=config_.instance)return Status::Conflict;
     const auto token=action.offer.proposal.executorAction;const auto& cached=offers_[token%offers_.size()];if(!token||cached.token!=token||cached.epoch!=action.grant.epoch||cached.input!=action.grant.inputSequence||cached.contentVersion!=action.offer.context.slot.contentVersion||!Same(selected_[hand-1],r,config_.higgsClient,actionExecutor_))return Status::Conflict;
     if(cached.plan.transferKind==HIGGS_TRANSFER_HAND_TO_INVENTORY&&(!r.incoming.known||!r.incoming.allowed||r.incoming.source!=1||!r.incoming.referenceId))return Status::Conflict;
@@ -88,7 +89,22 @@ Status OrdinaryInventoryProvider::Queue(const SourceActionRequest& r){
        (tables_.hands.CopySnapshot(config_.higgsClient,&snapshot)!=HIGGS_HAND_OK||snapshot.epoch!=action.grant.epoch))return Status::Conflict;
     RuntimeView scope{};scope.structSize=sizeof(scope);scope.version=kRuntimeApiVersion;
     if(!CopiedScope(tables_.slots->CopyRuntime(config_.writer,nullptr,0,&scope))||scope.saveGeneration!=saveGeneration_||scope.epoch!=action.grant.epoch)return Status::Conflict;
-    work_={};work_.selected=r;work_.plan=cached.plan;work_.held=cached.held;work_.authority=selected_[hand-1];work_.saveGeneration=scope.saveGeneration;work_.drawGeneration=snapshot.hands[hand-1].generation;progress_={};progress_.stage=InventoryProviderStage::Queued;progress_.slotRequest=action.requestId;progress_.higgsAction=action.grant.requestId;progress_.saveGeneration=scope.saveGeneration;return Status::Ok;
+    Work next{};next.selected=r;next.plan=cached.plan;next.held=cached.held;next.authority=selected_[hand-1];next.saveGeneration=scope.saveGeneration;next.drawGeneration=snapshot.hands[hand-1].generation;
+    const bool retain=(tables_.hands.capabilities&HIGGS_HAND_CAP_ACCEPTED_RECEIPTS)!=0;
+    // Owner commands are serialized. Never acquire HIGGS's dispatch fence while
+    // holding our callback mutex: controller Selected may be waiting for it.
+    lock.unlock();
+    if(retain){
+        HIGGS_ActionResult accepted{};accepted.structSize=sizeof(accepted);
+        const auto& a=next.authority;
+        if(tables_.hands.CopyActionResult(config_.higgsClient,a.requestId,&accepted)!=HIGGS_HAND_OK||
+           accepted.stage!=HIGGS_ACTION_ACCEPTED||accepted.requestId!=a.requestId||accepted.executor!=a.executor||
+           accepted.epoch!=a.epoch||accepted.inputId!=a.inputId||
+           tables_.hands.ReportResult(config_.higgsClient,&accepted)!=HIGGS_HAND_OK)return Status::Conflict;
+    }
+    // The successful opt-in is the last provider operation. Only the callback
+    // mutex and POD publication follow; retained work has an owner to drain it.
+    lock.lock();work_=next;progress_={};progress_.stage=InventoryProviderStage::Queued;progress_.slotRequest=action.requestId;progress_.higgsAction=action.grant.requestId;progress_.saveGeneration=scope.saveGeneration;return Status::Ok;
 }
 void OrdinaryInventoryProvider::ObserveScope(Work& w,InventoryProviderProgress& p){
     RuntimeView scope{};scope.structSize=sizeof(scope);scope.version=kRuntimeApiVersion;
@@ -105,23 +121,37 @@ bool OrdinaryInventoryProvider::ReportOriginal(const Work& w,std::uint32_t stage
 Status OrdinaryInventoryProvider::Mirror(const Work& w,CommitStage stage,const ContentProjection& content,std::uint64_t version){const auto& r=w.selected.request;ContentCommit receipt{};receipt.structSize=sizeof(receipt);receipt.stage=static_cast<std::uint32_t>(stage);receipt.requestId=r.requestId;receipt.epoch=r.grant.epoch;receipt.higgsRequestId=r.grant.requestId;receipt.higgsGrantId=r.grant.grantId;receipt.instanceHandle=config_.instance;receipt.expectedContentVersion=r.offer.context.slot.contentVersion;receipt.contentVersion=version;receipt.contentIdentity=content.identity;receipt.quantity=content.quantity;return tables_.slots->ReportContentCommit(config_.writer,&receipt);}
 bool OrdinaryInventoryProvider::Finish(Work& w,InventoryProviderProgress& p,bool success){
     const auto& slot=w.selected.request.offer.context.slot;const auto flags=Evidence(p.receipt);
-    if(w.sourceRetired){
+    if(!w.completed){
+      if(w.sourceRetired){
         // Positive save/epoch replacement, never a missing handle or failed
         // read. Release old resources only after Advance proves a terminal
         // transfer (or that no transfer was ever admitted). No old mirror.
         p.sourceRetired=true;
-    }else if(success){
+      }else if(success){
         if(!w.mirror){if(!ReportOriginal(w,HIGGS_ACTION_COMMITTED,flags,p))return false;p.slotStatus=Mirror(w,CommitStage::Committed,w.plan.after,slot.contentVersion+1);if(p.slotStatus!=Status::Ok)return false;w.mirror=true;}
         if(!ReportOriginal(w,HIGGS_ACTION_COMPLETED,flags,p))return false;
-        if(!w.completed){p.slotStatus=Mirror(w,CommitStage::Completed,w.plan.after,slot.contentVersion+1);if(p.slotStatus!=Status::Ok)return false;w.completed=true;}
-    }else{
+        p.slotStatus=Mirror(w,CommitStage::Completed,w.plan.after,slot.contentVersion+1);if(p.slotStatus!=Status::Ok)return false;
+      }else{
         HIGGS_ActionResult original{};if(!OriginalResult(w,original,p))return false;
         const bool rejected=original.stage==HIGGS_ACTION_REJECTED;if(!rejected&&original.stage!=HIGGS_ACTION_CANCELLED&&!ReportOriginal(w,HIGGS_ACTION_CANCELLED,flags,p))return false;
-        if(!w.completed){p.slotStatus=Mirror(w,rejected?CommitStage::Failed:CommitStage::Cancelled,{slot.contentIdentity,slot.quantity},slot.contentVersion);if(p.slotStatus!=Status::Ok)return false;w.completed=true;}
+        p.slotStatus=Mirror(w,rejected?CommitStage::Failed:CommitStage::Cancelled,{slot.contentIdentity,slot.quantity},slot.contentVersion);if(p.slotStatus!=Status::Ok)return false;
+      }
+      w.completed=true;
     }
     if(w.ticket){p.handStatus=tables_.inventory.ReleaseSelection(config_.higgsClient,w.ticket);if(!Released(p.handStatus))return false;w.ticket=0;}
-    p.handStatus=tables_.hands.ReleaseGrant(config_.higgsClient,w.authority.grant);if(!Released(p.handStatus))return false;
+    if(!w.grantReleased){p.handStatus=tables_.hands.ReleaseGrant(config_.higgsClient,w.authority.grant);if(!Released(p.handStatus))return false;w.grantReleased=true;}
+    // Factual protocol work is complete and physically released. Semantic
+    // retries depend only on this owned receipt, not evictable provider history.
+    if(config_.settle){
+        auto outcome=p;outcome.stage=success?InventoryProviderStage::Completed:InventoryProviderStage::Cancelled;
+        try{p.settlementStatus=config_.settle(config_.settlementContext,outcome);}
+        catch(...){p.settlementStatus=Status::InternalError;}
+        if(p.settlementStatus!=Status::Ok)return false;
+    }
     p.stage=success?InventoryProviderStage::Completed:InventoryProviderStage::Cancelled;w={};return true;
+}
+void OrdinaryInventoryProvider::Finalize(Work& w,InventoryProviderProgress& p,bool success){
+    if(!Finish(w,p,success))p.stage=p.settlementStatus!=Status::Ok?InventoryProviderStage::Settling:InventoryProviderStage::RecoveryRequired;
 }
 bool OrdinaryInventoryProvider::DrawReady(Work& w,const HIGGS_HandSnapshot& snapshot,InventoryProviderProgress& p){
     const auto& action=w.selected.request;
@@ -147,13 +177,14 @@ bool OrdinaryInventoryProvider::DrawReady(Work& w,const HIGGS_HandSnapshot& snap
 }
 bool OrdinaryInventoryProvider::SourceReady(Work& w,const HIGGS_HandSnapshot& snapshot,InventoryProviderProgress& p,RuntimeRecord& current){
     const auto& action=w.selected.request;
-    const auto now=Now();
     p.slotStatus=tables_.behaviorOptions->CopyDeferredSource(config_.writer,action.requestId,&current);
     GameFrameObservation frame{};frame.structSize=sizeof(frame);
-    if(p.slotStatus!=Status::Ok||tables_.frameObservations->CopyFrameObservation(&frame)!=Status::Ok||
+    const auto copied=tables_.frameObservations->CopyFrameObservation(&frame);
+    const auto now=Now();
+    if(p.slotStatus!=Status::Ok||copied!=Status::Ok||
        frame.epoch!=snapshot.epoch||current.epoch!=snapshot.epoch||!current.frame||
        current.frame!=frame.frame||current.frame<action.offer.context.slot.frame||!frame.sampledAtNs||!snapshot.sampledAtNs||
-       now<frame.sampledAtNs||now-frame.sampledAtNs>100000000||now<snapshot.sampledAtNs||now-snapshot.sampledAtNs>100000000){w.cancel=true;return false;}
+       frame.copiedAtNs<frame.sampledAtNs||frame.copiedAtNs-frame.sampledAtNs>100000000||now<snapshot.sampledAtNs||now-snapshot.sampledAtNs>100000000){w.cancel=true;return false;}
     return true;
 }
 HIGGS_HandStatus HIGGS_HAND_CALL OrdinaryInventoryProvider::AdmitTransfer(const HIGGS_ActionRequest* request,const HIGGS_HandSnapshot* snapshot,void* context){
@@ -179,28 +210,28 @@ void OrdinaryInventoryProvider::Advance(Work& w,InventoryProviderProgress& p){
     ObserveScope(w,p);
     HIGGS_ActionResult original{};const bool readable=OriginalResult(w,original,p);
     if(!w.transfer){
-        if(!readable||original.stage==HIGGS_ACTION_CANCELLED||original.stage==HIGGS_ACTION_REJECTED||w.cancel){if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+        if(!readable||original.stage==HIGGS_ACTION_CANCELLED||original.stage==HIGGS_ACTION_REJECTED||w.cancel){Finalize(w,p,false);return;}
         HIGGS_HandSnapshot snapshot{};snapshot.structSize=sizeof(snapshot);p.handStatus=tables_.hands.CopySnapshot(config_.higgsClient,&snapshot);
         const auto hand=w.authority.physicalHands;
         std::uint64_t correlation{};
         if(p.handStatus || snapshot.epoch!=w.authority.epoch ||
            tables_.routes.CheckSelectedAction(config_.higgsClient,w.authority.requestId,w.authority.epoch,hand,&correlation)!=HIGGS_HAND_OK ||
-           correlation!=w.selected.request.grant.grantId || snapshot.hands[hand-1].grant!=correlation){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+           correlation!=w.selected.request.grant.grantId || snapshot.hands[hand-1].grant!=correlation){w.cancel=true;Finalize(w,p,false);return;}
         const bool deferred=config_.withdrawOnExit&&w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND;
         const bool drawReady=!deferred||DrawReady(w,snapshot,p);
-        if(w.cancel){if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+        if(w.cancel){Finalize(w,p,false);return;}
         HIGGS_ItemIdentity item{};item.structSize=sizeof(item);
         if(w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND){
-            if(!w.ticket){HIGGS_InventorySelectionRequest request{};request.structSize=sizeof(request);request.baseFormId=w.plan.baseFormId;request.epoch=w.authority.epoch;request.stackOrdinal=w.plan.stackOrdinal;request.quantity=w.plan.quantity;p.handStatus=tables_.inventory.RequestSelection(config_.higgsClient,&request,&w.ticket);if(p.handStatus){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}}
+            if(!w.ticket){HIGGS_InventorySelectionRequest request{};request.structSize=sizeof(request);request.baseFormId=w.plan.baseFormId;request.epoch=w.authority.epoch;request.stackOrdinal=w.plan.stackOrdinal;request.quantity=w.plan.quantity;p.handStatus=tables_.inventory.RequestSelection(config_.higgsClient,&request,&w.ticket);if(p.handStatus){w.cancel=true;Finalize(w,p,false);return;}}
             p.selectionTicket=w.ticket;HIGGS_InventorySelection selection{};selection.structSize=sizeof(selection);p.handStatus=tables_.inventory.CopySelection(config_.higgsClient,w.ticket,&selection);
-            if(p.handStatus||selection.epoch!=w.authority.epoch||selection.state==HIGGS_SELECTION_INVALID){p.receipt.reason=selection.reason?selection.reason:p.handStatus;w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+            if(p.handStatus||selection.epoch!=w.authority.epoch||selection.state==HIGGS_SELECTION_INVALID){p.receipt.reason=selection.reason?selection.reason:p.handStatus;w.cancel=true;Finalize(w,p,false);return;}
             if(selection.state==HIGGS_SELECTION_QUEUED){p.stage=InventoryProviderStage::Selecting;return;}if(selection.state!=HIGGS_SELECTION_READY||selection.item.kind!=HIGGS_ITEM_NATIVE_INVENTORY){p.stage=InventoryProviderStage::RecoveryRequired;return;}item=selection.item;
-        }else{p.handStatus=tables_.transactions.CopyHeldItem(config_.higgsClient,hand,&item);if(p.handStatus||!SameItem(item,w.held)||item.worldRefId!=w.selected.incoming.referenceId||(w.selected.incoming.baseFormId&&item.baseFormId!=w.selected.incoming.baseFormId)){p.receipt.reason=p.handStatus?p.handStatus:HIGGS_HAND_STALE;w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}}
-        if(item.quantity!=w.plan.quantity){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+        }else{p.handStatus=tables_.transactions.CopyHeldItem(config_.higgsClient,hand,&item);if(p.handStatus||!SameItem(item,w.held)||item.worldRefId!=w.selected.incoming.referenceId||(w.selected.incoming.baseFormId&&item.baseFormId!=w.selected.incoming.baseFormId)){p.receipt.reason=p.handStatus?p.handStatus:HIGGS_HAND_STALE;w.cancel=true;Finalize(w,p,false);return;}}
+        if(item.quantity!=w.plan.quantity){w.cancel=true;Finalize(w,p,false);return;}
         // Pin the selected native stack while armed. Selection is read-only;
         // only the actual transfer waits for a valid exit of the held press.
         if(!drawReady){p.stage=InventoryProviderStage::WaitingForExit;return;}
-        HIGGS_HandExecutor transferExecutor=0;p.handStatus=tables_.inventory.GetExecutor(config_.higgsClient,&transferExecutor);if(p.handStatus){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+        HIGGS_HandExecutor transferExecutor=0;p.handStatus=tables_.inventory.GetExecutor(config_.higgsClient,&transferExecutor);if(p.handStatus){w.cancel=true;Finalize(w,p,false);return;}
         auto& r=w.transferRequest;r={};r.structSize=sizeof(r);r.kind=w.plan.transferKind;r.epoch=w.authority.epoch;r.idempotencyKey=w.authority.requestId;r.original=item;r.executor=transferExecutor;r.grant=w.authority.grant;r.quantity=w.plan.quantity;r.timeoutMs=config_.timeoutMs;r.contextGeneration=w.selected.request.offer.context.slot.contentVersion;r.sourceResource=r.destinationResource=config_.instance;
         if(r.kind==HIGGS_TRANSFER_INVENTORY_TO_HAND)r.destinationHand=hand;else r.sourceHand=hand;
         if(config_.withdrawOnExit||config_.storeOnHeldRelease){
@@ -208,18 +239,18 @@ void OrdinaryInventoryProvider::Advance(Work& w,InventoryProviderProgress& p){
             TransferDispatch dispatch{this,&w,&p};
             p.handStatus=tables_.dispatch.Invoke(config_.higgsClient,&invocation,AdmitTransfer,&dispatch);
         }else p.handStatus=tables_.transactions.RequestTransfer(config_.higgsClient,&r,&w.transfer);
-        if(p.handStatus){w.cancel=true;if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}p.transfer=w.transfer;
+        if(p.handStatus){w.cancel=true;Finalize(w,p,false);return;}p.transfer=w.transfer;
     }
     HIGGS_TransferState state=p.receipt;
     const bool terminal=state.requestId==w.transfer&&
         (state.stage==HIGGS_TX_COMPLETED||state.stage==HIGGS_TX_CANCELLED||state.stage==HIGGS_TX_REJECTED)&&
-        (!(state.receiptFlags&HIGGS_TX_MUTATION_UNCERTAIN)||(state.receiptFlags&HIGGS_TX_RECOVERY_RECONCILED));
+        !TransferNeedsRecovery(state);
     if(!terminal){
         if(w.cancel){p.handStatus=tables_.transactions.CancelTransfer(config_.higgsClient,w.transfer,w.authority.epoch);}
         state={};state.structSize=sizeof(state);p.handStatus=tables_.transactions.CopyTransfer(config_.higgsClient,w.transfer,&state);
     }else p.handStatus=HIGGS_HAND_OK; // Terminal factual copies are immutable, including across cleanup retries.
     if(p.handStatus||state.requestId!=w.transfer||state.owner!=config_.higgsClient||state.grant!=w.authority.grant||state.epoch!=w.authority.epoch||state.idempotencyKey!=w.authority.requestId){p.stage=InventoryProviderStage::RecoveryRequired;return;}p.receipt=state;
-    if(state.stage==HIGGS_TX_RECOVERY_REQUIRED||((state.receiptFlags&HIGGS_TX_MUTATION_UNCERTAIN)&&!(state.receiptFlags&HIGGS_TX_RECOVERY_RECONCILED))){p.stage=InventoryProviderStage::RecoveryRequired;return;}
+    if(TransferNeedsRecovery(state)){p.stage=InventoryProviderStage::RecoveryRequired;return;}
     if(state.stage==HIGGS_TX_COMPLETED){
         const bool restored=(state.receiptFlags&HIGGS_TX_COMPENSATION_CONFIRMED)!=0;
         const auto nativeFlag=w.plan.transferKind==HIGGS_TRANSFER_INVENTORY_TO_HAND?HIGGS_TX_NATIVE_GRIP_CONFIRMED:HIGGS_TX_NATIVE_RELEASE_CONFIRMED;
@@ -236,9 +267,9 @@ void OrdinaryInventoryProvider::Advance(Work& w,InventoryProviderProgress& p){
             // delivery. Settle it once, exposing unavailable continuation.
             w.releaseResolved=true;
         }
-        p.stage=InventoryProviderStage::Reporting;if(!Finish(w,p,success))p.stage=InventoryProviderStage::RecoveryRequired;return;
+        p.stage=InventoryProviderStage::Reporting;Finalize(w,p,success);return;
     }
-    if(state.stage==HIGGS_TX_REJECTED||state.stage==HIGGS_TX_CANCELLED){if(!Finish(w,p,false))p.stage=InventoryProviderStage::RecoveryRequired;return;}
+    if(state.stage==HIGGS_TX_REJECTED||state.stage==HIGGS_TX_CANCELLED){Finalize(w,p,false);return;}
     if(state.receiptFlags&HIGGS_TX_DOMAIN_ATTESTED){if(!ReportOriginal(w,HIGGS_ACTION_COMMITTED,Evidence(state),p)){p.stage=InventoryProviderStage::RecoveryRequired;return;}}
     p.stage=InventoryProviderStage::Transferring;
 }
