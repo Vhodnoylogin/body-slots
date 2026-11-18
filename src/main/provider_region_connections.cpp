@@ -8,7 +8,7 @@
 #include <cmath>
 #endif
 #if defined(BODY_SLOTS_WITH_PLANCK_SOURCE)
-#include "planck_anchor_reader.h"
+#include "body_slots_planck_anchor.h"
 #endif
 
 namespace body_slots::game {
@@ -23,7 +23,10 @@ Status ReadBody(const detail::OwnedRegionSource& target, RegionAnchorSnapshot& a
     // PLANCK copies while holding its own short-lived mutex. This data is
     // consumed after the copy returns; no provider object escapes this phase.
     static thread_local std::array<PlanckBodyPhysics, 256> bodies{};
-    return detail::ReadPlanckAnchor(*planck.api, planck.client, target, RE::bhkWorld::GetWorldScaleInverse(),
+    const auto& b = target.body;
+    const PlanckBodyRef body{{b.worldEpoch, b.actorGeneration, b.actorHandle, 0}, b.bodyGeneration, b.bodyIndex, 0};
+    const detail::PlanckAnchorScope scope{body, target.higgsEpoch, target.saveGeneration, target.openedAtNs};
+    return detail::ReadPlanckAnchor(*planck.api, planck.client, scope, RE::bhkWorld::GetWorldScaleInverse(),
                                     bodies, anchor);
 }
 } // namespace

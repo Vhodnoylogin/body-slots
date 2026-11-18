@@ -32,3 +32,7 @@ Other SDK examples cover definitions, inventory and manual anchor publication. A
 In the source checkout, run `tools/build_game.py` with `--output`, `--sdk-root`, `--higgs-root`, `--planck-root`, and `--ppb-root`. A checked-in test manifest compiles the HIGGS production core from the same checkout as the headers. An existing external CMake directory can be reused with `--build-dir`.
 
 Pass the resulting build-evidence directory as `--native-build` to `tools/package_candidate.py`, together with the provider roots, `--skse-root`, `--dependency-sources` and a new empty `--output` directory. The packager checks the tested DLL, source hashes and provider commits. Offline checks cover contracts and exported tables. Skyrim VR gameplay, visual fit and hardware input remain unverified.
+
+## Post-RC3 development
+
+The published RC3 source/tag and its existing draft archives remain the November 11 snapshot. Current development adds RegionDwell1 and negotiates HIGGS shared proposal version 2, with consolidated public HIGGS headers. Those additions are not in the unchanged RC3 archive. Build the current source with the provider revisions recorded in the implementation ledger; full DLL/offline verification does not qualify Skyrim gameplay. No new candidate archive or release follows solely from this development commit.

@@ -52,11 +52,12 @@ struct Fixture {
     std::array<HIGGS_HandRecord,2> observations{};
     std::array<std::unique_ptr<Provider>,2> providers;
     std::vector<std::uint64_t> submittedActions;
+    std::vector<std::pair<std::uint64_t,std::uint64_t>> dwellRequests;
     HIGGS_HandSnapshot snapshot{};
     unsigned fallback{},beforeMode{},invokeCalls{};
     HIGGS_HandStatus invokeStatus=999;
     explicit Fixture(std::int32_t providerPriorityB=1,std::uint32_t edgeMask=1,bool sharedOwner=false,bool sequences=false,
-        RegionAnchorKind kind=RegionAnchorKind::World) {
+        RegionAnchorKind kind=RegionAnchorKind::World,bool noButtonUses=false) {
         CHECK(DisconnectRegionActions()==Status::Ok);active=this;
         hands.structSize=sizeof(hands);hands.abiVersion=HIGGS_HAND_ABI_VERSION;
         hands.capabilities=HIGGS_HAND_CAP_SNAPSHOT|HIGGS_HAND_CAP_INPUT_BROKER|HIGGS_HAND_CAP_OWNED_GRANTS|HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
@@ -96,7 +97,32 @@ struct Fixture {
             +[](std::uint64_t c,std::uint64_t* label)->HIGGS_HandStatus{
                 *label=active->broker.ClientLabel(c);return *label?HIGGS_HAND_OK:HIGGS_HAND_INVALID_CLIENT;
             }};
-        CHECK(ConnectRegionActions(hands,routing,dispatch,&routes)==Status::Ok);
+        DwellProvider dwell{};
+        dwell.proposals.proposals={sizeof(dwell.proposals),2,HIGGS_HAND_USE_PROPOSALS_CAP_PRIORITY_ROUNDS|HIGGS_HAND_USE_PROPOSALS_CAP_SHARED_WINDOWS,
+            +[](std::uint64_t owner,const HIGGS_HandUseProposalRequest* request,std::uint64_t* id) {
+                const auto result=active->broker.ProposeHandUse(owner,*request,*id,HiggsHands::Now());
+                if(result==HIGGS_HAND_OK)active->dwellRequests.emplace_back(owner,*id);
+                return result;
+            },
+            +[](std::uint64_t owner,std::uint64_t id,HIGGS_HandUseProposalState* out) {
+                return active->broker.CopyHandUseProposal(owner,id,*out,HiggsHands::Now());
+            },
+            +[](std::uint64_t owner,std::uint64_t id,std::uint64_t epoch) {
+                return active->broker.CancelHandUseProposal(owner,id,epoch);
+            }};
+        dwell.proposals.EnableSharedRounds=+[](std::uint64_t client){return active->broker.EnableSharedRounds(client);};
+        dwell.proposals.ProposeOrdered=+[](std::uint64_t owner,const HIGGS_HandUseProposalRequest* request,
+            std::uint64_t action,std::uint64_t target,std::uint64_t* id) {
+            const auto result=active->broker.ProposeOrderedHandUse(owner,*request,action,target,*id,HiggsHands::Now());
+            if(result==HIGGS_HAND_OK)active->dwellRequests.emplace_back(owner,*id);
+            return result;
+        };
+        dwell.uses={sizeof(dwell.uses),1,1,nullptr,nullptr,nullptr,
+            +[](std::uint64_t owner,std::uint64_t id,std::uint64_t epoch){return active->broker.EndHandUse(owner,id,epoch);}};
+        dwell.contexts={sizeof(dwell.contexts),HIGGS_INPUT_CONTEXT_ABI_VERSION,1,
+            +[](std::uint64_t owner,HIGGS_InputContextState* ctx){return active->broker.CopyInputContext(owner,*ctx);},nullptr,nullptr};
+        dwell.dispatch=dispatch;
+        CHECK(ConnectRegionActions(hands,routing,dispatch,&routes,noButtonUses?&dwell:nullptr)==Status::Ok);
         for(auto& h:observations)h.observationMask=HIGGS_OBS_HELD_KNOWN|HIGGS_OBS_EQUIPMENT_KNOWN|HIGGS_OBS_PALM_VALID|HIGGS_OBS_TRACKING_VALID;
         broker.MarkMainThread();broker.ObserveWorld(1,false,HiggsHands::Now());Frame(false);
         for(unsigned i=0;i<2;++i) {
@@ -404,7 +430,131 @@ void AnatomicalEvidenceScope() {
     CHECK(read() == Status::Unavailable);
     SetPpbDigestReader(nullptr);
 }
+struct DwellConsumer {
+    Fixture& fixture;
+    Provider& owner;
+    RegionActionRegistration binding{sizeof(binding)};
+    std::uint64_t revision{},sample{};
+    unsigned offers{}, effects{};
+    HIGGS_ActionRequest delivered{};
+    std::uint64_t visit{};
+    RegionDwellBindingSpec spec{};
+
+    DwellConsumer(Fixture& f,unsigned index):fixture(f),owner(*f.providers[index]) {
+        spec={sizeof(spec),Left,Left,HIGGS_USE_HAND_GOALS,500,1000,
+            owner.region.regionId,owner.region.revision,
+            0x4457454c4c,owner.client,Eligible,Execute,this};
+    }
+    static Status BS_CALL Eligible(void* raw,const RegionDwellContext* context,std::uint32_t* yes) {
+        auto& self=*static_cast<DwellConsumer*>(raw);
+        ++self.offers;
+        *yes=context->visit && context->observation.state==static_cast<std::uint32_t>(RegionSpatialState::Ready);
+        return Status::Ok;
+    }
+    static Status BS_CALL Execute(void* raw,const RegionDwellExecution* execution) {
+        auto& self=*static_cast<DwellConsumer*>(raw);
+        CHECK(!execution->authority.inputId && execution->authority.owner==self.owner.client);
+        CHECK(execution->authority.executor==self.binding.higgsExecutor && execution->authority.actionId==self.spec.actionKey);
+        CHECK(execution->authority.grant && execution->authority.grant!=execution->current.hands.hands[0].grant);
+        CHECK(!std::strcmp(execution->current.observation.probe.source.provider,"HIGGS"));
+        CHECK(execution->current.actionKey==self.spec.actionKey && execution->current.visit>self.visit);
+        self.delivered=execution->authority;self.visit=execution->current.visit;++self.effects;
+        return Status::Ok;
+    }
+    Status Register() {return GetRegionDwellApi().RegisterBinding(owner.writer,&spec,&binding);}
+    void Anchor(float x=0) {
+        auto anchor=owner.anchor;anchor.world.position[0]=x;
+        anchor.source.sampleId=anchor.source.frame=++sample;
+        anchor.source.timeSeconds=double(HiggsHands::Now())/1e9;
+        CHECK(fixture.api.PublishAnchor(owner.writer,binding.bindingId,revision,&anchor,&revision)==Status::Ok);
+    }
+    void Finish() {
+        HIGGS_ActionResult result{sizeof(result)};
+        result.stage=HIGGS_ACTION_COMPLETED;result.requestId=delivered.requestId;result.executor=delivered.executor;
+        result.epoch=delivered.epoch;CHECK(fixture.broker.Report(owner.client,result)==HIGGS_HAND_OK);
+        CHECK(fixture.broker.EndHandUse(owner.client,delivered.requestId,delivered.epoch)==HIGGS_HAND_OK);
+    }
+};
+void DwellRounds() {
+    {Fixture f;DwellConsumer d(f,0);CHECK(d.Register()==Status::UnsupportedVersion);}
+    Fixture f(10,1,false,false,RegionAnchorKind::World,true);
+    DwellConsumer low(f,0),high(f,1);
+    CHECK(low.Register()==Status::Ok && high.Register()==Status::Ok);
+    CHECK(!low.binding.recognizerClient && !high.binding.recognizerClient);
+    low.Anchor();high.Anchor();TickRegionActions();
+    CHECK(f.dwellRequests.size()==2 && high.effects==0 && low.effects==0);
+    f.broker.DrainHandUses();TickRegionActions();
+    CHECK(high.effects==1 && low.effects==0);high.Finish();
+    f.Frame(false);f.broker.DrainHandUses();TickRegionActions();
+    CHECK(f.dwellRequests.size()==2 && high.effects==1);
+    high.Anchor(20);f.Frame(false);high.Anchor();f.Frame(false);
+    CHECK(f.dwellRequests.size()==3);f.broker.DrainHandUses();TickRegionActions();
+    CHECK(high.effects==2 && low.effects==0);high.Finish();
+}
+void DwellInvalidations() {
+    for(unsigned mode=0; mode!=6; ++mode) {
+        Fixture f(0,1,false,false,RegionAnchorKind::World,true);
+        DwellConsumer d(f,0);CHECK(d.Register()==Status::Ok);d.Anchor();TickRegionActions();
+        CHECK(f.dwellRequests.size()==1);
+        const auto [owner,proposal]=f.dwellRequests.front();
+        if(mode!=0)f.broker.DrainHandUses();
+        if(mode==0 || mode==1)d.Anchor(20);
+        if(mode==2)ResetRegionActions();
+        if(mode==3){f.broker.SetInputContext(1,HiggsHands::Now());f.broker.SetInputContext(0,HiggsHands::Now());}
+        if(mode==4)CHECK(f.api.RemoveBinding(d.owner.writer,d.binding.bindingId)==Status::Ok);
+        if(mode==5){
+            auto anchor=d.owner.anchor;anchor.source.generation++;anchor.source.sampleId=anchor.source.frame=++d.sample;
+            anchor.source.timeSeconds=double(HiggsHands::Now())/1e9;
+            CHECK(f.api.PublishAnchor(d.owner.writer,d.binding.bindingId,d.revision,&anchor,&d.revision)==Status::Ok);
+        }
+        TickRegionActions();f.broker.DrainHandUses();TickRegionActions();
+        CHECK(!d.effects);
+        HIGGS_HandUseProposalState state{sizeof(state)};
+        CHECK(f.broker.CopyHandUseProposal(owner,proposal,state,HiggsHands::Now())==HIGGS_HAND_OK);
+        CHECK(state.stage!=HIGGS_USE_PROPOSAL_PENDING && !state.use.active);
+    }
+}
+void MixedAdmissionBoundaries() {
+    // Both orders of publication enter one common window; higher provider priority wins.
+    for(unsigned buttonFirst=0;buttonFirst!=2;++buttonFirst) {
+        Fixture f(100,1,false,false,RegionAnchorKind::World,true);
+        f.providers[1]->enabled=false;
+        DwellConsumer d(f,1);CHECK(d.Register()==Status::Ok);d.Anchor();
+        if(buttonFirst)CHECK(f.Input());
+        TickRegionActions();
+        if(!buttonFirst)CHECK(f.Input());
+        CHECK(f.dwellRequests.size()==1 && !f.Effects() && !d.effects);
+        f.broker.DrainHandUses();TickRegionActions();
+        CHECK(d.effects==1 && !f.Effects());d.Finish();
+    }
+    // Button priority also wins over a lower-priority dwell: no category preference.
+    {
+        Fixture f(100,1,false,false,RegionAnchorKind::World,true);
+        f.providers[0]->enabled=false;
+        DwellConsumer d(f,0);CHECK(d.Register()==Status::Ok);d.Anchor();TickRegionActions();
+        CHECK(f.Input());f.broker.DrainHandUses();TickRegionActions();
+        CHECK(f.providers[1]->effects==1 && !d.effects);f.Settle(*f.providers[1]);
+    }
+    // Native acquisition participates, rather than starting beside the dwell winner.
+    {
+        Fixture f(100,1,false,false,RegionAnchorKind::World,true);
+        f.providers[0]->enabled=f.providers[1]->enabled=false;
+        f.observations[0].observationMask|=HIGGS_OBS_NATIVE_GRIP_TARGET;f.Frame(false);
+        f.broker.SetNativeTargetKeys(Left,0x1234,0x1234);
+        DwellConsumer d(f,1);CHECK(d.Register()==Status::Ok);d.Anchor();TickRegionActions();
+        bool native=false;CHECK(f.broker.Input(Left,HIGGS_INPUT_GRIP,true,HiggsHands::Now(),&native) && !native);
+        f.broker.DrainHandUses();TickRegionActions();CHECK(d.effects==1 && !f.Effects());d.Finish();
+    }
+    // A shared connection alone cannot swallow unrelated default controls.
+    {
+        Fixture f(0,1,false,false,RegionAnchorKind::World,true);
+        f.providers[0]->enabled=f.providers[1]->enabled=false;
+        CHECK(!f.Input());f.broker.DrainHandUses();TickRegionActions();CHECK(!f.Effects());
+    }
+}
+
 int main(){try {
+    DwellRounds();DwellInvalidations();MixedAdmissionBoundaries();
     ConsumedRelease();SourceOwnership();AnatomicalEvidenceScope();
     ArbitrationAndFallback();ProviderPriorityAndUp();TargetRefreshAndHeld();CancelBeforeEffect();ConsumerFailureAndDrain();ScopeAndEvidence();DwellAndOrdering();RequiredResourcesAndAge();
     std::printf("Body Slots/HIGGS production region actions: %u checks passed; zero game starts\n",checks);return 0;

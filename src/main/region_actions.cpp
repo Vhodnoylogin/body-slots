@@ -28,9 +28,24 @@ struct Binding {
     RegionAnchorSnapshot anchor{};
     HIGGS_HandExecutor executor{};
     RegionInputEnded onInputEnd{};
+    std::unique_ptr<DwellVisit> dwell;
+    std::uint64_t dwellKey{}, sourceRevision{1};
+    std::uint32_t activationHand{};
     bool active=true, registering=true;
     unsigned inFlight{};
     std::array<RegionObservation,2> observations{};
+
+    void InvalidateAnchor() {
+        if (anchor.valid)
+            ++sourceRevision;
+        anchor.valid = 0;
+        observations = {};
+    }
+
+    void SetAnchor(const RegionAnchorSnapshot& value) {
+        anchor = value;
+        ++anchorRevision;
+    }
 };
 struct Candidate {
     std::shared_ptr<Binding> binding;
@@ -38,7 +53,6 @@ struct Candidate {
     RegionActionProposal proposal{};
     std::shared_ptr<const OwnedRegionSource> source;
     std::uint64_t token{}, requestId{};
-    std::uint64_t correlation{};
     HIGGS_ActionRequest selected{};
     bool claimed=false, dispatchEntered=false;
 };
@@ -49,6 +63,7 @@ struct Service {
     HIGGS_HandRoutingInterface routing{};
     HIGGS_AuthorizedDispatchInterface dispatch{};
     HIGGS_InputRoutesInterface routes{};
+    DwellProvider dwell{};
     HIGGS_HandClient recognizer{};
     std::uint64_t recognizerLabel{};
     HIGGS_HandRegistration registration{};
@@ -58,7 +73,7 @@ struct Service {
     bool connecting=false, ticking=false;
     std::vector<std::shared_ptr<Binding>> bindings;
     std::vector<std::shared_ptr<Candidate>> candidates;
-    std::vector<std::shared_ptr<Candidate>> held;
+    std::vector<RegionInputTerminal> held;
     using BoundSource = std::pair<std::shared_ptr<Binding>,std::shared_ptr<const OwnedRegionSource>>;
     using Sources = std::vector<BoundSource>;
     std::shared_ptr<const Sources> sources=std::make_shared<Sources>();
@@ -96,6 +111,7 @@ void SetSource(Service& s, const std::shared_ptr<Binding>& b, std::shared_ptr<co
         updated->emplace_back(b, source);
     s.sources = std::move(updated);
     b->source = std::move(source);
+    ++b->sourceRevision;
     b->anchor = {};
     b->observations = {};
 }
@@ -143,7 +159,7 @@ RegionObservation Observe(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,u
     const auto* previous=&old;
     old=EvaluateInteractionRegion(b.region,frame,e,previous,++s.sequence,true);return old;
 }
-bool Ready(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned hand) {
+bool ObserveFresh(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned hand) {
     const auto now=double(Now())/1e9;
     const auto palmTime=double(snap.hands[hand-1].poseObservedAtNs)/1e9;
     if(!Owned(b) || !Scope(s,snap) || !ValidHand(snap.hands[hand-1],hand) ||
@@ -151,7 +167,20 @@ bool Ready(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned hand) {
        !b.anchor.valid || b.anchor.source.timeSeconds>now || now-b.anchor.source.timeSeconds>b.region.spec.maxSampleAgeSeconds ||
        palmTime>now || now-palmTime>b.region.spec.maxSampleAgeSeconds)return false;
     auto o=Observe(s,b,snap,hand);
-    return o.state==static_cast<std::uint32_t>(RegionSpatialState::Ready);
+    return o.state!=static_cast<std::uint32_t>(RegionSpatialState::Unavailable);
+}
+bool Ready(Service& s,Binding& b,const HIGGS_HandSnapshot& snap,unsigned hand) {
+    return ObserveFresh(s,b,snap,hand) && b.observations[hand-1].state==static_cast<std::uint32_t>(RegionSpatialState::Ready);
+}
+bool ReadDwell(void* cookie,const HIGGS_HandSnapshot& snapshot,DwellEvidence& evidence) {
+    auto& b=*static_cast<Binding*>(cookie);
+    auto& s=State();std::lock_guard lock(s.mutex);
+    if(!b.dwell || !snapshot.worldReady || b.sourceRevision==0 || !ObserveFresh(s,b,snapshot,b.activationHand))return false;
+    auto& out=evidence.context;
+    out.structSize=sizeof(out);out.binding=b.id;out.actionKey=b.dwellKey;out.activationHand=b.activationHand;
+    out.observation=b.observations[b.activationHand-1];out.hands=snapshot;
+    evidence.sourceRevision=b.sourceRevision;
+    return true;
 }
 struct Lease {
     std::shared_ptr<Binding> binding;
@@ -167,7 +196,7 @@ void Cancel(const std::vector<std::shared_ptr<Candidate>>& candidates,const HIGG
 }
 void HIGGS_HAND_CALL Selected(const HIGGS_ActionRequest* request,void* context) noexcept {
     try {
-        if(!request || request->structSize!=sizeof(*request) || !context)return;
+        if(!request || !request->inputId || request->structSize!=sizeof(*request) || !context)return;
         auto& s=State();std::lock_guard lock(s.mutex);
         for(auto& c:s.candidates)if(c->binding.get()==context && c->token==request->contextId &&
             c->requestId==request->requestId && c->binding->active && !c->claimed &&
@@ -292,13 +321,14 @@ HIGGS_HandStatus HIGGS_HAND_CALL ExecuteAuthorized(const HIGGS_ActionRequest* re
         return status==Status::Ok ? HIGGS_HAND_OK : HIGGS_HAND_NOT_READY;
     }catch(...){return HIGGS_HAND_INTERNAL_ERROR;}
 }
-Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* input,RegionActionRegistration* output) noexcept {
+Status RegisterBinding(std::uint64_t writer,const RegionActionBindingSpec* input,RegionActionRegistration* output,
+    const RegionDwellBindingSpec* dwell) noexcept {
     return Guard([&] {
         SetRegionActionsReleaseHook(DrainRegionActionsClient);
         if(!input || !output || output->structSize!=sizeof(*output) || output->reserved)return Status::InvalidArgument;
         const auto spec=*input;
-        if(spec.structSize!=sizeof(spec) || !spec.physicalHands || spec.physicalHands>Both || spec.button<1 || spec.button>2 ||
-           !spec.edgeMask || spec.edgeMask>3 || !spec.higgsClient || !spec.offers || !spec.execute)return Status::InvalidArgument;
+        if(!dwell && (spec.structSize!=sizeof(spec) || !spec.physicalHands || spec.physicalHands>Both || spec.button<1 || spec.button>2 ||
+           !spec.edgeMask || spec.edgeMask>3 || !spec.higgsClient || !spec.offers || !spec.execute))return Status::InvalidArgument;
         InteractionRegionRecord region{};auto result=CopyOwnedInteractionRegion(writer,spec.regionId,spec.regionRevision,region);
         if(result!=Status::Ok)return result;
         auto& s=State();auto b=std::make_shared<Binding>();b->writer=writer;b->spec=spec;b->region=region;
@@ -306,12 +336,23 @@ Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* inpu
         {
             std::lock_guard lock(s.mutex);
             if(!s.recognizer)return Status::Unavailable;
+            if(dwell) {
+                if(!s.dwell.Available())return Status::UnsupportedVersion;
+                for(const auto& existing:s.bindings)if(existing->active && existing->dwell && existing->writer==writer &&
+                    existing->region.regionId==region.regionId && existing->activationHand==dwell->activationHand &&
+                    existing->dwellKey==dwell->actionKey)return Status::Conflict;
+                auto key=(TargetKey(region.spec)^dwell->actionKey)*1099511628211ULL;
+                key=(key^dwell->activationHand)*1099511628211ULL;
+                b->dwell=std::make_unique<DwellVisit>(*dwell,s.dwell,key ? key : 1);
+                b->dwellKey=dwell->actionKey;b->activationHand=dwell->activationHand;
+            }
             if(s.bindings.size()>=kMaxRegionActionBindings || s.nextBinding==kMax)return Status::LimitExceeded;
             b->id=s.nextBinding++;b->openedAt=Now();s.bindings.push_back(b);hands=s.hands;routing=s.routing;recognizer=s.recognizerLabel;
         }
         HIGGS_HandExecutor executor{};
-        auto status=hands.RegisterExecutor(spec.higgsClient,Selected,b.get(),&executor);
-        if(status==HIGGS_HAND_OK)status=routing.AuthorizeRecognizer(spec.higgsClient,executor,recognizer,spec.physicalHands);
+        auto status=dwell ? b->dwell->EnableSharedRounds() : HIGGS_HAND_OK;
+        if(status==HIGGS_HAND_OK)status=hands.RegisterExecutor(spec.higgsClient,Selected,b.get(),&executor);
+        if(status==HIGGS_HAND_OK && !dwell)status=routing.AuthorizeRecognizer(spec.higgsClient,executor,recognizer,spec.physicalHands);
         if(status!=HIGGS_HAND_OK) {
             if(executor)hands.RemoveRegistration(spec.higgsClient,executor);
             std::lock_guard lock(s.mutex);s.bindings.erase(std::remove(s.bindings.begin(),s.bindings.end(),b),s.bindings.end());return Convert(status);
@@ -322,15 +363,25 @@ Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* inpu
             InteractionRegionRecord current{};
             cancelled=!b->active || s.recognizerLabel!=recognizer ||
                 CopyOwnedInteractionRegion(writer,spec.regionId,spec.regionRevision,current)!=Status::Ok;
-            if(!cancelled)*output={sizeof(*output),0,b->id,executor,recognizer};
+            if(!cancelled)*output={sizeof(*output),0,b->id,executor,dwell ? 0 : recognizer};
         }
         if(cancelled) {
-            routing.RevokeRecognizer(spec.higgsClient,executor,recognizer);
+            if(!dwell)routing.RevokeRecognizer(spec.higgsClient,executor,recognizer);
             hands.RemoveRegistration(spec.higgsClient,executor);
             std::lock_guard lock(s.mutex);s.bindings.erase(std::remove(s.bindings.begin(),s.bindings.end(),b),s.bindings.end());return Status::Unavailable;
         }
         return Status::Ok;
     });
+}
+Status BS_CALL Register(std::uint64_t writer,const RegionActionBindingSpec* input,RegionActionRegistration* output) noexcept {
+    return RegisterBinding(writer,input,output,nullptr);
+}
+Status BS_CALL RegisterDwell(std::uint64_t writer,const RegionDwellBindingSpec* spec,RegionActionRegistration* output) noexcept {
+    if(!spec || !ValidDwellSpec(*spec))return Status::InvalidArgument;
+    RegionActionBindingSpec common{};
+    common.structSize=sizeof(common);common.physicalHands=spec->resourceHands;common.regionId=spec->regionId;
+    common.regionRevision=spec->regionRevision;common.higgsClient=spec->client;
+    return RegisterBinding(writer,&common,output,spec);
 }
 Status BS_CALL Remove(std::uint64_t writer,std::uint64_t id) noexcept {
     return Guard([&] {
@@ -344,13 +395,14 @@ Status BS_CALL Remove(std::uint64_t writer,std::uint64_t id) noexcept {
             for(auto& c:s.candidates)if(c->binding==b)cancelled.push_back(c);
         }
         Cancel(cancelled,routing,recognizer);
-        const auto route=routing.RevokeRecognizer(b->spec.higgsClient,b->executor,label);
+        if(b->dwell)b->dwell->Invalidate(true);
+        const auto route=b->dwell ? HIGGS_HAND_OK : routing.RevokeRecognizer(b->spec.higgsClient,b->executor,label);
         const auto removed=hands.RemoveRegistration(b->spec.higgsClient,b->executor);
         if(callbackDepth || route==HIGGS_HAND_PENDING || removed==HIGGS_HAND_PENDING)return Status::Unavailable;
         if(removed!=HIGGS_HAND_OK && removed!=HIGGS_HAND_NOT_FOUND && removed!=HIGGS_HAND_INVALID_CLIENT)return Convert(removed);
         std::unique_lock lock(s.mutex);s.drained.wait(lock,[&]{return !b->inFlight;});
         s.candidates.erase(std::remove_if(s.candidates.begin(),s.candidates.end(),[&](const auto& c){return c->binding==b;}),s.candidates.end());
-        s.held.erase(std::remove_if(s.held.begin(),s.held.end(),[&](const auto& c){return c->binding==b;}),s.held.end());
+        std::erase_if(s.held, [&](const auto& input) { return input.binding == id; });
         s.bindings.erase(std::remove(s.bindings.begin(),s.bindings.end(),b),s.bindings.end());return Status::Ok;
     });
 }
@@ -364,6 +416,9 @@ bool ValidAnchor(const RegionAnchorSnapshot& a,const Binding& b,const Service& s
     // authenticates HIGGS input; those come exclusively from the retained table.
     return std::isfinite(ZonePointSignedDistance(b.region.spec.shape,a.world,a.world.position));
 }
+bool AdvancesSample(const RegionSampleSource& previous, const RegionSampleSource& next) {
+    return next.sampleId > previous.sampleId && next.frame > previous.frame;
+}
 Status BS_CALL Publish(std::uint64_t writer,std::uint64_t id,std::uint64_t expected,const RegionAnchorSnapshot* input,std::uint64_t* output) noexcept {
     return Guard([&] {
         if(!input || !output)return Status::InvalidArgument;
@@ -373,18 +428,18 @@ Status BS_CALL Publish(std::uint64_t writer,std::uint64_t id,std::uint64_t expec
         if(!Owned(*b) || !s.epoch || CurrentSaveGeneration()!=s.save)return Status::Unavailable;
         if(b->source)return Status::Conflict;
         if(expected!=b->anchorRevision)return Status::Conflict;
-        if(!ValidAnchor(anchor,*b,s)) {b->anchor.valid=0;b->observations={};return Status::InvalidArgument;}
+        if(!ValidAnchor(anchor,*b,s)) {b->InvalidateAnchor();return Status::InvalidArgument;}
         if(b->anchorRevision) {
             const auto& old=b->anchor.source;const auto& p=anchor.source;
             const bool identity=old.identity==p.identity && !std::strcmp(old.provider,p.provider) && !std::strcmp(old.source,p.source);
             const bool scope=old.epoch==p.epoch && old.saveGeneration==p.saveGeneration;
             if(scope && (!identity || p.generation<old.generation || p.timeSeconds<old.timeSeconds ||
-               (p.generation==old.generation && (p.sampleId<=old.sampleId || p.frame<=old.frame)))) {
-                b->anchor.valid=0;b->observations={};return Status::Conflict;
+               (p.generation==old.generation && !AdvancesSample(old,p)))) {
+                b->InvalidateAnchor();return Status::Conflict;
             }
         }
         if(b->anchorRevision==kMax)return Status::LimitExceeded;
-        b->anchor=anchor;*output=++b->anchorRevision;return Status::Ok;
+        b->SetAnchor(anchor);*output=b->anchorRevision;return Status::Ok;
     });
 }
 Status BS_CALL Integration(std::uint64_t reader,RegionActionsIntegration* output) noexcept {
@@ -518,22 +573,19 @@ void RefreshSources(Service& s, const HIGGS_HandSnapshot& snapshot) {
         if (!available || !ValidAnchor(anchor, *b, s) || anchor.source.timeSeconds > now ||
             now - anchor.source.timeSeconds > b->region.spec.maxSampleAgeSeconds || s.epoch <= s.barredEpoch ||
             source->saveGeneration != CurrentSaveGeneration()) {
-            b->anchor.valid = 0;
-            b->observations = {};
+            b->InvalidateAnchor();
             continue;
         }
         const auto& old = b->anchor.source;
         const auto& next = anchor.source;
         if (old.sampleId == next.sampleId && old.frame == next.frame && old.timeSeconds == next.timeSeconds)
             continue;
-        if (next.sampleId <= old.sampleId || next.frame <= old.frame || next.timeSeconds < old.timeSeconds ||
+        if (!AdvancesSample(old, next) || next.timeSeconds < old.timeSeconds ||
             b->anchorRevision == kMax) {
-            b->anchor.valid = 0;
-            b->observations = {};
+            b->InvalidateAnchor();
             continue;
         }
-        b->anchor = anchor;
-        ++b->anchorRevision;
+        b->SetAnchor(anchor);
     }
 }
 Status BS_CALL SubscribeEnd(std::uint64_t writer, std::uint64_t id, RegionInputEnded callback) noexcept {
@@ -562,42 +614,36 @@ Status BS_CALL SubscribeEnd(std::uint64_t writer, std::uint64_t id, RegionInputE
 const RegionContinuationApi continuation{sizeof(continuation),1,SubscribeEnd};
 
 void DeliverTerminals(Service& s, const HIGGS_InputRoutesInterface& routes) {
-    std::vector<std::shared_ptr<Candidate>> tracked;
+    std::vector<RegionInputTerminal> tracked;
     {
         std::lock_guard lock(s.mutex);
         tracked = s.held;
     }
-    for (const auto& c : tracked) {
-        const auto& input = c->context.input;
-        auto b = c->binding;
-        HIGGS_InputSequence sequence{};
-        sequence.structSize = sizeof(sequence);
-        const auto status = routes.CopySequence(b->spec.higgsClient, input.inputId, &sequence);
-        const bool same = status == HIGGS_HAND_OK && sequence.structSize == sizeof(sequence) &&
-                          sequence.epoch == input.epoch && sequence.pressInputId == input.inputId &&
-                          sequence.requestId == c->requestId && sequence.executor == b->executor &&
-                          sequence.correlation == c->correlation && sequence.actionId == c->proposal.actionId &&
-                          sequence.physicalHand == input.physicalHand && sequence.button == input.button;
-        RegionInputTerminal terminal{sizeof(terminal),
-                                     static_cast<std::uint32_t>(RegionInputEnd::ObservationLost),
-                                     input.physicalHand,
-                                     input.button,
-                                     b->id,
-                                     input.epoch,
-                                     input.inputId,
-                                     0,
-                                     c->requestId,
-                                     c->proposal.actionId,
-                                     c->correlation,
-                                     0,
-                                     0};
+    for (auto terminal : tracked) {
+        std::shared_ptr<Binding> b;
         {
             std::lock_guard lock(s.mutex);
-            const auto found = std::find(s.held.begin(), s.held.end(), c);
+            b = Find(s, terminal.binding);
+            if (!b || !b->active)
+                continue;
+        }
+        HIGGS_InputSequence sequence{};
+        sequence.structSize = sizeof(sequence);
+        const auto status = routes.CopySequence(b->spec.higgsClient, terminal.pressInput, &sequence);
+        const bool same = status == HIGGS_HAND_OK && sequence.structSize == sizeof(sequence) &&
+                          sequence.epoch == terminal.epoch && sequence.pressInputId == terminal.pressInput &&
+                          sequence.requestId == terminal.request && sequence.executor == b->executor &&
+                          sequence.correlation == terminal.correlation && sequence.actionId == terminal.action &&
+                          sequence.physicalHand == terminal.hand && sequence.button == terminal.button;
+        {
+            std::lock_guard lock(s.mutex);
+            const auto found = std::find_if(s.held.begin(), s.held.end(), [&](const auto& held) {
+                return held.binding == terminal.binding && held.epoch == terminal.epoch && held.request == terminal.request;
+            });
             if (found == s.held.end())
                 continue;
             const bool live =
-                s.barredEpoch < input.epoch && s.epoch == input.epoch && s.save == CurrentSaveGeneration();
+                s.barredEpoch < terminal.epoch && s.epoch == terminal.epoch && s.save == CurrentSaveGeneration();
             if (live && same && sequence.phase == HIGGS_SEQUENCE_HELD)
                 continue;
             if (same && ((sequence.phase == HIGGS_SEQUENCE_RELEASED && sequence.terminalInputId) ||
@@ -622,6 +668,10 @@ void DeliverTerminals(Service& s, const HIGGS_InputRoutesInterface& routes) {
 }
 } // namespace
 const RegionActionsApi& GetRegionActionsApi() noexcept {return api;}
+const RegionDwellApi& GetRegionDwellApi() noexcept {
+    static const RegionDwellApi dwell{sizeof(dwell),1,RegisterDwell};
+    return dwell;
+}
 const RegionContinuationApi& GetRegionContinuationApi() noexcept {return continuation;}
 const RegionSourcesApi& GetRegionSourcesApi() noexcept {return sourcesApi;}
 void SetOwnedPlanckReader(ReadOwnedAnchor read) noexcept {
@@ -652,7 +702,7 @@ Status DrainRegionActionsClient(std::uint64_t writer) noexcept {
     });
 }
 Status ConnectRegionActions(const HIGGS_HandInterface& hands,const HIGGS_HandRoutingInterface& routing,
-    const HIGGS_AuthorizedDispatchInterface& dispatch,const HIGGS_InputRoutesInterface* routes) noexcept {
+    const HIGGS_AuthorizedDispatchInterface& dispatch,const HIGGS_InputRoutesInterface* routes,const DwellProvider* dwell) noexcept {
     return Guard([&] {
         constexpr auto required=HIGGS_HAND_CAP_SNAPSHOT|HIGGS_HAND_CAP_INPUT_BROKER|HIGGS_HAND_CAP_OWNED_GRANTS|HIGGS_HAND_CAP_EXECUTOR_RECEIPTS;
         if(!routes || routes->structSize!=sizeof(*routes) || routes->abiVersion!=1 || !routes->CopyClientLabel ||
@@ -668,6 +718,7 @@ Status ConnectRegionActions(const HIGGS_HandInterface& hands,const HIGGS_HandRou
         std::uint64_t label{};
         if(result==HIGGS_HAND_OK)result=routes->CopyClientLabel(client,&label);
         if(result==HIGGS_HAND_OK && (!label || label==client))result=HIGGS_HAND_UNSUPPORTED;
+        if(result==HIGGS_HAND_OK && dwell && dwell->Available())result=dwell->proposals.EnableSharedRounds(client);
         if(result==HIGGS_HAND_OK)result=hands.SubscribeRecognizer(client,Recognize,nullptr,&registration);
         if(result!=HIGGS_HAND_OK && client)hands.UnregisterClient(client);
         std::lock_guard lock(s.mutex);s.connecting=false;
@@ -679,6 +730,7 @@ Status ConnectRegionActions(const HIGGS_HandInterface& hands,const HIGGS_HandRou
             }
             if(routes->capabilities&HIGGS_ROUTE_ORDERED_CANDIDATES)s.routes.SubmitOrderedCandidate=routes->SubmitOrderedCandidate;
         }
+        s.dwell=dwell && dwell->Available() ? *dwell : DwellProvider{};
         s.hands=hands;s.routing=routing;s.dispatch=dispatch;s.recognizer=client;s.recognizerLabel=label;s.registration=registration;return Status::Ok;
     });
 }
@@ -694,6 +746,7 @@ void TickRegionActions() noexcept {
         HIGGS_HandSnapshot snap{};snap.structSize=sizeof(snap);const auto copied=hands.CopySnapshot(recognizer,&snap);
         if(copied==HIGGS_HAND_OK && snap.worldReady && Fresh(snap.sampledAtNs,Now()))RefreshSources(s,snap);
         std::vector<std::shared_ptr<Candidate>> pending,cancelled;
+        std::vector<std::shared_ptr<Binding>> dwellBindings;
         {
             std::lock_guard lock(s.mutex);
             const bool valid=copied==HIGGS_HAND_OK && Scope(s,snap) && Fresh(snap.sampledAtNs,Now()) &&
@@ -703,6 +756,8 @@ void TickRegionActions() noexcept {
                 for(auto& b:s.bindings)if(Owned(*b))for(unsigned hand=1;hand<=2;++hand)
                     if(b->spec.physicalHands&hand)Observe(s,*b,snap,hand);
             } else {s.snapshot={};for(auto& b:s.bindings)b->observations={};}
+            if(!valid)snap={};
+            for(auto& b:s.bindings)if(b->dwell && b->active && !b->registering)dwellBindings.push_back(b);
             for(auto& c:s.candidates) {
                 if(!c->claimed && c->selected.requestId) {c->claimed=true;if(valid)pending.push_back(c);else cancelled.push_back(c);}
                 else if(!c->claimed && (!valid || !c->binding->active || c->context.input.epoch!=s.epoch ||
@@ -712,21 +767,35 @@ void TickRegionActions() noexcept {
             }
         }
         Cancel(cancelled,routing,recognizer);
+        for(const auto& b:dwellBindings) {
+            {
+                std::lock_guard lock(s.mutex);
+                if(!b->active || b->registering)continue;
+                ++b->inFlight;
+            }
+            Lease lease(b);
+            b->dwell->Tick(b.get(),b->executor,snap,ReadDwell);
+        }
         for(auto& c:pending) {
             HIGGS_ActionResult result{};result.structSize=sizeof(result);
             const auto copiedResult=hands.CopyActionResult(recognizer,c->selected.requestId,&result);
             HIGGS_HandStatus invoked=HIGGS_HAND_STALE;
+            std::uint64_t correlation{};
             if(copiedResult==HIGGS_HAND_OK && result.stage==HIGGS_ACTION_ACCEPTED && result.executor==c->binding->executor &&
                result.epoch==c->selected.epoch && result.inputId==c->selected.inputId) {
                 const HIGGS_AuthorizedDispatchRequest request{sizeof(request),0,c->selected.requestId,c->selected.executor,c->selected.epoch,c->selected.grant};
                 if(!routes.CheckSelectedAction || routes.CheckSelectedAction(recognizer,request.requestId,request.epoch,
-                        c->proposal.physicalHands,&c->correlation)==HIGGS_HAND_OK)
+                        c->proposal.physicalHands,&correlation)==HIGGS_HAND_OK)
                     invoked=dispatch.Invoke(c->binding->spec.higgsClient,&request,ExecuteAuthorized,c.get());
             }
             bool entered=false;{
                 std::lock_guard lock(s.mutex);entered=c->dispatchEntered;
-                if(entered && c->correlation && c->context.input.edge==1 && c->binding->active && c->binding->onInputEnd)
-                    s.held.push_back(c);
+                const auto& input = c->context.input;
+                if (entered && correlation && input.edge == 1 && c->binding->active && c->binding->onInputEnd) {
+                    s.held.push_back({sizeof(RegionInputTerminal), static_cast<std::uint32_t>(RegionInputEnd::ObservationLost),
+                                      input.physicalHand, input.button, c->binding->id, input.epoch, input.inputId,
+                                      0, c->requestId, c->proposal.actionId, correlation, 0, 0});
+                }
             }
             if(!entered && invoked!=HIGGS_HAND_OK && copiedResult==HIGGS_HAND_OK && result.stage==HIGGS_ACTION_ACCEPTED)
                 routing.CancelRecognizedAction(recognizer,c->selected.requestId,c->selected.epoch,1);
@@ -748,13 +817,18 @@ void TickRegionActions() noexcept {
 void ResetRegionActions() noexcept {
     try {
         auto& s=State();std::vector<std::shared_ptr<Candidate>> cancelled;HIGGS_HandRoutingInterface routing{};HIGGS_HandClient recognizer{};
+        std::vector<std::shared_ptr<Binding>> dwell;
         {
             std::lock_guard lock(s.mutex);s.barredEpoch=std::max(s.barredEpoch,s.epoch);s.snapshot={};
-            for(auto& b:s.bindings)b->observations={};
+            for(auto& b:s.bindings) {
+                b->observations={};
+                if(b->dwell)dwell.push_back(b);
+            }
             for(auto& c:s.candidates)if(!c->claimed){c->claimed=true;cancelled.push_back(c);}
             routing=s.routing;recognizer=s.recognizer;
         }
         if(recognizer)Cancel(cancelled,routing,recognizer);
+        for(const auto& b:dwell)b->dwell->Invalidate(false);
     }catch(...){}
 }
 Status DisconnectRegionActions() noexcept {
@@ -778,6 +852,10 @@ Status DisconnectRegionActions() noexcept {
 extern "C" BS_REGION_EXPORT const body_slots::RegionContinuationApi* BS_CALL BodySlots_QueryRegionContinuationInterface(
     std::uint32_t version,std::uint32_t size) noexcept {
     return version==1 && size==sizeof(body_slots::RegionContinuationApi) ? &body_slots::detail::GetRegionContinuationApi() : nullptr;
+}
+extern "C" BS_REGION_EXPORT const body_slots::RegionDwellApi* BS_CALL BodySlots_QueryRegionDwellInterface(
+    std::uint32_t version,std::uint32_t size) noexcept {
+    return version==1 && size==sizeof(body_slots::RegionDwellApi) ? &body_slots::detail::GetRegionDwellApi() : nullptr;
 }
 extern "C" BS_REGION_EXPORT const body_slots::RegionSourcesApi* BS_CALL BodySlots_QueryRegionSourcesInterface(
     std::uint32_t version,std::uint32_t size) noexcept {

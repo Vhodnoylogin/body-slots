@@ -17,7 +17,7 @@ DEPENDENCIES = {
     "spdlog": "8e5613379f5140fefb0b60412fbf1f5406e7c7f8",
     "rapidcsv": "68f57cc6c83d5e0992904398822453489d8dfac1",
 }
-HIGGS_HEADERS = ("higgshandapi.h", "higgshandrouting.h", "higgsinputroutes.h", "higgsauthorizeddispatch.h", "higgsgrantmutation.h", "higgsinventory.h", "higgstransactions.h")
+HIGGS_HEADERS = ("higgsabitypes.h", "higgshandapi.h", "higgsinput.h", "higgsphysics.h", "higgsobservations.h", "higgstransactions.h", "higgsnativeinterop.h")
 DOCS = ("configuration", "content-observation", "game-adapter", "higgs-native-regions", "instance-activation",
         "instance-configuration", "instances", "interaction-regions", "native-placement", "native-policy",
         "ordinary-inventory-provider", "region-actions", "runtime", "runtime-extensions", "planck-region-anchor", "naming")

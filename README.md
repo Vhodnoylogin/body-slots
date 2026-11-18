@@ -1,10 +1,10 @@
 # Body Slots
 
-Body Slots development: independent slot management and interaction for Skyrim VR.
+Body Slots development: independent slot management and interaction for Skyrim VR. Proposed display name: **VR Interaction Framework**; the existing DLL, API symbols and stable provider keys are retained until a naming decision. This is shared infrastructure for consumer mods; it adds no standalone gameplay feature.
 
 Body Slots owns definitions, stable keys, saved placement, body/equipment binding, zones, activation, content-provider dispatch and presentation. VRIK supplies the body and virtual-hand observations; HIGGS supplies authoritative hand states, input arbitration and granted physical operations. Offline visual authoring belongs in the Slots mode of [Morphbench](https://github.com/Vhodnoylogin/morphbench).
 
-Body Slots recognizes named player, NPC, equipment, world and transient regions, with hysteresis, dwell and stale-source invalidation. A mod can offer an action using the actual HIGGS palm and resolved input in that region. HIGGS chooses the action and authorizes its executor. The winning binding can receive the matching release after its short grant expires. The native HIGGS mouth/stash detector retains its standalone fallback. [Interaction regions](docs/interaction-regions.md) · [Region actions and provider bindings](docs/region-actions.md)
+Body Slots recognizes named player, NPC, equipment, world and transient regions, with hysteresis, dwell and stale-source invalidation. A mod can offer an action using the actual HIGGS palm and resolved input in that region. HIGGS chooses the action and authorizes its executor. The winning binding can receive the matching release after its short grant expires. A separate optional dwell binding submits a buttonless action to the same HIGGS shared decision window; it never synthesizes a button or runs a competing fallback. The native HIGGS mouth/stash detector retains its standalone fallback. [Interaction regions](docs/interaction-regions.md) · [Region actions and provider bindings](docs/region-actions.md)
 
 For an NPC pocket, the owner can bind a PLANCK actor/body identity directly. Body Slots reads the moving body on the game main thread and compares its transform with the HIGGS palm. PPB can supply separate grouped evidence about a particular anatomical child. The SDK includes a complete binding and removal example. [NPC pocket](examples/npc_pocket_binding.cpp)
 

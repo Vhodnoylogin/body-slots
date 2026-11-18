@@ -1,6 +1,6 @@
 #pragma once
 #include "body_slots_regions_api.h"
-#include "higgsnativeregions.h"
+#include "higgsinput.h"
 #include <array>
 #include <mutex>
 

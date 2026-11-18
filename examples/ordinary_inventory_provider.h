@@ -1,10 +1,10 @@
 #pragma once
-#include "higgsinputroutes.h"
+#include "higgsinput.h"
 // Mod-author SDK helper. Only copied public Body Slots/HIGGS contracts.
 #include "body_slots_behavior_api.h"
 #include "body_slots_game_api.h"
-#include "higgsinventory.h"
-#include "higgshandrouting.h"
+#include "higgstransactions.h"
+#include "higgshandapi.h"
 #include <array>
 #include <mutex>
 namespace body_slots::examples {

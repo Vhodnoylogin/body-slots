@@ -53,8 +53,8 @@ def main():
         p.error('build directory must be outside the source checkout')
     closure = (args.higgs_test_manifest or (ROOT / 'cmake/HiggsServices.cmake')).resolve()
     dependencies = [closure, *(higgs / 'include' / name for name in (
-        'higgsinterface001.h', 'higgsnativeregions.h', 'higgsauthorizeddispatch.h', 'higgsinputroutes.h',
-        'higgshandapi.h', 'higgshandrouting.h', 'higgsgrantmutation.h', 'higgsinputcontext.h', 'higgsinventory.h', 'higgstransactions.h'))]
+        'higgsinterface001.h', 'higgsabitypes.h', 'higgshandapi.h', 'higgsinput.h', 'higgstransactions.h',
+        'higgsphysics.h', 'higgsobservations.h', 'higgsnativeinterop.h'))]
     roots = {'bodySlots': ROOT, 'higgs': higgs}
     if args.planck_root:
         roots['planck'] = args.planck_root.resolve()

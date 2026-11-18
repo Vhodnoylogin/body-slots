@@ -11,6 +11,18 @@
 namespace body_slots::game {
 namespace {
 void OnRegionActionsFrame() noexcept { detail::TickRegionActions(); }
+detail::DwellProvider DiscoverDwell(HMODULE module,const HIGGS_AuthorizedDispatchInterface& dispatch) {
+    detail::DwellProvider provider{};
+    const auto proposals=reinterpret_cast<HIGGS_QueryHandUseProposalsInterfaceFn>(GetProcAddress(module,"HIGGS_QueryHandUseProposalsInterface"));
+    const auto uses=reinterpret_cast<HIGGS_QueryHandUseInterfaceFn>(GetProcAddress(module,"HIGGS_QueryHandUseInterface"));
+    const auto context=reinterpret_cast<HIGGS_QueryInputContextInterfaceFn>(GetProcAddress(module,"HIGGS_QueryInputContextInterface"));
+    if(proposals && uses && context &&
+        proposals(2,sizeof(provider.proposals),&provider.proposals.proposals)==HIGGS_HAND_OK &&
+        uses(1,sizeof(provider.uses),&provider.uses)==HIGGS_HAND_OK &&
+        context(HIGGS_INPUT_CONTEXT_ABI_VERSION,sizeof(provider.contexts),&provider.contexts)==HIGGS_HAND_OK)
+        provider.dispatch=dispatch;
+    return provider;
+}
 }
 void ConnectHiggsRegionActions(void* handle) noexcept {
     try {
@@ -37,7 +49,8 @@ void ConnectHiggsRegionActions(void* handle) noexcept {
         HIGGS_InputRoutesInterface routes{};
         const auto queryRoutes = reinterpret_cast<HIGGS_QueryInputRoutesInterfaceFn>(GetProcAddress(module, "HIGGS_QueryInputRoutesInterface"));
         const bool hasRoutes = queryRoutes && queryRoutes(1, sizeof(routes), &routes) == HIGGS_HAND_OK;
-        if (!phases || detail::ConnectRegionActions(hands, routing, dispatch, hasRoutes ? &routes : nullptr) != Status::Ok) return;
+        const auto dwell=DiscoverDwell(module,dispatch);
+        if (!phases || detail::ConnectRegionActions(hands, routing, dispatch, hasRoutes ? &routes : nullptr,&dwell) != Status::Ok) return;
         phases->AddPostVrikPostHiggsCallback(&OnRegionActionsFrame);
         connected = true;
     } catch (...) {}

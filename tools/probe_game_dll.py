@@ -58,7 +58,8 @@ def main():
             table.contents.size, table.contents.version, table.contents.capabilities
         ) != (size, 1, capabilities):
             raise RuntimeError(f'{symbol} negotiation/layout differs')
-    for symbol, slots in (('BodySlots_QueryRegionSourcesInterface', 3), ('BodySlots_QueryRegionContinuationInterface', 1)):
+    for symbol, slots in (('BodySlots_QueryRegionSourcesInterface', 3), ('BodySlots_QueryRegionContinuationInterface', 1),
+                          ('BodySlots_QueryRegionDwellInterface', 1)):
         extension = getattr(dll, symbol)
         extension.argtypes = [C.c_uint32, C.c_uint32]
         extension.restype = C.c_void_p

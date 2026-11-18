@@ -1,7 +1,7 @@
 // Production PLANCK registry and capture-time lookup with synthetic body poses.
 // The recording Body Slots sink implements its writer/revision/withdraw protocol.
 #include "planck_region_anchor.h"
-#include "main/planck_anchor_reader.h"
+#include "body_slots_planck_anchor.h"
 #include "synergy_runtime.h"
 #include <array>
 #include <cmath>
@@ -37,6 +37,13 @@ PlanckStatus PLANCK_CALL CopyOriginalPrefix(PlanckToken client, std::uint32_t ha
     actor->size = 72;
     return PlanckSynergy::GetAPI()->CopyActorPhysics(client, handle, actor, bodies, capacity, count);
 }
+PlanckStatus PLANCK_CALL CopyWrongPhase(PlanckToken client, std::uint32_t handle, PlanckActorPhysics* actor,
+    PlanckBodyPhysics* bodies, std::uint32_t capacity, std::uint32_t* count) {
+    const auto status = PlanckSynergy::GetAPI()->CopyActorPhysics(client, handle, actor, bodies, capacity, count);
+    if (status == PLANCK_OK)
+        actor->phase = PLANCK_PHASE_PRE_PHYSICS;
+    return status;
+}
 }
 
 int main() {
@@ -67,8 +74,7 @@ int main() {
     const auto timestamp = PlanckSynergy::MonotonicNowNs();
     capture(2, timestamp);
     CHECK(update() == Status::Ok && seen.valid && revision == 1);
-    const detail::OwnedRegionSource owned{{sizeof(RegionPlanckBody),target.body.actor.handle,target.body.index,0,
-        target.body.actor.epoch,target.body.actor.actorGeneration,target.body.bodyGeneration},scope.epoch,scope.saveGeneration,timestamp-1};
+    const detail::PlanckAnchorScope owned{target.body,scope.epoch,scope.saveGeneration,timestamp-1};
     RegionAnchorSnapshot real{};
     CHECK(detail::ReadPlanckAnchor(*planck,client,owned,70,scratch,real)==Status::Ok);
     CHECK(real.world.position[0]==70 && real.source.sampleId==seen.source.sampleId && real.source.timeSeconds==double(timestamp)/1e9);
@@ -109,6 +115,10 @@ int main() {
     --scope.saveGeneration;
     capture(6, PlanckSynergy::MonotonicNowNs());
     CHECK(update() == Status::Ok && seen.valid);
+    auto wrongPhase = *planck;
+    wrongPhase.CopyActorPhysics = CopyWrongPhase;
+    CHECK(anchor.Update(&wrongPhase, scratch) == Status::Unavailable && !seen.valid);
+    CHECK(update() == Status::Conflict && !seen.valid);
     ++body.lineage; // Same actor handle and body index, new physical generation.
     capture(7, PlanckSynergy::MonotonicNowNs());
     CHECK(detail::ReadPlanckAnchor(*planck,client,owned,70,scratch,real)==Status::Unavailable);
